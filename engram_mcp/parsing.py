@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import fnmatch
 import os
 from pathlib import Path
-from typing import Dict, Iterable, Iterator, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Dict, Iterable, Iterator, List, Optional
 
 from .chunking import Chunk, chunk_text, make_chunk_id, token_count
 
@@ -125,7 +127,23 @@ def parse_file_to_chunks(
     return []
 
 
-def parse_directory(
+@dataclass(frozen=True)
+class ParsedFile:
+    file_path: str
+    mtime_ns: int
+    size_bytes: int
+    chunks: List[Chunk]
+
+
+@dataclass(frozen=True)
+class ParseDirectoryResult:
+    chunks: List[Chunk]
+    file_count: int
+    file_metadata: Dict[str, ParsedFile]
+    changed_files: List[str]
+
+
+async def parse_directory(
     *,
     root: str,
     project_type: str,
@@ -133,26 +151,64 @@ def parse_directory(
     chunk_size_tokens: int,
     overlap_tokens: int,
     max_file_size_mb: int,
-) -> Tuple[List[Chunk], int]:
+    existing_metadata: Optional[Dict[str, ParsedFile]] = None,
+) -> ParseDirectoryResult:
     chunks: List[Chunk] = []
-    file_count = 0
+    file_metadata: Dict[str, ParsedFile] = {}
+    changed_files: List[str] = []
+    existing_metadata = existing_metadata or {}
+
+    files: List[Path] = []
     for p in iter_files(root, ignore_patterns):
         ext = p.suffix.lower()
-        if ext not in SUPPORTED_TEXT_EXTS and ext not in SUPPORTED_DOC_EXTS:
-            continue
-        try:
-            file_chunks = parse_file_to_chunks(
-                path=p,
-                root=root,
-                project_type=project_type,
-                chunk_size_tokens=chunk_size_tokens,
-                overlap_tokens=overlap_tokens,
-                max_file_size_mb=max_file_size_mb,
-            )
-            if file_chunks:
-                chunks.extend(file_chunks)
-            file_count += 1
-        except Exception:
-            # Best effort: skip unreadable files
-            continue
-    return chunks, file_count
+        if ext in SUPPORTED_TEXT_EXTS or ext in SUPPORTED_DOC_EXTS:
+            files.append(p)
+
+    file_count = len(files)
+    sem = asyncio.Semaphore(os.cpu_count() or 4)
+
+    async def parse_one(path: Path) -> Optional[ParsedFile]:
+        rel = str(path.relative_to(root))
+        stat = path.stat()
+        existing = existing_metadata.get(rel)
+        if existing and existing.mtime_ns == stat.st_mtime_ns and existing.size_bytes == stat.st_size:
+            file_metadata[rel] = existing
+            return None
+
+        async with sem:
+            try:
+                file_chunks = await asyncio.to_thread(
+                    parse_file_to_chunks,
+                    path=path,
+                    root=root,
+                    project_type=project_type,
+                    chunk_size_tokens=chunk_size_tokens,
+                    overlap_tokens=overlap_tokens,
+                    max_file_size_mb=max_file_size_mb,
+                )
+            except Exception:
+                return None
+
+        changed_files.append(rel)
+        parsed = ParsedFile(
+            file_path=rel,
+            mtime_ns=stat.st_mtime_ns,
+            size_bytes=stat.st_size,
+            chunks=file_chunks,
+        )
+        file_metadata[rel] = parsed
+        return parsed
+
+    tasks = [parse_one(p) for p in files]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    for res in results:
+        if isinstance(res, ParsedFile):
+            if res.chunks:
+                chunks.extend(res.chunks)
+
+    return ParseDirectoryResult(
+        chunks=chunks,
+        file_count=file_count,
+        file_metadata=file_metadata,
+        changed_files=changed_files,
+    )

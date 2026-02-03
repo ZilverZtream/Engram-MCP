@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import json
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import aiosqlite
 
@@ -62,6 +64,23 @@ END;
 CREATE TRIGGER IF NOT EXISTS chunks_au AFTER UPDATE OF content ON chunks BEGIN
   UPDATE chunks_fts SET content = new.content WHERE chunk_id = new.chunk_id;
 END;
+
+CREATE TABLE IF NOT EXISTS embedding_cache (
+    content_hash TEXT PRIMARY KEY,
+    embedding BLOB NOT NULL,
+    model_name TEXT NOT NULL,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS file_metadata (
+    project_id TEXT NOT NULL,
+    file_path TEXT NOT NULL,
+    mtime_ns INTEGER NOT NULL,
+    size_bytes INTEGER NOT NULL,
+    chunk_ids TEXT NOT NULL,
+    PRIMARY KEY (project_id, file_path),
+    FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE
+);
 """
 
 
@@ -75,8 +94,68 @@ class ChunkRow:
     access_count: int
 
 
+@dataclass(frozen=True)
+class FileMetadataRow:
+    file_path: str
+    mtime_ns: int
+    size_bytes: int
+    chunk_ids: List[str]
+
+
+class _ConnectionPool:
+    def __init__(self, db_path: str, maxsize: int = 10) -> None:
+        self.db_path = db_path
+        self.maxsize = maxsize
+        self._queue: asyncio.LifoQueue[aiosqlite.Connection] = asyncio.LifoQueue(maxsize)
+        self._created = 0
+        self._lock = asyncio.Lock()
+
+    async def acquire(self) -> aiosqlite.Connection:
+        try:
+            return self._queue.get_nowait()
+        except asyncio.QueueEmpty:
+            async with self._lock:
+                if self._created < self.maxsize:
+                    conn = await aiosqlite.connect(self.db_path)
+                    await conn.execute("PRAGMA foreign_keys=ON;")
+                    await conn.execute("PRAGMA journal_mode=WAL;")
+                    self._created += 1
+                    return conn
+        return await self._queue.get()
+
+    async def release(self, conn: aiosqlite.Connection) -> None:
+        await self._queue.put(conn)
+
+    async def close(self) -> None:
+        while not self._queue.empty():
+            conn = await self._queue.get()
+            await conn.close()
+
+
+_pool: Optional[_ConnectionPool] = None
+_pool_lock = asyncio.Lock()
+
+
+async def _get_pool(db_path: str) -> _ConnectionPool:
+    global _pool
+    async with _pool_lock:
+        if _pool is None or _pool.db_path != db_path:
+            _pool = _ConnectionPool(db_path=db_path, maxsize=10)
+        return _pool
+
+
+@asynccontextmanager
+async def get_connection(db_path: str) -> Iterable[aiosqlite.Connection]:
+    pool = await _get_pool(db_path)
+    conn = await pool.acquire()
+    try:
+        yield conn
+    finally:
+        await pool.release(conn)
+
+
 async def init_db(db_path: str) -> None:
-    async with aiosqlite.connect(db_path) as db:
+    async with get_connection(db_path) as db:
         await db.executescript(SCHEMA_SQL)
         await db.commit()
 
@@ -91,7 +170,7 @@ async def upsert_project(
     embedding_dim: int,
     metadata: Dict[str, Any],
 ) -> None:
-    async with aiosqlite.connect(db_path) as db:
+    async with get_connection(db_path) as db:
         await db.execute(
             """
             INSERT INTO projects(project_id, project_name, project_type, directory, embedding_dim, metadata, updated_at)
@@ -110,13 +189,13 @@ async def upsert_project(
 
 
 async def delete_project(db_path: str, project_id: str) -> None:
-    async with aiosqlite.connect(db_path) as db:
+    async with get_connection(db_path) as db:
         await db.execute("DELETE FROM projects WHERE project_id = ?", (project_id,))
         await db.commit()
 
 
 async def list_projects(db_path: str) -> List[Dict[str, Any]]:
-    async with aiosqlite.connect(db_path) as db:
+    async with get_connection(db_path) as db:
         db.row_factory = aiosqlite.Row
         rows = await db.execute_fetchall(
             """
@@ -129,7 +208,7 @@ async def list_projects(db_path: str) -> List[Dict[str, Any]]:
 
 
 async def get_project(db_path: str, project_id: str) -> Optional[Dict[str, Any]]:
-    async with aiosqlite.connect(db_path) as db:
+    async with get_connection(db_path) as db:
         db.row_factory = aiosqlite.Row
         row = await db.execute_fetchone(
             """
@@ -154,7 +233,7 @@ async def reserve_internal_ids(db_path: str, project_id: str, count: int) -> Lis
     if count <= 0:
         return []
 
-    async with aiosqlite.connect(db_path) as db:
+    async with get_connection(db_path) as db:
         row = await db.execute_fetchone(
             "SELECT COALESCE(MAX(internal_id), 0) FROM chunks WHERE project_id = ?",
             (project_id,),
@@ -173,7 +252,7 @@ async def upsert_chunks(
 
     rows entries: (chunk_id, internal_id, content, token_count, metadata)
     """
-    async with aiosqlite.connect(db_path) as db:
+    async with get_connection(db_path) as db:
         await db.executemany(
             """
             INSERT INTO chunks(chunk_id, project_id, internal_id, content, token_count, metadata, updated_at)
@@ -196,7 +275,7 @@ async def delete_chunks(db_path: str, project_id: str, chunk_ids: List[str]) -> 
     if not chunk_ids:
         return
     placeholders = ",".join(["?"] * len(chunk_ids))
-    async with aiosqlite.connect(db_path) as db:
+    async with get_connection(db_path) as db:
         await db.execute(
             f"DELETE FROM chunks WHERE project_id = ? AND chunk_id IN ({placeholders})",
             (project_id, *chunk_ids),
@@ -210,7 +289,7 @@ async def fetch_chunks_by_internal_ids(
     if not internal_ids:
         return []
     placeholders = ",".join(["?"] * len(internal_ids))
-    async with aiosqlite.connect(db_path) as db:
+    async with get_connection(db_path) as db:
         rows = await db.execute_fetchall(
             f"""
             SELECT chunk_id, internal_id, content, token_count, metadata, access_count
@@ -230,7 +309,7 @@ async def bump_access_counts(db_path: str, project_id: str, chunk_ids: List[str]
     if not chunk_ids:
         return
     placeholders = ",".join(["?"] * len(chunk_ids))
-    async with aiosqlite.connect(db_path) as db:
+    async with get_connection(db_path) as db:
         await db.execute(
             f"UPDATE chunks SET access_count = access_count + 1 WHERE project_id = ? AND chunk_id IN ({placeholders})",
             (project_id, *chunk_ids),
@@ -239,7 +318,7 @@ async def bump_access_counts(db_path: str, project_id: str, chunk_ids: List[str]
 
 
 async def refresh_project_stats(db_path: str, project_id: str) -> None:
-    async with aiosqlite.connect(db_path) as db:
+    async with get_connection(db_path) as db:
         row = await db.execute_fetchone(
             "SELECT COUNT(*), COALESCE(SUM(token_count), 0) FROM chunks WHERE project_id = ?",
             (project_id,),
@@ -265,7 +344,7 @@ async def fts_search(
     limit: int,
 ) -> List[Dict[str, Any]]:
     """Lexical search using FTS5 + bm25 ranking."""
-    async with aiosqlite.connect(db_path) as db:
+    async with get_connection(db_path) as db:
         db.row_factory = aiosqlite.Row
         rows = await db.execute_fetchall(
             """
@@ -295,3 +374,127 @@ async def fts_search(
             }
         )
     return out
+
+
+async def fetch_internal_ids_for_chunk_ids(
+    db_path: str, project_id: str, chunk_ids: List[str]
+) -> List[int]:
+    if not chunk_ids:
+        return []
+    placeholders = ",".join(["?"] * len(chunk_ids))
+    async with get_connection(db_path) as db:
+        rows = await db.execute_fetchall(
+            f"""
+            SELECT internal_id
+            FROM chunks
+            WHERE project_id = ? AND chunk_id IN ({placeholders})
+            """,
+            (project_id, *chunk_ids),
+        )
+    return [int(r[0]) for r in rows]
+
+
+async def fetch_file_metadata(db_path: str, project_id: str) -> Dict[str, FileMetadataRow]:
+    async with get_connection(db_path) as db:
+        rows = await db.execute_fetchall(
+            """
+            SELECT file_path, mtime_ns, size_bytes, chunk_ids
+            FROM file_metadata
+            WHERE project_id = ?
+            """,
+            (project_id,),
+        )
+    out: Dict[str, FileMetadataRow] = {}
+    for path, mtime_ns, size_bytes, chunk_ids_json in rows:
+        try:
+            chunk_ids = json.loads(chunk_ids_json or "[]")
+        except Exception:
+            chunk_ids = []
+        out[path] = FileMetadataRow(
+            file_path=path,
+            mtime_ns=int(mtime_ns),
+            size_bytes=int(size_bytes),
+            chunk_ids=[str(cid) for cid in chunk_ids],
+        )
+    return out
+
+
+async def upsert_file_metadata(
+    db_path: str,
+    project_id: str,
+    rows: List[FileMetadataRow],
+) -> None:
+    if not rows:
+        return
+    async with get_connection(db_path) as db:
+        await db.executemany(
+            """
+            INSERT INTO file_metadata(project_id, file_path, mtime_ns, size_bytes, chunk_ids)
+            VALUES(?,?,?,?,?)
+            ON CONFLICT(project_id, file_path) DO UPDATE SET
+              mtime_ns = excluded.mtime_ns,
+              size_bytes = excluded.size_bytes,
+              chunk_ids = excluded.chunk_ids
+            """,
+            [
+                (project_id, r.file_path, int(r.mtime_ns), int(r.size_bytes), json.dumps(r.chunk_ids))
+                for r in rows
+            ],
+        )
+        await db.commit()
+
+
+async def delete_file_metadata(db_path: str, project_id: str, file_paths: List[str]) -> None:
+    if not file_paths:
+        return
+    placeholders = ",".join(["?"] * len(file_paths))
+    async with get_connection(db_path) as db:
+        await db.execute(
+            f"DELETE FROM file_metadata WHERE project_id = ? AND file_path IN ({placeholders})",
+            (project_id, *file_paths),
+        )
+        await db.commit()
+
+
+async def fetch_embedding_cache(
+    db_path: str,
+    *,
+    model_name: str,
+    content_hashes: List[str],
+) -> Dict[str, bytes]:
+    if not content_hashes:
+        return {}
+    placeholders = ",".join(["?"] * len(content_hashes))
+    async with get_connection(db_path) as db:
+        rows = await db.execute_fetchall(
+            f"""
+            SELECT content_hash, embedding
+            FROM embedding_cache
+            WHERE model_name = ? AND content_hash IN ({placeholders})
+            """,
+            (model_name, *content_hashes),
+        )
+    return {str(r[0]): bytes(r[1]) for r in rows}
+
+
+async def upsert_embedding_cache(
+    db_path: str,
+    *,
+    model_name: str,
+    rows: List[Tuple[str, bytes]],
+) -> None:
+    if not rows:
+        return
+    async with get_connection(db_path) as db:
+        await db.executemany(
+            """
+            INSERT INTO embedding_cache(content_hash, embedding, model_name, created_at)
+            VALUES(?,?,?, datetime('now'))
+            ON CONFLICT(content_hash) DO UPDATE SET
+              embedding = excluded.embedding,
+              model_name = excluded.model_name,
+              created_at = datetime('now')
+            """,
+            [(content_hash, embedding, model_name) for content_hash, embedding in rows],
+        )
+        await db.commit()
