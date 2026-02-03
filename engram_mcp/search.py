@@ -199,6 +199,41 @@ class SearchEngine:
                 _faiss_cache.popitem(last=False)
         return index
 
+    async def _reconstruct_embeddings(
+        self,
+        *,
+        project_id: str,
+        internal_ids: List[int],
+        shard_count: int,
+    ) -> Dict[int, np.ndarray]:
+        if not internal_ids:
+            return {}
+        embeddings: Dict[int, np.ndarray] = {}
+        if shard_count > 1:
+            safe_id = _sanitize_project_id(project_id)
+            shard_map: Dict[int, List[int]] = {}
+            for iid in internal_ids:
+                shard_map.setdefault(iid % shard_count, []).append(iid)
+            for shard_id, ids in shard_map.items():
+                index_path = os.path.join(self.index_dir, f"{safe_id}.shard{shard_id}.index")
+                if not os.path.exists(index_path):
+                    continue
+                index = await self._load_faiss_path(project_id, index_path)
+                for iid in ids:
+                    try:
+                        embeddings[iid] = index.reconstruct(int(iid))
+                    except Exception:
+                        continue
+            return embeddings
+
+        index = await self._load_faiss(project_id)
+        for iid in internal_ids:
+            try:
+                embeddings[iid] = index.reconstruct(int(iid))
+            except Exception:
+                continue
+        return embeddings
+
     async def vector_search(
         self,
         *,
@@ -238,7 +273,7 @@ class SearchEngine:
                     "token_count": row.token_count,
                     "metadata": row.metadata,
                     "access_count": row.access_count,
-                    "embedding": query_vec,  # only used for MMR; cheap to store query vec
+                    "embedding": None,
                     "vec_rank": id_to_rank.get(row.internal_id, 10**9),
                     "vec_score": id_to_score.get(row.internal_id, 0.0),
                 }
@@ -312,8 +347,28 @@ class SearchEngine:
         combined = combined[: max(return_k, 50)]
 
         if enable_mmr:
+            mmr_candidates = min(len(combined), max(return_k * 5, return_k))
+            candidates = combined[:mmr_candidates]
+            internal_ids = [int(r["internal_id"]) for r in candidates if r.get("internal_id") is not None]
+            embeddings = await self._reconstruct_embeddings(
+                project_id=project_id, internal_ids=internal_ids, shard_count=shard_count
+            )
+            for r in candidates:
+                iid = r.get("internal_id")
+                if iid is not None:
+                    r["embedding"] = embeddings.get(int(iid))
+
             # Offload MMR calculation to thread as well
-            combined = await asyncio.to_thread(apply_mmr, combined, query_vec, return_k, mmr_lambda)
+            ranked = await asyncio.to_thread(apply_mmr, candidates, query_vec, return_k, mmr_lambda)
+            ranked_ids = {r["id"] for r in ranked}
+            if len(ranked) < return_k:
+                for r in combined:
+                    if r["id"] in ranked_ids:
+                        continue
+                    ranked.append(r)
+                    if len(ranked) >= return_k:
+                        break
+            combined = ranked[:return_k]
         else:
             combined = combined[:return_k]
 

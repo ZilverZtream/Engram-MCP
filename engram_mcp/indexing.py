@@ -14,8 +14,17 @@ import numpy as np
 
 from .config import EngramConfig
 from .embeddings import Embedder
-from .parsing import ParsedFile, parse_directory, iter_files, parse_file_to_chunks, SUPPORTED_DOC_EXTS, SUPPORTED_TEXT_EXTS
+from .parsing import (
+    ParsedFile,
+    parse_directory,
+    iter_files,
+    parse_file_to_chunks,
+    SUPPORTED_DOC_EXTS,
+    SUPPORTED_TEXT_EXTS,
+    hash_file,
+)
 from .locks import get_project_lock
+from .security import enforce_allowed_roots
 from . import db as dbmod
 
 
@@ -47,6 +56,27 @@ def _content_hash(text: str) -> str:
     h = hashlib.sha256()
     h.update(text.encode("utf-8", errors="ignore"))
     return h.hexdigest()
+
+
+async def _bounded_gather(items: List[Any], worker, concurrency: int):
+    iterator = iter(items)
+    pending: set[asyncio.Task] = set()
+    for _ in range(concurrency):
+        try:
+            item = next(iterator)
+        except StopIteration:
+            break
+        pending.add(asyncio.create_task(worker(item)))
+
+    while pending:
+        done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+        for task in done:
+            yield task.result()
+            try:
+                item = next(iterator)
+            except StopIteration:
+                continue
+            pending.add(asyncio.create_task(worker(item)))
 
 
 @dataclass
@@ -149,11 +179,33 @@ class Indexer:
 
         await asyncio.to_thread(_add)
 
+    async def _persist_index_batch(
+        self,
+        *,
+        project_id: str,
+        index: Any,
+        vectors: np.ndarray,
+        ids: np.ndarray,
+        rows: List[Tuple[str, int, str, int, Dict[str, Any]]],
+        index_path: str,
+        lock: asyncio.Lock,
+    ) -> None:
+        chunk_ids = [row[0] for row in rows]
+        await dbmod.upsert_chunks(self.cfg.db_path, project_id=project_id, rows=rows)
+        try:
+            await self._add_vectors(index, vectors, ids)
+            async with lock:
+                await asyncio.to_thread(_save_faiss, index, index_path)
+        except Exception:
+            await dbmod.delete_chunks(self.cfg.db_path, project_id, chunk_ids)
+            raise
+
     async def index_project(self, *, directory: str, project_name: str, project_type: str) -> str:
         await dbmod.init_db(self.cfg.db_path)
 
         project_id = f"{_slug(project_name)}_{int(time.time())}"
         directory = os.path.abspath(directory)
+        directory_realpath = os.path.realpath(directory)
 
         model_name = _pick_model_name(project_type, self.cfg)
         device = "cuda" if _cuda_available() else "cpu"
@@ -163,6 +215,8 @@ class Indexer:
             prefer_thread_for_cuda=self.cfg.prefer_thread_for_cuda,
         )
 
+        project_initialized = False
+        index_path: Optional[str] = None
         try:
             files: List[Any] = []
             for p in iter_files(directory, self.cfg.ignore_patterns):
@@ -174,33 +228,33 @@ class Indexer:
                 raise ValueError("No indexable content found.")
 
             sem = asyncio.Semaphore(os.cpu_count() or 4)
-            tasks = []
-            for p in files:
-                async def parse_one(path=p) -> Optional[ParsedFile]:
-                    rel = str(path.relative_to(directory))
-                    async with sem:
-                        try:
-                            chunks = await asyncio.to_thread(
-                                parse_file_to_chunks,
-                                path=path,
-                                root=directory,
-                                project_type=project_type,
-                                chunk_size_tokens=self.cfg.chunk_size_tokens,
-                                overlap_tokens=self.cfg.overlap_tokens,
-                                max_file_size_mb=self.cfg.max_file_size_mb,
-                            )
-                        except Exception:
-                            logging.warning("Failed to parse %s", rel, exc_info=True)
-                            return None
-                    stat = path.stat()
-                    return ParsedFile(
-                        file_path=str(path.relative_to(directory)),
-                        mtime_ns=stat.st_mtime_ns,
-                        size_bytes=stat.st_size,
-                        chunks=chunks,
-                    )
+            max_bytes = int(self.cfg.max_file_size_mb) * 1024 * 1024
 
-                tasks.append(parse_one())
+            async def parse_one(path: Any) -> Optional[ParsedFile]:
+                rel = str(path.relative_to(directory))
+                async with sem:
+                    try:
+                        chunks = await asyncio.to_thread(
+                            parse_file_to_chunks,
+                            path=path,
+                            root=directory,
+                            project_type=project_type,
+                            chunk_size_tokens=self.cfg.chunk_size_tokens,
+                            overlap_tokens=self.cfg.overlap_tokens,
+                            max_file_size_mb=self.cfg.max_file_size_mb,
+                        )
+                        content_hash = await asyncio.to_thread(hash_file, path, max_bytes)
+                    except Exception:
+                        logging.warning("Failed to parse %s", rel, exc_info=True)
+                        return None
+                stat = path.stat()
+                return ParsedFile(
+                    file_path=str(path.relative_to(directory)),
+                    mtime_ns=stat.st_mtime_ns,
+                    size_bytes=stat.st_size,
+                    content_hash=content_hash,
+                    chunks=chunks,
+                )
 
             embedding_dim: Optional[int] = None
             index: Optional[Any] = None
@@ -210,14 +264,12 @@ class Indexer:
             training_vectors: List[np.ndarray] = []
             total_chunks = 0
             file_metadata_rows: List[dbmod.FileMetadataRow] = []
-            project_initialized = False
             train_target = max(1000, int(self.cfg.faiss_nlist) * 20)
             safe_id = _sanitize_project_id(project_id)
             index_path = os.path.join(self.cfg.index_dir, f"{safe_id}.index")
             lock = await get_project_lock(project_id)
 
-            for coro in asyncio.as_completed(tasks):
-                parsed = await coro
+            async for parsed in _bounded_gather(files, parse_one, max(1, int(os.cpu_count() or 4))):
                 if parsed is None:
                     continue
 
@@ -227,6 +279,7 @@ class Indexer:
                         file_path=parsed.file_path,
                         mtime_ns=parsed.mtime_ns,
                         size_bytes=parsed.size_bytes,
+                        content_hash=parsed.content_hash,
                         chunk_ids=chunk_ids,
                     )
                 )
@@ -255,6 +308,7 @@ class Indexer:
                             "device": device,
                             "shard_count": 1,
                             "shard_size": int(self.cfg.shard_size),
+                            "directory_realpath": directory_realpath,
                         },
                     )
                     project_initialized = True
@@ -275,21 +329,30 @@ class Indexer:
                     if sum(v.shape[0] for v in training_vectors) >= train_target:
                         train_vecs = np.vstack(training_vectors)
                         index = await self._build_faiss_index(train_vecs)
-                        for vec_batch, id_batch in zip(pending_vectors, pending_ids):
-                            await self._add_vectors(index, vec_batch, id_batch)
+                        for vec_batch, id_batch, row_batch in zip(pending_vectors, pending_ids, pending_rows):
+                            await self._persist_index_batch(
+                                project_id=project_id,
+                                index=index,
+                                vectors=vec_batch,
+                                ids=id_batch,
+                                rows=row_batch,
+                                index_path=index_path,
+                                lock=lock,
+                            )
                         training_vectors.clear()
                         pending_vectors.clear()
                         pending_ids.clear()
-                        async with lock:
-                            await asyncio.to_thread(_save_faiss, index, index_path)
-                        for row_batch in pending_rows:
-                            await dbmod.upsert_chunks(self.cfg.db_path, project_id=project_id, rows=row_batch)
                         pending_rows.clear()
                 else:
-                    await self._add_vectors(index, vectors, ids)
-                    async with lock:
-                        await asyncio.to_thread(_save_faiss, index, index_path)
-                    await dbmod.upsert_chunks(self.cfg.db_path, project_id=project_id, rows=rows)
+                    await self._persist_index_batch(
+                        project_id=project_id,
+                        index=index,
+                        vectors=vectors,
+                        ids=ids,
+                        rows=rows,
+                        index_path=index_path,
+                        lock=lock,
+                    )
 
                 total_chunks += len(parsed.chunks)
 
@@ -314,18 +377,23 @@ class Indexer:
                         "device": device,
                         "shard_count": 1,
                         "shard_size": int(self.cfg.shard_size),
+                        "directory_realpath": directory_realpath,
                     },
                 )
 
             if index is None:
                 train_vecs = np.vstack(training_vectors) if training_vectors else np.vstack(pending_vectors)
                 index = await self._build_faiss_index(train_vecs)
-                for vec_batch, id_batch in zip(pending_vectors, pending_ids):
-                    await self._add_vectors(index, vec_batch, id_batch)
-                async with lock:
-                    await asyncio.to_thread(_save_faiss, index, index_path)
-                for row_batch in pending_rows:
-                    await dbmod.upsert_chunks(self.cfg.db_path, project_id=project_id, rows=row_batch)
+                for vec_batch, id_batch, row_batch in zip(pending_vectors, pending_ids, pending_rows):
+                    await self._persist_index_batch(
+                        project_id=project_id,
+                        index=index,
+                        vectors=vec_batch,
+                        ids=id_batch,
+                        rows=row_batch,
+                        index_path=index_path,
+                        lock=lock,
+                    )
                 pending_rows.clear()
 
             await dbmod.upsert_file_metadata(self.cfg.db_path, project_id, file_metadata_rows)
@@ -335,6 +403,12 @@ class Indexer:
 
             await self._maybe_shard_project(project_id=project_id)
             return project_id
+        except BaseException:
+            if project_initialized:
+                await dbmod.delete_project(self.cfg.db_path, project_id)
+                if index_path and os.path.exists(index_path):
+                    os.unlink(index_path)
+            raise
         finally:
             embedder.close()
 
@@ -349,9 +423,18 @@ class Indexer:
         directory = proj.get("directory")
         if not directory:
             raise ValueError("Project has no stored directory; cannot update.")
+        directory = enforce_allowed_roots(directory, self.cfg.allowed_roots)
+        metadata = proj.get("metadata") or {}
+        stored_realpath = metadata.get("directory_realpath")
+        current_realpath = os.path.realpath(directory)
+        if stored_realpath and stored_realpath != current_realpath:
+            raise ValueError(
+                f"Project directory realpath changed from '{stored_realpath}' to '{current_realpath}'. "
+                "Refusing to update to prevent symlink traversal."
+            )
 
         project_type = proj["project_type"]
-        stored_model = (proj.get("metadata") or {}).get("model_name")
+        stored_model = metadata.get("model_name")
         current_model = _pick_model_name(project_type, self.cfg)
 
         # Enforce model consistency to prevent vector space pollution
@@ -362,84 +445,114 @@ class Indexer:
             )
 
         model_name = stored_model or current_model
-        device = (proj.get("metadata") or {}).get("device") or ("cuda" if _cuda_available() else "cpu")
+        device = metadata.get("device") or ("cuda" if _cuda_available() else "cpu")
 
-        existing_meta = await dbmod.fetch_file_metadata(self.cfg.db_path, project_id)
+        lock = await get_project_lock(project_id)
+        async with lock:
+            existing_meta = await dbmod.fetch_file_metadata(self.cfg.db_path, project_id)
 
-        current_files: Dict[str, Tuple[int, int, Any]] = {}
-        for p in iter_files(directory, self.cfg.ignore_patterns):
-            ext = p.suffix.lower()
-            if ext not in SUPPORTED_TEXT_EXTS and ext not in SUPPORTED_DOC_EXTS:
-                continue
-            rel = str(p.relative_to(directory))
-            stat = p.stat()
-            current_files[rel] = (stat.st_mtime_ns, stat.st_size, p)
+            current_files: Dict[str, Tuple[int, int, str, Any]] = {}
+            max_bytes = int(self.cfg.max_file_size_mb) * 1024 * 1024
+            for p in iter_files(directory, self.cfg.ignore_patterns):
+                ext = p.suffix.lower()
+                if ext not in SUPPORTED_TEXT_EXTS and ext not in SUPPORTED_DOC_EXTS:
+                    continue
+                rel = str(p.relative_to(directory))
+                stat = p.stat()
+                content_hash = ""
+                existing = existing_meta.get(rel)
+                if existing and existing.mtime_ns == stat.st_mtime_ns and existing.size_bytes == stat.st_size:
+                    try:
+                        content_hash = hash_file(p, max_bytes)
+                    except Exception:
+                        logging.warning("Failed to hash %s", rel, exc_info=True)
+                        continue
+                    if existing.content_hash == content_hash:
+                        current_files[rel] = (stat.st_mtime_ns, stat.st_size, content_hash, p)
+                        continue
+                if not content_hash:
+                    try:
+                        content_hash = hash_file(p, max_bytes)
+                    except Exception:
+                        logging.warning("Failed to hash %s", rel, exc_info=True)
+                        continue
+                current_files[rel] = (stat.st_mtime_ns, stat.st_size, content_hash, p)
 
-        file_count = len(current_files)
-        deleted_files = set(existing_meta.keys()) - set(current_files.keys())
-        changed_files = {
-            rel
-            for rel, (mtime_ns, size_bytes, _) in current_files.items()
-            if rel not in existing_meta
-            or existing_meta[rel].mtime_ns != mtime_ns
-            or existing_meta[rel].size_bytes != size_bytes
-        }
+            file_count = len(current_files)
+            deleted_files = set(existing_meta.keys()) - set(current_files.keys())
+            changed_files = {
+                rel
+                for rel, (mtime_ns, size_bytes, content_hash, _) in current_files.items()
+                if rel not in existing_meta
+                or existing_meta[rel].mtime_ns != mtime_ns
+                or existing_meta[rel].size_bytes != size_bytes
+                or existing_meta[rel].content_hash != content_hash
+            }
 
-        to_delete_chunk_ids: List[str] = []
-        for path in deleted_files:
-            to_delete_chunk_ids.extend(existing_meta[path].chunk_ids)
-        for path in changed_files:
-            if path in existing_meta:
+            to_delete_chunk_ids: List[str] = []
+            for path in deleted_files:
                 to_delete_chunk_ids.extend(existing_meta[path].chunk_ids)
+            for path in changed_files:
+                if path in existing_meta:
+                    to_delete_chunk_ids.extend(existing_meta[path].chunk_ids)
 
-        if not to_delete_chunk_ids and not changed_files:
-            await _set_file_count(self.cfg.db_path, project_id, file_count)
-            return {"added": 0, "deleted": 0}
+            if not to_delete_chunk_ids and not changed_files:
+                await _set_file_count(self.cfg.db_path, project_id, file_count)
+                if not stored_realpath:
+                    metadata["directory_realpath"] = current_realpath
+                    await dbmod.upsert_project(
+                        self.cfg.db_path,
+                        project_id=project_id,
+                        project_name=proj["project_name"],
+                        project_type=project_type,
+                        directory=directory,
+                        embedding_dim=int(proj.get("embedding_dim") or 0),
+                        metadata=metadata,
+                    )
+                return {"added": 0, "deleted": 0}
 
-        embedder = Embedder(
-            model_name=model_name,
-            device=device,
-            prefer_thread_for_cuda=self.cfg.prefer_thread_for_cuda,
-        )
-
-        try:
-            internal_ids_to_delete = await dbmod.fetch_internal_ids_for_chunk_ids(
-                self.cfg.db_path, project_id, to_delete_chunk_ids
+            embedder = Embedder(
+                model_name=model_name,
+                device=device,
+                prefer_thread_for_cuda=self.cfg.prefer_thread_for_cuda,
             )
 
-            shard_count = int((proj.get("metadata") or {}).get("shard_count") or 1)
-            added_count = 0
-            updated_file_rows: List[dbmod.FileMetadataRow] = []
-            sem = asyncio.Semaphore(os.cpu_count() or 4)
-
-            async def parse_one(rel_path: str) -> Optional[ParsedFile]:
-                mtime_ns, size_bytes, path = current_files[rel_path]
-                async with sem:
-                    try:
-                        chunks = await asyncio.to_thread(
-                            parse_file_to_chunks,
-                            path=path,
-                            root=directory,
-                            project_type=project_type,
-                            chunk_size_tokens=self.cfg.chunk_size_tokens,
-                            overlap_tokens=self.cfg.overlap_tokens,
-                            max_file_size_mb=self.cfg.max_file_size_mb,
-                        )
-                    except Exception:
-                        logging.warning("Failed to parse %s", rel_path, exc_info=True)
-                        return None
-                return ParsedFile(
-                    file_path=rel_path,
-                    mtime_ns=mtime_ns,
-                    size_bytes=size_bytes,
-                    chunks=chunks,
+            added_chunk_ids: List[str] = []
+            try:
+                internal_ids_to_delete = await dbmod.fetch_internal_ids_for_chunk_ids(
+                    self.cfg.db_path, project_id, to_delete_chunk_ids
                 )
 
-            tasks = [parse_one(rel) for rel in sorted(changed_files)]
+                shard_count = int(metadata.get("shard_count") or 1)
+                added_count = 0
+                updated_file_rows: List[dbmod.FileMetadataRow] = []
+                sem = asyncio.Semaphore(os.cpu_count() or 4)
 
-            safe_id = _sanitize_project_id(project_id)
-            lock = await get_project_lock(project_id)
-            async with lock:
+                async def parse_one(rel_path: str) -> Optional[ParsedFile]:
+                    mtime_ns, size_bytes, content_hash, path = current_files[rel_path]
+                    async with sem:
+                        try:
+                            chunks = await asyncio.to_thread(
+                                parse_file_to_chunks,
+                                path=path,
+                                root=directory,
+                                project_type=project_type,
+                                chunk_size_tokens=self.cfg.chunk_size_tokens,
+                                overlap_tokens=self.cfg.overlap_tokens,
+                                max_file_size_mb=self.cfg.max_file_size_mb,
+                            )
+                        except Exception:
+                            logging.warning("Failed to parse %s", rel_path, exc_info=True)
+                            return None
+                    return ParsedFile(
+                        file_path=rel_path,
+                        mtime_ns=mtime_ns,
+                        size_bytes=size_bytes,
+                        content_hash=content_hash,
+                        chunks=chunks,
+                    )
+
+                safe_id = _sanitize_project_id(project_id)
                 if shard_count > 1:
                     shard_paths = [
                         os.path.join(self.cfg.index_dir, f"{safe_id}.shard{shard_id}.index")
@@ -456,14 +569,13 @@ class Indexer:
                         for shard_id, index in enumerate(shard_indexes):
                             if index is None:
                                 continue
-                            ids_for_shard = [
-                                iid for iid in internal_ids_to_delete if iid % shard_count == shard_id
-                            ]
+                            ids_for_shard = [iid for iid in internal_ids_to_delete if iid % shard_count == shard_id]
                             if ids_for_shard:
                                 index.remove_ids(np.asarray(ids_for_shard, dtype=np.int64))
 
-                    for coro in asyncio.as_completed(tasks):
-                        parsed = await coro
+                    async for parsed in _bounded_gather(
+                        sorted(changed_files), parse_one, max(1, int(os.cpu_count() or 4))
+                    ):
                         if parsed is None:
                             continue
                         chunk_ids = [c.chunk_id for c in parsed.chunks]
@@ -472,6 +584,7 @@ class Indexer:
                                 file_path=parsed.file_path,
                                 mtime_ns=parsed.mtime_ns,
                                 size_bytes=parsed.size_bytes,
+                                content_hash=parsed.content_hash,
                                 chunk_ids=chunk_ids,
                             )
                         )
@@ -486,6 +599,7 @@ class Indexer:
                             for c, iid in zip(parsed.chunks, internal_ids)
                         ]
                         await dbmod.upsert_chunks(self.cfg.db_path, project_id=project_id, rows=rows)
+                        added_chunk_ids.extend(chunk_ids)
                         for shard_id in range(shard_count):
                             shard_mask = [i for i, iid in enumerate(internal_ids) if iid % shard_count == shard_id]
                             if not shard_mask:
@@ -506,8 +620,9 @@ class Indexer:
                     index = await asyncio.to_thread(_load_faiss, index_path)
                     if internal_ids_to_delete:
                         index.remove_ids(np.asarray(internal_ids_to_delete, dtype=np.int64))
-                    for coro in asyncio.as_completed(tasks):
-                        parsed = await coro
+                    async for parsed in _bounded_gather(
+                        sorted(changed_files), parse_one, max(1, int(os.cpu_count() or 4))
+                    ):
                         if parsed is None:
                             continue
                         chunk_ids = [c.chunk_id for c in parsed.chunks]
@@ -516,6 +631,7 @@ class Indexer:
                                 file_path=parsed.file_path,
                                 mtime_ns=parsed.mtime_ns,
                                 size_bytes=parsed.size_bytes,
+                                content_hash=parsed.content_hash,
                                 chunk_ids=chunk_ids,
                             )
                         )
@@ -530,36 +646,52 @@ class Indexer:
                             for c, iid in zip(parsed.chunks, internal_ids)
                         ]
                         await dbmod.upsert_chunks(self.cfg.db_path, project_id=project_id, rows=rows)
+                        added_chunk_ids.extend(chunk_ids)
                         await self._add_vectors(index, vectors, np.asarray(internal_ids, dtype=np.int64))
                         added_count += len(parsed.chunks)
 
                     await asyncio.to_thread(_save_faiss, index, index_path)
 
-            if to_delete_chunk_ids:
-                await dbmod.delete_chunks(self.cfg.db_path, project_id, to_delete_chunk_ids)
+                if to_delete_chunk_ids:
+                    await dbmod.delete_chunks(self.cfg.db_path, project_id, to_delete_chunk_ids)
 
-            file_metadata_rows: List[dbmod.FileMetadataRow] = []
-            for path in current_files.keys():
-                if path in changed_files:
-                    row = next((r for r in updated_file_rows if r.file_path == path), None)
-                    if row:
-                        file_metadata_rows.append(row)
-                else:
-                    existing = existing_meta.get(path)
-                    if existing:
-                        file_metadata_rows.append(existing)
+                file_metadata_rows: List[dbmod.FileMetadataRow] = []
+                for path in current_files.keys():
+                    if path in changed_files:
+                        row = next((r for r in updated_file_rows if r.file_path == path), None)
+                        if row:
+                            file_metadata_rows.append(row)
+                    else:
+                        existing = existing_meta.get(path)
+                        if existing:
+                            file_metadata_rows.append(existing)
 
-            if file_metadata_rows:
-                await dbmod.upsert_file_metadata(self.cfg.db_path, project_id, file_metadata_rows)
-            if deleted_files:
-                await dbmod.delete_file_metadata(self.cfg.db_path, project_id, sorted(deleted_files))
+                if file_metadata_rows:
+                    await dbmod.upsert_file_metadata(self.cfg.db_path, project_id, file_metadata_rows)
+                if deleted_files:
+                    await dbmod.delete_file_metadata(self.cfg.db_path, project_id, sorted(deleted_files))
 
-            await dbmod.refresh_project_stats(self.cfg.db_path, project_id)
-            await _set_file_count(self.cfg.db_path, project_id, file_count)
-            await self._maybe_shard_project(project_id=project_id)
-            return {"added": added_count, "deleted": len(to_delete_chunk_ids)}
-        finally:
-            embedder.close()
+                metadata["directory_realpath"] = current_realpath
+                await dbmod.upsert_project(
+                    self.cfg.db_path,
+                    project_id=project_id,
+                    project_name=proj["project_name"],
+                    project_type=project_type,
+                    directory=directory,
+                    embedding_dim=int(proj.get("embedding_dim") or 0),
+                    metadata=metadata,
+                )
+
+                await dbmod.refresh_project_stats(self.cfg.db_path, project_id)
+                await _set_file_count(self.cfg.db_path, project_id, file_count)
+                await self._maybe_shard_project(project_id=project_id)
+                return {"added": added_count, "deleted": len(to_delete_chunk_ids)}
+            except BaseException:
+                if added_chunk_ids:
+                    await dbmod.delete_chunks(self.cfg.db_path, project_id, added_chunk_ids)
+                raise
+            finally:
+                embedder.close()
 
     async def _update_sharded_indexes(
         self,
