@@ -49,7 +49,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
     chunk_id,
     project_id,
     content,
-    tokenize = 'porter'
+    tokenize = 'unicode61'
 );
 
 -- Keep FTS in sync (triggers)
@@ -78,8 +78,15 @@ CREATE TABLE IF NOT EXISTS file_metadata (
     file_path TEXT NOT NULL,
     mtime_ns INTEGER NOT NULL,
     size_bytes INTEGER NOT NULL,
+    content_hash TEXT NOT NULL DEFAULT '',
     chunk_ids TEXT NOT NULL,
     PRIMARY KEY (project_id, file_path),
+    FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS internal_id_sequence (
+    project_id TEXT PRIMARY KEY,
+    next_internal_id INTEGER NOT NULL,
     FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE
 );
 """
@@ -100,6 +107,7 @@ class FileMetadataRow:
     file_path: str
     mtime_ns: int
     size_bytes: int
+    content_hash: str
     chunk_ids: List[str]
 
 
@@ -158,7 +166,40 @@ async def get_connection(db_path: str) -> Iterable[aiosqlite.Connection]:
 async def init_db(db_path: str) -> None:
     async with get_connection(db_path) as db:
         await db.executescript(SCHEMA_SQL)
+        await _ensure_file_metadata_schema(db)
+        await _ensure_fts_tokenizer(db)
         await db.commit()
+
+
+async def _ensure_file_metadata_schema(db: aiosqlite.Connection) -> None:
+    rows = await db.execute_fetchall("PRAGMA table_info(file_metadata)")
+    columns = {r[1] for r in rows}
+    if "content_hash" not in columns:
+        await db.execute("ALTER TABLE file_metadata ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''")
+
+
+async def _ensure_fts_tokenizer(db: aiosqlite.Connection) -> None:
+    row = await db.execute_fetchone(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'chunks_fts'"
+    )
+    if not row or not row[0]:
+        return
+    sql = row[0].lower()
+    if "tokenize = 'porter'" not in sql:
+        return
+    await db.executescript(
+        """
+        DROP TABLE IF EXISTS chunks_fts;
+        CREATE VIRTUAL TABLE chunks_fts USING fts5(
+            chunk_id,
+            project_id,
+            content,
+            tokenize = 'unicode61'
+        );
+        INSERT INTO chunks_fts(chunk_id, project_id, content)
+        SELECT chunk_id, project_id, content FROM chunks;
+        """
+    )
 
 
 async def upsert_project(
@@ -235,12 +276,31 @@ async def reserve_internal_ids(db_path: str, project_id: str, count: int) -> Lis
         return []
 
     async with get_connection(db_path) as db:
+        await db.execute("BEGIN IMMEDIATE")
         row = await db.execute_fetchone(
-            "SELECT COALESCE(MAX(internal_id), 0) FROM chunks WHERE project_id = ?",
+            "SELECT next_internal_id FROM internal_id_sequence WHERE project_id = ?",
             (project_id,),
         )
-        start = int(row[0]) + 1
-        return list(range(start, start + count))
+        if row and row[0] is not None:
+            start = int(row[0])
+        else:
+            row = await db.execute_fetchone(
+                "SELECT COALESCE(MAX(internal_id), 0) FROM chunks WHERE project_id = ?",
+                (project_id,),
+            )
+            start = int(row[0]) + 1
+        next_id = start + count
+        await db.execute(
+            """
+            INSERT INTO internal_id_sequence(project_id, next_internal_id)
+            VALUES(?,?)
+            ON CONFLICT(project_id) DO UPDATE SET
+              next_internal_id = excluded.next_internal_id
+            """,
+            (project_id, next_id),
+        )
+        await db.commit()
+        return list(range(start, next_id))
 
 
 async def upsert_chunks(
@@ -406,14 +466,14 @@ async def fetch_file_metadata(db_path: str, project_id: str) -> Dict[str, FileMe
     async with get_connection(db_path) as db:
         rows = await db.execute_fetchall(
             """
-            SELECT file_path, mtime_ns, size_bytes, chunk_ids
+            SELECT file_path, mtime_ns, size_bytes, content_hash, chunk_ids
             FROM file_metadata
             WHERE project_id = ?
             """,
             (project_id,),
         )
     out: Dict[str, FileMetadataRow] = {}
-    for path, mtime_ns, size_bytes, chunk_ids_json in rows:
+    for path, mtime_ns, size_bytes, content_hash, chunk_ids_json in rows:
         try:
             chunk_ids = json.loads(chunk_ids_json or "[]")
         except Exception:
@@ -422,6 +482,7 @@ async def fetch_file_metadata(db_path: str, project_id: str) -> Dict[str, FileMe
             file_path=path,
             mtime_ns=int(mtime_ns),
             size_bytes=int(size_bytes),
+            content_hash=str(content_hash or ""),
             chunk_ids=[str(cid) for cid in chunk_ids],
         )
     return out
@@ -437,15 +498,23 @@ async def upsert_file_metadata(
     async with get_connection(db_path) as db:
         await db.executemany(
             """
-            INSERT INTO file_metadata(project_id, file_path, mtime_ns, size_bytes, chunk_ids)
-            VALUES(?,?,?,?,?)
+            INSERT INTO file_metadata(project_id, file_path, mtime_ns, size_bytes, content_hash, chunk_ids)
+            VALUES(?,?,?,?,?,?)
             ON CONFLICT(project_id, file_path) DO UPDATE SET
               mtime_ns = excluded.mtime_ns,
               size_bytes = excluded.size_bytes,
+              content_hash = excluded.content_hash,
               chunk_ids = excluded.chunk_ids
             """,
             [
-                (project_id, r.file_path, int(r.mtime_ns), int(r.size_bytes), json.dumps(r.chunk_ids))
+                (
+                    project_id,
+                    r.file_path,
+                    int(r.mtime_ns),
+                    int(r.size_bytes),
+                    r.content_hash,
+                    json.dumps(r.chunk_ids),
+                )
                 for r in rows
             ],
         )

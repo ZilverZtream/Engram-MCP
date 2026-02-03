@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import fnmatch
+import hashlib
 import logging
 import os
 from pathlib import Path
@@ -53,6 +54,20 @@ def read_text_streaming(path: Path, max_bytes: int) -> str:
         raise ValueError(f"File too large: {path} ({size} bytes)")
     with path.open("r", encoding="utf-8", errors="ignore") as f:
         return f.read()
+
+
+def hash_file(path: Path, max_bytes: int) -> str:
+    size = path.stat().st_size
+    if size > max_bytes:
+        raise ValueError(f"File too large: {path} ({size} bytes)")
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        while True:
+            chunk = f.read(1024 * 1024)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def parse_file_to_chunks(
@@ -145,6 +160,7 @@ class ParsedFile:
     file_path: str
     mtime_ns: int
     size_bytes: int
+    content_hash: str
     chunks: List[Chunk]
 
 
@@ -184,9 +200,22 @@ async def parse_directory(
         rel = str(path.relative_to(root))
         stat = path.stat()
         existing = existing_metadata.get(rel)
+        file_hash: Optional[str] = None
         if existing and existing.mtime_ns == stat.st_mtime_ns and existing.size_bytes == stat.st_size:
-            file_metadata[rel] = existing
-            return None
+            try:
+                file_hash = await asyncio.to_thread(hash_file, path, max_file_size_mb * 1024 * 1024)
+            except Exception:
+                logging.warning("Failed to hash %s", rel, exc_info=True)
+            if file_hash and existing.content_hash == file_hash:
+                file_metadata[rel] = existing
+                return None
+
+        if file_hash is None:
+            try:
+                file_hash = await asyncio.to_thread(hash_file, path, max_file_size_mb * 1024 * 1024)
+            except Exception:
+                logging.warning("Failed to hash %s", rel, exc_info=True)
+                return None
 
         async with sem:
             try:
@@ -208,17 +237,15 @@ async def parse_directory(
             file_path=rel,
             mtime_ns=stat.st_mtime_ns,
             size_bytes=stat.st_size,
+            content_hash=file_hash or "",
             chunks=file_chunks,
         )
         file_metadata[rel] = parsed
         return parsed
 
-    tasks = [asyncio.create_task(parse_one(p)) for p in files]
-    for coro in asyncio.as_completed(tasks):
-        res = await coro
-        if isinstance(res, ParsedFile):
-            if res.chunks:
-                chunks.extend(res.chunks)
+    async for res in _bounded_gather(files, parse_one, max(1, int(os.cpu_count() or 4))):
+        if isinstance(res, ParsedFile) and res.chunks:
+            chunks.extend(res.chunks)
 
     return ParseDirectoryResult(
         chunks=chunks,
@@ -226,3 +253,25 @@ async def parse_directory(
         file_metadata=file_metadata,
         changed_files=changed_files,
     )
+
+
+async def _bounded_gather(items: List[Path], worker, concurrency: int):
+    iterator = iter(items)
+    pending: set[asyncio.Task] = set()
+
+    for _ in range(concurrency):
+        try:
+            item = next(iterator)
+        except StopIteration:
+            break
+        pending.add(asyncio.create_task(worker(item)))
+
+    while pending:
+        done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+        for task in done:
+            yield task.result()
+            try:
+                item = next(iterator)
+            except StopIteration:
+                continue
+            pending.add(asyncio.create_task(worker(item)))
