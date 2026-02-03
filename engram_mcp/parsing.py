@@ -78,6 +78,11 @@ def parse_file_to_chunks(
         # Streaming: page by page
         from pypdf import PdfReader
 
+        # Check PDF file size before loading (prevent OOM/DoS)
+        size = path.stat().st_size
+        if size > max_bytes:
+            raise ValueError(f"PDF file too large: {path} ({size} bytes)")
+
         reader = PdfReader(str(path))
         chunks: List[Chunk] = []
         base_id = make_chunk_id(str(path), str(path.stat().st_mtime_ns))

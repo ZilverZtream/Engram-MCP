@@ -85,10 +85,15 @@ def load_config(path: Optional[str] = None) -> EngramConfig:
     # Merge known fields only (avoid surprises)
     for k, v in data.items():
         if hasattr(cfg, k):
-            setattr(cfg, k, v)
+            # Special handling for ignore_patterns: merge with defaults instead of replacing
+            if k == "ignore_patterns" and isinstance(v, list):
+                # Combine user patterns with defaults (user patterns first for priority)
+                cfg.ignore_patterns = list(v) + [p for p in DEFAULT_IGNORE_PATTERNS if p not in v]
+            else:
+                setattr(cfg, k, v)
 
-    # Normalize allowed roots
-    cfg.allowed_roots = [os.path.abspath(p) for p in (cfg.allowed_roots or [])]
+    # Normalize allowed roots (resolve symlinks for security)
+    cfg.allowed_roots = [os.path.realpath(p) for p in (cfg.allowed_roots or [])]
     cfg.index_dir = os.path.abspath(cfg.index_dir)
     cfg.db_path = os.path.abspath(cfg.db_path)
 

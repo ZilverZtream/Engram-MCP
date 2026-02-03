@@ -10,9 +10,9 @@ class PathNotAllowed(Exception):
 
 def is_within_allowed_roots(path: str, allowed_roots: Iterable[str]) -> bool:
     """Return True if path is within any allowed root (prefix match by commonpath)."""
-    ap = os.path.abspath(path)
+    ap = os.path.realpath(path)
     for root in allowed_roots:
-        ar = os.path.abspath(root)
+        ar = os.path.realpath(root)
         try:
             common = os.path.commonpath([ap, ar])
         except ValueError:
@@ -24,8 +24,8 @@ def is_within_allowed_roots(path: str, allowed_roots: Iterable[str]) -> bool:
 
 
 def enforce_allowed_roots(path: str, allowed_roots: Iterable[str]) -> str:
-    """Validate and return normalized absolute path."""
-    ap = os.path.abspath(path)
+    """Validate and return normalized absolute path with symlinks resolved."""
+    ap = os.path.realpath(path)
     roots = list(allowed_roots)
     if not roots:
         # Safe default: require explicit opt-in.

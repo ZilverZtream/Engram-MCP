@@ -2,12 +2,36 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 import numpy as np
 
 from . import db as dbmod
+
+
+# Global project lock manager to prevent race conditions
+_project_locks: Dict[str, asyncio.Lock] = {}
+_locks_lock = asyncio.Lock()
+
+
+async def _get_project_lock(project_id: str) -> asyncio.Lock:
+    """Get or create a lock for a specific project."""
+    async with _locks_lock:
+        if project_id not in _project_locks:
+            _project_locks[project_id] = asyncio.Lock()
+        return _project_locks[project_id]
+
+
+def _sanitize_project_id(project_id: str) -> str:
+    """Sanitize project_id to prevent directory traversal attacks."""
+    # Use basename to strip any directory components
+    sanitized = os.path.basename(project_id)
+    # Additional validation: only allow alphanumeric, underscore, and hyphen
+    if not re.match(r"^[a-zA-Z0-9_-]+$", sanitized):
+        raise ValueError(f"Invalid project_id: {project_id}. Only alphanumeric characters, underscores, and hyphens are allowed.")
+    return sanitized
 
 
 def rrf_combine(bm25_results: List[Dict[str, Any]], vec_results: List[Dict[str, Any]], k: int = 60) -> List[Dict[str, Any]]:
@@ -91,12 +115,21 @@ class SearchEngine:
     async def _load_faiss(self, project_id: str):
         import faiss
 
-        index_path = os.path.join(self.index_dir, f"{project_id}.index")
+        safe_id = _sanitize_project_id(project_id)
+        index_path = os.path.join(self.index_dir, f"{safe_id}.index")
         if not os.path.exists(index_path):
             raise FileNotFoundError(f"FAISS index not found: {index_path}")
 
-        # Memory-map for faster load on large indices
-        return faiss.read_index(index_path, faiss.IO_FLAG_MMAP)
+        # Acquire lock to prevent race condition with updates
+        lock = await _get_project_lock(project_id)
+        async with lock:
+            # Load in thread to avoid blocking event loop
+            def _load():
+                # Use IO_FLAG_READ_ONLY instead of MMAP to avoid SIGBUS issues
+                return faiss.read_index(index_path)
+
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(None, _load)
 
     async def vector_search(
         self,
@@ -156,11 +189,13 @@ class SearchEngine:
         lex = await dbmod.fts_search(self.db_path, project_id=project_id, query=query, limit=fts_top_k)
         vec = await self.vector_search(project_id=project_id, query_vec=query_vec, top_k=vector_top_k)
 
-        combined = rrf_combine(lex, vec, k=60)
+        # Offload RRF calculation to thread to prevent event loop blocking
+        combined = await asyncio.to_thread(rrf_combine, lex, vec, 60)
         combined = combined[: max(return_k, 50)]
 
         if enable_mmr:
-            combined = apply_mmr(combined, query_vec=query_vec, k=return_k, mmr_lambda=mmr_lambda)
+            # Offload MMR calculation to thread as well
+            combined = await asyncio.to_thread(apply_mmr, combined, query_vec, return_k, mmr_lambda)
         else:
             combined = combined[:return_k]
 
