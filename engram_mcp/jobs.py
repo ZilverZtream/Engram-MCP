@@ -15,13 +15,21 @@ class Job:
 
 
 class JobManager:
-    def __init__(self) -> None:
+    def __init__(self, max_concurrent_jobs: int = 5) -> None:
         self._jobs: Dict[str, Job] = {}
         self._lock = asyncio.Lock()
+        # Semaphore to limit concurrent jobs and prevent DoS
+        self._semaphore = asyncio.Semaphore(max_concurrent_jobs)
 
     async def create(self, kind: str, coro: Awaitable[Any]) -> Job:
         job_id = f"{kind}_{int(time.time()*1000)}"
-        task = asyncio.create_task(coro)
+
+        # Wrap coroutine with semaphore to limit concurrency
+        async def _wrapped_coro():
+            async with self._semaphore:
+                return await coro
+
+        task = asyncio.create_task(_wrapped_coro())
         job = Job(job_id=job_id, kind=kind, created_at=time.time(), task=task)
         async with self._lock:
             self._jobs[job_id] = job

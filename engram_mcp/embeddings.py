@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import multiprocessing
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, List, Optional, Sequence, Tuple
@@ -68,8 +69,11 @@ class Embedder:
             return "thread", self._thread_pool
 
         if self._proc_pool is None:
+            # Use spawn context to avoid PyTorch/CUDA fork issues
+            mp_context = multiprocessing.get_context("spawn")
             self._proc_pool = ProcessPoolExecutor(
                 max_workers=self.max_workers,
+                mp_context=mp_context,
                 initializer=_worker_init,
                 initargs=(self.model_name, self.device),
             )

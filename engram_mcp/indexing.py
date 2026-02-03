@@ -15,11 +15,34 @@ from .parsing import parse_directory
 from . import db as dbmod
 
 
+# Global project lock manager to prevent race conditions
+_project_locks: Dict[str, asyncio.Lock] = {}
+_locks_lock = asyncio.Lock()
+
+
+async def _get_project_lock(project_id: str) -> asyncio.Lock:
+    """Get or create a lock for a specific project."""
+    async with _locks_lock:
+        if project_id not in _project_locks:
+            _project_locks[project_id] = asyncio.Lock()
+        return _project_locks[project_id]
+
+
 def _slug(s: str) -> str:
     s = s.strip().lower()
     s = re.sub(r"[^a-z0-9]+", "_", s)
     s = re.sub(r"_+", "_", s).strip("_")
     return s or "project"
+
+
+def _sanitize_project_id(project_id: str) -> str:
+    """Sanitize project_id to prevent directory traversal attacks."""
+    # Use basename to strip any directory components
+    sanitized = os.path.basename(project_id)
+    # Additional validation: only allow alphanumeric, underscore, and hyphen
+    if not re.match(r"^[a-zA-Z0-9_-]+$", sanitized):
+        raise ValueError(f"Invalid project_id: {project_id}. Only alphanumeric characters, underscores, and hyphens are allowed.")
+    return sanitized
 
 
 def _pick_model_name(project_type: str, cfg: EngramConfig) -> str:
@@ -116,8 +139,13 @@ class Indexer:
 
         # Build and save FAISS
         index = await self._build_faiss(vectors, ids)
-        index_path = os.path.join(self.cfg.index_dir, f"{project_id}.index")
-        await asyncio.to_thread(_save_faiss, index, index_path)
+        safe_id = _sanitize_project_id(project_id)
+        index_path = os.path.join(self.cfg.index_dir, f"{safe_id}.index")
+
+        # Acquire lock to prevent race condition with concurrent reads
+        lock = await _get_project_lock(project_id)
+        async with lock:
+            await asyncio.to_thread(_save_faiss, index, index_path)
 
         await dbmod.refresh_project_stats(self.cfg.db_path, project_id)
         # Save file_count
@@ -125,6 +153,8 @@ class Indexer:
         return project_id
 
     async def update_project(self, *, project_id: str) -> Dict[str, int]:
+        # Sanitize project_id to prevent path traversal
+        project_id = _sanitize_project_id(project_id)
         await dbmod.init_db(self.cfg.db_path)
         proj = await dbmod.get_project(self.cfg.db_path, project_id)
         if not proj:
@@ -135,7 +165,17 @@ class Indexer:
             raise ValueError("Project has no stored directory; cannot update.")
 
         project_type = proj["project_type"]
-        model_name = (proj.get("metadata") or {}).get("model_name") or _pick_model_name(project_type, self.cfg)
+        stored_model = (proj.get("metadata") or {}).get("model_name")
+        current_model = _pick_model_name(project_type, self.cfg)
+
+        # Enforce model consistency to prevent vector space pollution
+        if stored_model and stored_model != current_model:
+            raise ValueError(
+                f"Model mismatch: project was indexed with '{stored_model}' but config specifies '{current_model}'. "
+                f"Delete and re-index the project, or update config to use the original model."
+            )
+
+        model_name = stored_model or current_model
         device = (proj.get("metadata") or {}).get("device") or ("cuda" if _cuda_available() else "cpu")
 
         # Parse current directory
@@ -171,8 +211,13 @@ class Indexer:
         ids = np.asarray([r["internal_id"] for r in all_rows], dtype=np.int64)
 
         index = await self._build_faiss(vectors, ids)
-        index_path = os.path.join(self.cfg.index_dir, f"{project_id}.index")
-        await asyncio.to_thread(_save_faiss, index, index_path)
+        safe_id = _sanitize_project_id(project_id)
+        index_path = os.path.join(self.cfg.index_dir, f"{safe_id}.index")
+
+        # Acquire lock to prevent race condition with concurrent reads
+        lock = await _get_project_lock(project_id)
+        async with lock:
+            await asyncio.to_thread(_save_faiss, index, index_path)
 
         await dbmod.refresh_project_stats(self.cfg.db_path, project_id)
         await _set_file_count(self.cfg.db_path, project_id, file_count)
@@ -190,9 +235,24 @@ def _cuda_available() -> bool:
 
 def _save_faiss(index: Any, path: str) -> None:
     import faiss
+    import tempfile
 
     os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
-    faiss.write_index(index, path)
+
+    # Write to temporary file first for atomic update
+    dir_path = os.path.dirname(os.path.abspath(path))
+    with tempfile.NamedTemporaryFile(mode='wb', delete=False, dir=dir_path, suffix='.index.tmp') as tmp:
+        tmp_path = tmp.name
+
+    try:
+        faiss.write_index(index, tmp_path)
+        # Atomic rename (POSIX guarantees atomicity)
+        os.replace(tmp_path, path)
+    except Exception:
+        # Clean up temp file on failure
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        raise
 
 
 async def _set_file_count(db_path: str, project_id: str, file_count: int) -> None:
