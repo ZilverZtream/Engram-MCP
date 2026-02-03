@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Dict, Optional
+import os
+import re
+from typing import Any, Dict, Optional, Tuple
 
 from fastmcp import FastMCP
 
 from engram_mcp.config import load_config
 from engram_mcp.embeddings import Embedder
 from engram_mcp.indexing import Indexer
+from engram_mcp.locks import get_project_lock
 from engram_mcp.jobs import JobManager
 from engram_mcp.search import SearchEngine
 from engram_mcp.security import PathNotAllowed, enforce_allowed_roots
@@ -21,6 +24,8 @@ mcp = FastMCP(name="Engram MCP")
 jobs = JobManager()
 indexer = Indexer(cfg)
 search_engine = SearchEngine(db_path=cfg.db_path, index_dir=cfg.index_dir)
+_embedder_cache: Dict[str, Tuple[str, str, Embedder]] = {}
+_embedder_lock = asyncio.Lock()
 
 
 def _device() -> str:
@@ -32,6 +37,13 @@ def _device() -> str:
         return "cpu"
 
 
+def _sanitize_project_id(project_id: str) -> str:
+    sanitized = os.path.basename(project_id)
+    if not re.match(r"^[a-zA-Z0-9_-]+$", sanitized):
+        raise ValueError(f"Invalid project_id: {project_id}. Only alphanumeric characters, underscores, and hyphens are allowed.")
+    return sanitized
+
+
 async def _get_embedder_for_project(project_id: str) -> Embedder:
     proj = await dbmod.get_project(cfg.db_path, project_id)
     if not proj:
@@ -40,7 +52,19 @@ async def _get_embedder_for_project(project_id: str) -> Embedder:
     md = proj.get("metadata") or {}
     model_name = md.get("model_name") or cfg.model_name_text
     device = md.get("device") or _device()
-    return Embedder(model_name=model_name, device=device, prefer_thread_for_cuda=cfg.prefer_thread_for_cuda)
+    async with _embedder_lock:
+        cached = _embedder_cache.get(project_id)
+        if cached and cached[0] == model_name and cached[1] == device:
+            return cached[2]
+        if cached:
+            cached[2].close()
+        embedder = Embedder(
+            model_name=model_name,
+            device=device,
+            prefer_thread_for_cuda=cfg.prefer_thread_for_cuda,
+        )
+        _embedder_cache[project_id] = (model_name, device, embedder)
+        return embedder
 
 
 @mcp.tool
@@ -155,6 +179,39 @@ async def cancel_job(job_id: str) -> str:
     """Cancel an in-progress index/update job by job_id."""
     ok = await jobs.cancel(job_id)
     return "✅ Cancelled" if ok else "❌ Job not found"
+
+
+@mcp.tool
+async def delete_project(project_id: str) -> str:
+    """Delete a project and remove its indexes from disk."""
+    await dbmod.init_db(cfg.db_path)
+    proj = await dbmod.get_project(cfg.db_path, project_id)
+    if not proj:
+        return f"❌ Project not found: {project_id}"
+
+    try:
+        safe_id = _sanitize_project_id(project_id)
+    except ValueError as e:
+        return f"❌ {e}"
+    lock = await get_project_lock(project_id)
+    async with lock:
+        await dbmod.delete_project(cfg.db_path, project_id)
+        index_paths = [
+            os.path.join(cfg.index_dir, f"{safe_id}.index"),
+        ]
+        shard_prefix = os.path.join(cfg.index_dir, f"{safe_id}.shard")
+        for entry in os.listdir(cfg.index_dir):
+            if entry.startswith(os.path.basename(shard_prefix)) and entry.endswith(".index"):
+                index_paths.append(os.path.join(cfg.index_dir, entry))
+        for path in index_paths:
+            if os.path.exists(path):
+                os.unlink(path)
+
+    async with _embedder_lock:
+        cached = _embedder_cache.pop(project_id, None)
+        if cached:
+            cached[2].close()
+    return f"✅ Deleted {project_id}"
 
 
 if __name__ == "__main__":

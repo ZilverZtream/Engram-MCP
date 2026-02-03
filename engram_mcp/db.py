@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -274,12 +275,15 @@ async def upsert_chunks(
 async def delete_chunks(db_path: str, project_id: str, chunk_ids: List[str]) -> None:
     if not chunk_ids:
         return
-    placeholders = ",".join(["?"] * len(chunk_ids))
     async with get_connection(db_path) as db:
-        await db.execute(
-            f"DELETE FROM chunks WHERE project_id = ? AND chunk_id IN ({placeholders})",
-            (project_id, *chunk_ids),
-        )
+        batch_size = 900
+        for i in range(0, len(chunk_ids), batch_size):
+            batch = chunk_ids[i:i + batch_size]
+            placeholders = ",".join(["?"] * len(batch))
+            await db.execute(
+                f"DELETE FROM chunks WHERE project_id = ? AND chunk_id IN ({placeholders})",
+                (project_id, *batch),
+            )
         await db.commit()
 
 
@@ -344,20 +348,24 @@ async def fts_search(
     limit: int,
 ) -> List[Dict[str, Any]]:
     """Lexical search using FTS5 + bm25 ranking."""
-    async with get_connection(db_path) as db:
-        db.row_factory = aiosqlite.Row
-        rows = await db.execute_fetchall(
-            """
-            SELECT c.chunk_id, c.internal_id, c.content, c.token_count, c.metadata, c.access_count,
-                   bm25(chunks_fts) AS score
-            FROM chunks_fts
-            JOIN chunks c ON c.chunk_id = chunks_fts.chunk_id
-            WHERE chunks_fts.project_id = ? AND chunks_fts MATCH ?
-            ORDER BY score ASC
-            LIMIT ?
-            """,
-            (project_id, query, limit),
-        )
+    try:
+        async with get_connection(db_path) as db:
+            db.row_factory = aiosqlite.Row
+            rows = await db.execute_fetchall(
+                """
+                SELECT c.chunk_id, c.internal_id, c.content, c.token_count, c.metadata, c.access_count,
+                       bm25(chunks_fts) AS score
+                FROM chunks_fts
+                JOIN chunks c ON c.chunk_id = chunks_fts.chunk_id
+                WHERE chunks_fts.project_id = ? AND chunks_fts MATCH ?
+                ORDER BY score ASC
+                LIMIT ?
+                """,
+                (project_id, query, limit),
+            )
+    except aiosqlite.OperationalError:
+        logging.warning("FTS query failed for %s", project_id, exc_info=True)
+        return []
 
     out: List[Dict[str, Any]] = []
     for r in rows:

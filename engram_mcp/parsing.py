@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import fnmatch
+import logging
 import os
 from pathlib import Path
 from dataclasses import dataclass
@@ -24,10 +25,20 @@ def _is_ignored(path: str, ignore_patterns: List[str]) -> bool:
     return False
 
 
+def _is_within_root(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+    except ValueError:
+        return False
+    return True
+
+
 def iter_files(root: str, ignore_patterns: List[str]) -> Iterator[Path]:
     root_p = Path(root)
     for p in root_p.rglob("*"):
         if not p.is_file():
+            continue
+        if not _is_within_root(p, root_p):
             continue
         rel = str(p.relative_to(root_p))
         if _is_ignored(rel, ignore_patterns):
@@ -53,6 +64,8 @@ def parse_file_to_chunks(
     overlap_tokens: int,
     max_file_size_mb: int,
 ) -> List[Chunk]:
+    if not _is_within_root(path, Path(root)):
+        raise ValueError(f"Path escapes root: {path}")
     ext = path.suffix.lower()
     rel = str(path.relative_to(root))
     base_meta: Dict[str, object] = {
@@ -187,6 +200,7 @@ async def parse_directory(
                     max_file_size_mb=max_file_size_mb,
                 )
             except Exception:
+                logging.warning("Failed to parse %s", rel, exc_info=True)
                 return None
 
         changed_files.append(rel)
@@ -199,9 +213,9 @@ async def parse_directory(
         file_metadata[rel] = parsed
         return parsed
 
-    tasks = [parse_one(p) for p in files]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    for res in results:
+    tasks = [asyncio.create_task(parse_one(p)) for p in files]
+    for coro in asyncio.as_completed(tasks):
+        res = await coro
         if isinstance(res, ParsedFile):
             if res.chunks:
                 chunks.extend(res.chunks)
