@@ -1,0 +1,12 @@
+# REQUIRED: restrict what can be indexed
+allowed_roots:
+  - /Users/you/Documents
+  - /Users/you/Projects
+
+# Optional overrides
+# db_path: /Users/you/.engram_mcp/memory.db
+# index_dir: /Users/you/.engram_mcp
+# chunk_size_tokens: 200
+# overlap_tokens: 30
+# max_file_size_mb: 200
+# embedding_batch_size: 128
