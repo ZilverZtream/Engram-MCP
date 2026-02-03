@@ -13,19 +13,7 @@ import numpy as np
 from numba import jit
 
 from . import db as dbmod
-
-
-# Global project lock manager to prevent race conditions
-_project_locks: Dict[str, asyncio.Lock] = {}
-_locks_lock = asyncio.Lock()
-
-
-async def _get_project_lock(project_id: str) -> asyncio.Lock:
-    """Get or create a lock for a specific project."""
-    async with _locks_lock:
-        if project_id not in _project_locks:
-            _project_locks[project_id] = asyncio.Lock()
-        return _project_locks[project_id]
+from .locks import get_project_lock
 
 
 def _sanitize_project_id(project_id: str) -> str:
@@ -162,6 +150,9 @@ _search_cache: OrderedDict[str, Tuple[float, List[Dict[str, Any]]]] = OrderedDic
 _cache_ttl = 300.0
 _cache_max_items = 512
 _cache_lock = asyncio.Lock()
+_faiss_cache: OrderedDict[str, Tuple[float, Any]] = OrderedDict()
+_faiss_cache_max_items = 8
+_faiss_cache_lock = asyncio.Lock()
 
 
 @dataclass
@@ -182,8 +173,16 @@ class SearchEngine:
         if not os.path.exists(index_path):
             raise FileNotFoundError(f"FAISS index not found: {index_path}")
 
+        index_mtime = os.path.getmtime(index_path)
+        async with _faiss_cache_lock:
+            cached = _faiss_cache.get(index_path)
+            if cached and cached[0] == index_mtime:
+                _faiss_cache.move_to_end(index_path)
+                return cached[1]
+            _faiss_cache.pop(index_path, None)
+
         # Acquire lock to prevent race condition with updates
-        lock = await _get_project_lock(project_id)
+        lock = await get_project_lock(project_id)
         async with lock:
             # Load in thread to avoid blocking event loop
             def _load():
@@ -191,7 +190,14 @@ class SearchEngine:
                 return faiss.read_index(index_path)
 
             loop = asyncio.get_running_loop()
-            return await loop.run_in_executor(None, _load)
+            index = await loop.run_in_executor(None, _load)
+
+        async with _faiss_cache_lock:
+            _faiss_cache[index_path] = (index_mtime, index)
+            _faiss_cache.move_to_end(index_path)
+            while len(_faiss_cache) > _faiss_cache_max_items:
+                _faiss_cache.popitem(last=False)
+        return index
 
     async def vector_search(
         self,

@@ -55,6 +55,7 @@ class Embedder:
     model_name: str
     device: str
     prefer_thread_for_cuda: bool = True
+    prefer_thread_for_cpu: bool = True
     max_workers: int = 2
 
     def __post_init__(self) -> None:
@@ -62,7 +63,9 @@ class Embedder:
         self._thread_pool: Optional[ThreadPoolExecutor] = None
 
     def _ensure_executor(self) -> Tuple[str, Any]:
-        use_thread = self.device.startswith("cuda") and self.prefer_thread_for_cuda
+        use_thread = (self.device.startswith("cuda") and self.prefer_thread_for_cuda) or (
+            not self.device.startswith("cuda") and self.prefer_thread_for_cpu
+        )
         if use_thread:
             if self._thread_pool is None:
                 self._thread_pool = ThreadPoolExecutor(max_workers=1)
