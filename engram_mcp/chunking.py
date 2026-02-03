@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from functools import lru_cache
 from typing import Dict, Iterable, List, Iterator
 
+from tokenizers import Tokenizer
+
 
 @dataclass(frozen=True)
 class Chunk:
@@ -15,28 +17,16 @@ class Chunk:
     metadata: Dict[str, object]
 
 
-@lru_cache(maxsize=50000)
-def _approx_token_count(text: str) -> int:
-    # More accurate token estimation using character-to-token ratio
-    # This works better for code and non-English text than whitespace splitting
-    # Conservative estimate: ~4 characters per token (accounts for punctuation, operators, etc.)
-    # This prevents chunks from exceeding model context windows due to underestimation
-    char_count = len(text)
-    if char_count == 0:
-        return 1
-
-    # Use character-based estimate as primary method
-    char_based = max(1, char_count // 4)
-
-    # Also count words as a sanity check (some texts are very sparse)
-    word_count = len(text.split())
-
-    # Return the larger of the two estimates to be conservative
-    return max(char_based, word_count)
+@lru_cache(maxsize=1)
+def _load_tokenizer() -> Tokenizer:
+    return Tokenizer.from_pretrained("bert-base-uncased")
 
 
 def token_count(text: str) -> int:
-    return _approx_token_count(text)
+    if not text:
+        return 0
+    tokenizer = _load_tokenizer()
+    return len(tokenizer.encode(text).ids)
 
 
 def make_chunk_id(*parts: str) -> str:

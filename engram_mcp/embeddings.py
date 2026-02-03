@@ -4,7 +4,7 @@ import asyncio
 import multiprocessing
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Any, List, Optional, Sequence, Tuple
+from typing import Any, AsyncIterator, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -111,6 +111,19 @@ class Embedder:
     async def embed_one(self, text: str) -> np.ndarray:
         vecs = await self.embed_texts([text])
         return vecs[0]
+
+    async def embed_texts_batched(
+        self,
+        texts: Sequence[str],
+        *,
+        batch_size: int = 256,
+    ) -> AsyncIterator[np.ndarray]:
+        texts_list = list(texts)
+        if not texts_list:
+            return
+        size = max(1, int(batch_size))
+        for i in range(0, len(texts_list), size):
+            yield await self.embed_texts(texts_list[i:i + size])
 
     def close(self) -> None:
         if self._thread_pool is not None:

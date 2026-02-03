@@ -43,6 +43,7 @@ class EngramConfig:
     query_timeout_s: int = 60
     index_timeout_s: int = 3600
     embedding_batch_size: int = 128
+    embedding_cache_ttl_s: int = 0
 
     # Search
     fts_top_k: int = 200
@@ -57,6 +58,16 @@ class EngramConfig:
 
     # Optional: keep GPU embeddings in-process (recommended)
     prefer_thread_for_cuda: bool = True
+
+    # FAISS IVF+PQ settings
+    faiss_nlist: int = 100
+    faiss_m: int = 8
+    faiss_nbits: int = 8
+    faiss_nprobe: int = 16
+
+    # Sharding settings
+    shard_chunk_threshold: int = 1_000_000
+    shard_size: int = 250_000
 
 
 def load_config(path: Optional[str] = None) -> EngramConfig:
