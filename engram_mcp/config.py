@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field
 from typing import List, Optional
@@ -107,5 +108,12 @@ def load_config(path: Optional[str] = None) -> EngramConfig:
     cfg.allowed_roots = [os.path.realpath(p) for p in (cfg.allowed_roots or [])]
     cfg.index_dir = os.path.abspath(cfg.index_dir)
     cfg.db_path = os.path.abspath(cfg.db_path)
+    if int(cfg.overlap_tokens) >= int(cfg.chunk_size_tokens):
+        logging.warning(
+            "overlap_tokens (%s) must be less than chunk_size_tokens (%s); adjusting overlap.",
+            cfg.overlap_tokens,
+            cfg.chunk_size_tokens,
+        )
+        cfg.overlap_tokens = max(0, int(cfg.chunk_size_tokens) - 1)
 
     return cfg

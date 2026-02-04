@@ -128,6 +128,7 @@ class _ConnectionPool:
         self._queue: asyncio.LifoQueue[aiosqlite.Connection] = asyncio.LifoQueue(maxsize)
         self._created = 0
         self._lock = asyncio.Lock()
+        self._all: set[aiosqlite.Connection] = set()
 
     async def acquire(self) -> aiosqlite.Connection:
         try:
@@ -139,6 +140,7 @@ class _ConnectionPool:
                     await conn.execute("PRAGMA foreign_keys=ON;")
                     await conn.execute("PRAGMA journal_mode=WAL;")
                     self._created += 1
+                    self._all.add(conn)
                     return conn
         return await self._queue.get()
 
@@ -146,8 +148,11 @@ class _ConnectionPool:
         await self._queue.put(conn)
 
     async def close(self) -> None:
+        conns = list(self._all)
+        self._all.clear()
         while not self._queue.empty():
-            conn = await self._queue.get()
+            await self._queue.get()
+        for conn in conns:
             await conn.close()
 
 
@@ -467,7 +472,7 @@ def _sanitize_fts_query(query: str) -> str:
     if not query or not query.strip():
         return '""'
     escaped = query.replace('"', '""')
-    return f'"{escaped}"'
+    return escaped
 
 
 async def fts_search(

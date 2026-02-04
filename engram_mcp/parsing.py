@@ -49,6 +49,11 @@ def iter_files(root: str, ignore_patterns: List[str]) -> Iterator[Path]:
 
 def _open_relative(root: Path, path: Path, mode: str, *, encoding: Optional[str] = None):
     rel = path.relative_to(root)
+    if os.name == "nt":
+        resolved = (root / rel).resolve()
+        if not _is_within_root(resolved, root):
+            raise ValueError(f"Path escapes root: {resolved}")
+        return open(resolved, mode, encoding=encoding, errors="ignore" if "b" not in mode else None)
     root_fd = os.open(root, os.O_RDONLY)
     try:
         flags = os.O_RDONLY
@@ -132,9 +137,10 @@ def parse_file_to_chunks(
         total_chars = 0
         for i, page in enumerate(reader.pages):
             page_text = page.extract_text() or ""
-            total_chars += len(page_text)
-            if total_chars > max_text_chars:
+            page_len = len(page_text)
+            if total_chars + page_len > max_text_chars:
                 raise ValueError(f"PDF extracted text too large: {path}")
+            total_chars += page_len
             if not page_text.strip():
                 continue
             page_meta = {**base_meta, "type": "pdf_page", "page": i + 1}

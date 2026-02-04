@@ -197,4 +197,4 @@ class Embedder:
                         self._shared_proc_pools.pop(key, None)
                     else:
                         self._shared_proc_pools[key] = (pool, ref - 1)
-            self._shared_key = None
+                self._shared_key = None
