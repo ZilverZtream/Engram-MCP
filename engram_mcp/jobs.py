@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+import uuid
 from dataclasses import dataclass
 from typing import Any, Awaitable, Dict
 
@@ -14,6 +15,10 @@ class Job:
     kind: str
     created_at: float
     task: asyncio.Task
+
+
+def generate_job_id(kind: str) -> str:
+    return f"{kind}_{int(time.time()*1000)}_{uuid.uuid4().hex[:8]}"
 
 
 class JobManager:
@@ -50,7 +55,7 @@ class JobManager:
         async with self._lock:
             if len(self._jobs) >= self._max_queue_size:
                 raise RuntimeError("Job queue is full; try again later.")
-        job_id = f"{kind}_{int(time.time()*1000)}"
+        job_id = generate_job_id(kind)
         await dbmod.init_db(self._db_path)
         await dbmod.create_job(self._db_path, job_id=job_id, kind=kind, status="QUEUED")
 

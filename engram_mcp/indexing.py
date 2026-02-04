@@ -32,7 +32,7 @@ from .parsing import (
 _PERSIST_BATCH_SIZE = 100
 from .locks import get_project_lock, get_project_rwlock
 from .search import invalidate_faiss_cache
-from .security import PathContext, ProjectID
+from .security import PathContext, ProjectID, validate_project_field
 from . import db as dbmod
 
 
@@ -44,8 +44,7 @@ def _write_index_uuid(path_context: PathContext, index_path: str, uuid_str: str)
     vectors must not be served.
     """
     uuid_path = index_path + ".uuid"
-    with path_context.open_file(uuid_path, "w", encoding="utf-8") as f:
-        f.write(uuid_str)
+    path_context.write_text_atomic(uuid_path, uuid_str, encoding="utf-8")
 
 
 def _slug(s: str) -> str:
@@ -257,6 +256,7 @@ class Indexer:
                 if clear_dirty:
                     await dbmod.clear_project_dirty(self.cfg.db_path, project_id)
         except Exception:
+            logging.error("Failed to persist index batch for project %s", project_id, exc_info=True)
             if vectors_added:
                 try:
                     index.remove_ids(ids)
@@ -270,6 +270,8 @@ class Indexer:
     async def index_project(self, *, directory: str, project_name: str, project_type: str) -> str:
         await dbmod.init_db(self.cfg.db_path)
         directory = str(self.project_path_context.resolve_path(directory))
+        project_name = validate_project_field(project_name, field_name="project_name")
+        project_type = validate_project_field(project_type, field_name="project_type")
         directory_realpath = os.path.realpath(directory)
         existing = await dbmod.get_project_by_name(self.cfg.db_path, project_name=project_name)
         if existing:
@@ -285,14 +287,16 @@ class Indexer:
             return str(existing["project_id"])
 
         project_id = ProjectID(f"{_slug(project_name)}_{time.time_ns()}_{uuid.uuid4().hex[:8]}")
+        rwlock = await get_project_rwlock(str(project_id))
 
-        model_name = _pick_model_name(project_type, self.cfg)
-        device = "cuda" if _cuda_available() else "cpu"
-        project_initialized = False
-        index_path: Optional[str] = None
-        index_current: Optional[str] = None
-        try:
-            file_count = 0
+        async with rwlock.write_lock():
+            model_name = _pick_model_name(project_type, self.cfg)
+            device = "cuda" if _cuda_available() else "cpu"
+            project_initialized = False
+            index_path: Optional[str] = None
+            index_current: Optional[str] = None
+            try:
+                file_count = 0
 
             def iter_indexable_files() -> Iterable[Any]:
                 nonlocal file_count
@@ -353,7 +357,6 @@ class Indexer:
             train_target = max(1000, int(self.cfg.faiss_nlist) * 20)
             index_current, index_new = _index_paths(self.cfg.index_dir, project_id)
             index_path = index_new
-            rwlock = await get_project_rwlock(str(project_id))
             parse_failures = 0
             parse_attempts = 0
             dirty_marked = False
@@ -572,8 +575,6 @@ class Indexer:
                 if index_current and self.index_path_context.exists(index_current):
                     self.index_path_context.unlink(index_current)
             raise
-        finally:
-            pass
 
     async def update_project(self, *, project_id: str) -> Dict[str, int]:
         project = ProjectID(project_id)
@@ -986,6 +987,7 @@ class Indexer:
                 if new_paths:
                     _swap_index_files(self.index_path_context, new_paths)
             except Exception:
+                logging.error("Failed to update sharded indexes for project %s", project_id, exc_info=True)
                 if added_chunk_ids:
                     await dbmod.delete_chunks(self.cfg.db_path, project_id, added_chunk_ids)
                 raise
@@ -1313,6 +1315,7 @@ class Indexer:
                     shard_replacements.append((new_path, current_path))
                 _swap_index_files(self.index_path_context, shard_replacements)
             except Exception:
+                logging.error("Failed to swap shard indexes for project %s", project_id, exc_info=True)
                 for new_path, _ in shard_replacements:
                     if self.index_path_context.exists(new_path):
                         self.index_path_context.unlink(new_path)
@@ -1381,14 +1384,14 @@ def _enable_direct_map(index: Any) -> None:
         try:
             index.make_direct_map()
         except Exception:
-            pass
+            logging.debug("Failed to create FAISS direct map", exc_info=True)
         return
     inner = getattr(index, "index", None)
     if inner is not None and hasattr(inner, "make_direct_map"):
         try:
             inner.make_direct_map()
         except Exception:
-            pass
+            logging.debug("Failed to create FAISS inner direct map", exc_info=True)
 
 
 def _save_faiss(index: Any, path_context: PathContext, path: str) -> None:
@@ -1399,6 +1402,10 @@ def _save_faiss(index: Any, path_context: PathContext, path: str) -> None:
     try:
         faiss.write_index(index, tmp_path)
         _replace_with_retries(path_context, tmp_path, path)
+        try:
+            path_context.chmod(path, 0o600)
+        except OSError:
+            logging.debug("Failed to chmod index file %s", path, exc_info=True)
     except Exception:
         if path_context.exists(tmp_path):
             path_context.unlink(tmp_path)
@@ -1450,3 +1457,30 @@ def _swap_index_files(path_context: PathContext, replacements: List[Tuple[str, s
             if path_context.exists(new_path):
                 path_context.unlink(new_path)
         raise
+
+
+def ensure_index_permissions(path_context: PathContext, index_dir: str) -> None:
+    """Best-effort chmod of index artifacts to owner-only permissions."""
+    try:
+        path_context.makedirs(index_dir, exist_ok=True)
+    except Exception:
+        logging.warning("Failed to create index directory %s", index_dir, exc_info=True)
+        return
+    try:
+        entries = path_context.list_dir(index_dir)
+    except Exception:
+        logging.warning("Failed to list index directory %s", index_dir, exc_info=True)
+        return
+    for entry in entries:
+        if not (
+            entry.endswith(".index.current")
+            or entry.endswith(".index.new")
+            or entry.endswith(".uuid")
+            or entry.endswith(".index.tmp")
+        ):
+            continue
+        path = os.path.join(index_dir, entry)
+        try:
+            path_context.chmod(path, 0o600)
+        except OSError:
+            logging.debug("Failed to chmod index artifact %s", path, exc_info=True)

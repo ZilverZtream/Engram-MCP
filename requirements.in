@@ -1,0 +1,15 @@
+fastmcp
+aiosqlite
+PyYAML
+pydantic
+numpy
+sentence-transformers
+pypdf
+python-docx
+tokenizers
+numba
+httpx
+# Choose ONE:
+# faiss-cpu
+# faiss-gpu
+# Torch is required by sentence-transformers; install the correct build for your platform.

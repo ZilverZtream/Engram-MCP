@@ -36,7 +36,11 @@ def _load_tokenizer() -> Tokenizer | None:
     try:
         return Tokenizer.from_file(tokenizer_path)
     except Exception:
-        logging.warning("Failed to load tokenizer from %s; using regex token offsets.", tokenizer_path)
+        logging.warning(
+            "Failed to load tokenizer from %s; using regex token offsets.",
+            tokenizer_path,
+            exc_info=True,
+        )
         return None
 
 

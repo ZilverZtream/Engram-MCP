@@ -245,7 +245,8 @@ class SearchEngine:
                     for iid in ids:
                         try:
                             embeddings[iid] = index.reconstruct(int(iid))
-                        except Exception:
+                        except (ValueError, RuntimeError):
+                            logging.debug("Failed to reconstruct embedding %s", iid, exc_info=True)
                             continue
             return embeddings
 
@@ -254,7 +255,8 @@ class SearchEngine:
             for iid in internal_ids:
                 try:
                     embeddings[iid] = index.reconstruct(int(iid))
-                except Exception:
+                except (ValueError, RuntimeError):
+                    logging.debug("Failed to reconstruct embedding %s", iid, exc_info=True)
                     continue
         return embeddings
 
@@ -348,6 +350,7 @@ class SearchEngine:
         return_k: int,
         enable_mmr: bool,
         mmr_lambda: float,
+        fts_mode: str = "strict",
     ) -> List[Dict[str, Any]]:
         params_hash = hashlib.sha256(
             f"{fts_top_k}:{vector_top_k}:{return_k}:{enable_mmr}:{mmr_lambda}".encode("utf-8")
@@ -361,15 +364,19 @@ class SearchEngine:
             if cached:
                 _search_cache.pop(cache_key, None)
 
-        lex = await dbmod.fts_search(self.db_path, project_id=project_id, query=query, limit=fts_top_k)
-        proj = await dbmod.get_project(self.db_path, project_id)
-        shard_count = int((proj.get("metadata") or {}).get("shard_count") or 1) if proj else 1
-        if shard_count > 1:
-            vec = await self._vector_search_sharded(
-                project_id=project_id, query_vec=query_vec, top_k=vector_top_k, shard_count=shard_count
+        rwlock = await get_project_rwlock(project_id)
+        async with rwlock.read_lock():
+            lex = await dbmod.fts_search(
+                self.db_path, project_id=project_id, query=query, limit=fts_top_k, mode=fts_mode
             )
-        else:
-            vec = await self.vector_search(project_id=project_id, query_vec=query_vec, top_k=vector_top_k)
+            proj = await dbmod.get_project(self.db_path, project_id)
+            shard_count = int((proj.get("metadata") or {}).get("shard_count") or 1) if proj else 1
+            if shard_count > 1:
+                vec = await self._vector_search_sharded(
+                    project_id=project_id, query_vec=query_vec, top_k=vector_top_k, shard_count=shard_count
+                )
+            else:
+                vec = await self.vector_search(project_id=project_id, query_vec=query_vec, top_k=vector_top_k)
 
         # Offload RRF calculation to thread to prevent event loop blocking
         combined = await asyncio.to_thread(rrf_combine, lex, vec, 60)

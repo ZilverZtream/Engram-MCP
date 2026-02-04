@@ -4,6 +4,7 @@ import asyncio
 import multiprocessing
 import os
 import threading
+import random
 from collections import OrderedDict
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass
@@ -35,25 +36,56 @@ class OllamaBackend:
     def __init__(self, model_name: str, url: str = "http://localhost:11434") -> None:
         self.model_name = model_name
         self.url = url.rstrip("/")
+        self._client: Optional["httpx.AsyncClient"] = None
+        self._lock = asyncio.Lock()
+        self._max_retries = 3
 
-    async def encode(self, texts: List[str]) -> np.ndarray:
+    async def _get_client(self) -> "httpx.AsyncClient":
         import httpx
 
+        async with self._lock:
+            if self._client is None:
+                timeout = httpx.Timeout(connect=10.0, read=120.0, write=10.0, pool=10.0)
+                limits = httpx.Limits(max_connections=10, max_keepalive_connections=5)
+                self._client = httpx.AsyncClient(timeout=timeout, limits=limits)
+            return self._client
+
+    async def _post_with_retry(self, url: str, *, json: Dict[str, Any]) -> "httpx.Response":
+        import httpx
+
+        last_exc: Exception | None = None
+        for attempt in range(self._max_retries):
+            client = await self._get_client()
+            try:
+                resp = await client.post(url, json=json)
+                if resp.status_code in {408, 429, 500, 502, 503, 504}:
+                    raise httpx.HTTPStatusError("Retryable response", request=resp.request, response=resp)
+                resp.raise_for_status()
+                return resp
+            except (httpx.TimeoutException, httpx.NetworkError, httpx.HTTPStatusError) as exc:
+                last_exc = exc
+                if attempt >= self._max_retries - 1:
+                    raise
+                backoff = 0.5 * (2 ** attempt) + random.random() * 0.1
+                await asyncio.sleep(backoff)
+        if last_exc:
+            raise last_exc
+        raise RuntimeError("Retry loop exited unexpectedly.")
+
+    async def encode(self, texts: List[str]) -> np.ndarray:
         vectors: List[List[float]] = []
-        async with httpx.AsyncClient() as client:
-            # Ollama accepts a list of inputs in one request.
-            resp = await client.post(
-                f"{self.url}/api/embed",
-                json={"model": self.model_name, "input": texts},
-                timeout=120.0,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            vectors = data.get("embeddings", [])
+        resp = await self._post_with_retry(
+            f"{self.url}/api/embed",
+            json={"model": self.model_name, "input": texts},
+        )
+        data = resp.json()
+        vectors = data.get("embeddings", [])
         return np.asarray(vectors, dtype=np.float32)
 
     async def close(self) -> None:
-        pass
+        if self._client is not None:
+            await self._client.aclose()
+            self._client = None
 
 
 # ---------------------------------------------------------------------------
@@ -71,24 +103,59 @@ class OpenAIBackend:
         self.model_name = model_name
         self.api_key = api_key
         self.api_base = api_base.rstrip("/")
+        self._client: Optional["httpx.AsyncClient"] = None
+        self._lock = asyncio.Lock()
+        self._max_retries = 3
 
-    async def encode(self, texts: List[str]) -> np.ndarray:
+    async def _get_client(self) -> "httpx.AsyncClient":
         import httpx
 
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(
-                f"{self.api_base}/embeddings",
-                headers={"Authorization": f"Bearer {self.api_key}"},
-                json={"model": self.model_name, "input": texts},
-                timeout=120.0,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            vectors = [item["embedding"] for item in data["data"]]
+        async with self._lock:
+            if self._client is None:
+                timeout = httpx.Timeout(connect=10.0, read=120.0, write=10.0, pool=10.0)
+                limits = httpx.Limits(max_connections=10, max_keepalive_connections=5)
+                self._client = httpx.AsyncClient(timeout=timeout, limits=limits)
+            return self._client
+
+    async def _post_with_retry(self, url: str, *, json: Dict[str, Any]) -> "httpx.Response":
+        import httpx
+
+        last_exc: Exception | None = None
+        for attempt in range(self._max_retries):
+            client = await self._get_client()
+            try:
+                resp = await client.post(
+                    url,
+                    headers={"Authorization": f"Bearer {self.api_key}"},
+                    json=json,
+                )
+                if resp.status_code in {408, 429, 500, 502, 503, 504}:
+                    raise httpx.HTTPStatusError("Retryable response", request=resp.request, response=resp)
+                resp.raise_for_status()
+                return resp
+            except (httpx.TimeoutException, httpx.NetworkError, httpx.HTTPStatusError) as exc:
+                last_exc = exc
+                if attempt >= self._max_retries - 1:
+                    raise
+                backoff = 0.5 * (2 ** attempt) + random.random() * 0.1
+                await asyncio.sleep(backoff)
+        if last_exc:
+            raise last_exc
+        raise RuntimeError("Retry loop exited unexpectedly.")
+
+    async def encode(self, texts: List[str]) -> np.ndarray:
+        resp = await self._post_with_retry(
+            f"{self.api_base}/embeddings",
+            json={"model": self.model_name, "input": texts},
+        )
+        data = resp.json()
+        vectors = [item["embedding"] for item in data["data"]]
         return np.asarray(vectors, dtype=np.float32)
 
     async def close(self) -> None:
-        pass
+        if self._client is not None:
+            await self._client.aclose()
+            self._client = None
 
 
 # -----------------
@@ -397,7 +464,7 @@ class EmbeddingService:
         vecs = await self.embed_texts([text], model_name=model_name, device=device)
         return vecs[0]
 
-    async def close(self) -> None:
+    async def close(self, *, graceful: bool = True) -> None:
         for task in self._workers:
             task.cancel()
         if self._workers:

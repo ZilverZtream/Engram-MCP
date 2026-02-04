@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -234,16 +235,50 @@ class _ConnectionPool:
             await conn.close()
 
 
-_pool: Optional[_ConnectionPool] = None
+_pools: Dict[str, _ConnectionPool] = {}
 _pool_lock = asyncio.Lock()
 
 
 async def _get_pool(db_path: str) -> _ConnectionPool:
-    global _pool
+    ensure_db_permissions(db_path)
     async with _pool_lock:
-        if _pool is None or _pool.db_path != db_path:
-            _pool = _ConnectionPool(db_path=db_path, maxsize=10)
-        return _pool
+        pool = _pools.get(db_path)
+        if pool is None:
+            pool = _ConnectionPool(db_path=db_path, maxsize=10)
+            _pools[db_path] = pool
+        return pool
+
+
+def ensure_db_permissions(db_path: str) -> None:
+    db_path = os.path.abspath(db_path)
+    db_dir = os.path.dirname(db_path)
+    os.makedirs(db_dir, exist_ok=True)
+    if not os.path.exists(db_path):
+        flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+        try:
+            fd = os.open(db_path, flags, 0o600)
+            os.close(fd)
+        except FileExistsError:
+            pass
+        except OSError:
+            logging.warning("Failed to create database file %s securely.", db_path, exc_info=True)
+    if os.name != "nt":
+        try:
+            os.chmod(db_path, 0o600)
+        except OSError:
+            logging.warning("Failed to chmod database file %s", db_path, exc_info=True)
+
+
+async def close_db_pool(db_path: Optional[str] = None) -> None:
+    async with _pool_lock:
+        if db_path is None:
+            pools = list(_pools.values())
+            _pools.clear()
+        else:
+            pool = _pools.pop(db_path, None)
+            pools = [pool] if pool else []
+    for pool in pools:
+        await pool.close()
 
 
 @asynccontextmanager
@@ -257,6 +292,7 @@ async def get_connection(db_path: str) -> Iterable[aiosqlite.Connection]:
 
 
 async def init_db(db_path: str) -> None:
+    ensure_db_permissions(db_path)
     async with get_connection(db_path) as db:
         await db.executescript(SCHEMA_SQL)
         await _ensure_file_metadata_schema(db)
@@ -311,7 +347,8 @@ async def _migrate_file_chunks_from_metadata(db: aiosqlite.Connection) -> None:
     async for project_id, file_path, chunk_ids_json in cursor:
         try:
             chunk_ids = json.loads(chunk_ids_json or "[]")
-        except Exception:
+        except json.JSONDecodeError:
+            logging.warning("Failed to decode chunk_ids for %s", file_path, exc_info=True)
             chunk_ids = []
         for chunk_id in chunk_ids:
             batch.append((str(project_id), str(file_path), str(chunk_id)))
@@ -627,12 +664,35 @@ def _sanitize_fts_query(query: str) -> str:
     if not query or not query.strip():
         return '""'
     # Replace FTS5 syntax operators and angle-brackets with spaces.
-    cleaned = re.sub(r'[*"^+(){}<>]', ' ', query)
+    cleaned = re.sub(r'[*^+(){}<>]', ' ', query)
     tokens = [t for t in cleaned.split() if t]
     if not tokens:
         return '""'
     tokens = [t[:64] for t in tokens[:50]]
     return " AND ".join(f'"{t}"' for t in tokens)
+
+
+def build_fts_query(query: str, *, mode: str = "strict") -> str:
+    """Build a sanitized FTS5 query string supporting AND/OR modes and phrases."""
+    if not query or not query.strip():
+        return '""'
+    cleaned = re.sub(r'[*^+(){}<>]', ' ', query)
+    parts = re.findall(r'"([^"]+)"|(\S+)', cleaned)
+    tokens: List[str] = []
+    for quoted, plain in parts:
+        token = quoted or plain
+        if not token:
+            continue
+        token = token.strip()
+        if not token:
+            continue
+        token = re.sub(r'\s+', ' ', token)
+        tokens.append(token)
+    if not tokens:
+        return '""'
+    tokens = [t[:64] for t in tokens[:50]]
+    joiner = " OR " if str(mode).lower() == "any" else " AND "
+    return joiner.join(f'"{t}"' for t in tokens)
 
 
 async def fts_search(
@@ -641,9 +701,10 @@ async def fts_search(
     project_id: str,
     query: str,
     limit: int,
+    mode: str = "strict",
 ) -> List[Dict[str, Any]]:
     """Lexical search using FTS5 + bm25 ranking."""
-    sanitized = _sanitize_fts_query(query)
+    sanitized = build_fts_query(query, mode=mode)
     try:
         async with get_connection(db_path) as db:
             db.row_factory = aiosqlite.Row
@@ -1009,7 +1070,8 @@ async def fetch_chunk_batch(
         meta = {}
         try:
             meta = json.loads(meta_json or "{}")
-        except Exception:
+        except json.JSONDecodeError:
+            logging.warning("Failed to decode chunk metadata for %s", cid, exc_info=True)
             meta = {}
         out.append(
             {
