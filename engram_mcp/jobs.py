@@ -23,8 +23,24 @@ class JobManager:
         # Semaphore to limit concurrent jobs and prevent DoS
         self._semaphore = asyncio.Semaphore(max_concurrent_jobs)
         self._db_path = db_path
+        self._reconciled = False
+        self._reconcile_lock = asyncio.Lock()
+
+    async def _ensure_reconciled(self) -> None:
+        if self._reconciled:
+            return
+        async with self._reconcile_lock:
+            if self._reconciled:
+                return
+            await dbmod.init_db(self._db_path)
+            await dbmod.mark_stale_jobs_failed(
+                self._db_path,
+                error="Job interrupted by server restart.",
+            )
+            self._reconciled = True
 
     async def create(self, kind: str, coro: Awaitable[Any]) -> Job:
+        await self._ensure_reconciled()
         job_id = f"{kind}_{int(time.time()*1000)}"
         await dbmod.init_db(self._db_path)
         await dbmod.create_job(self._db_path, job_id=job_id, kind=kind, status="QUEUED")
@@ -70,6 +86,7 @@ class JobManager:
         return True
 
     async def list(self) -> Dict[str, Dict[str, Any]]:
+        await self._ensure_reconciled()
         await dbmod.init_db(self._db_path)
         rows = await dbmod.list_jobs(self._db_path)
         out: Dict[str, Dict[str, Any]] = {}

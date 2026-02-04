@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import multiprocessing
 import threading
+from collections import OrderedDict
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, AsyncIterator, Dict, List, Optional, Sequence, Tuple
@@ -215,10 +216,12 @@ class EmbeddingService:
         prefer_thread_for_cuda: bool,
         worker_count: int = 2,
         max_workers_per_model: int = 2,
+        max_cached_models: int = 4,
     ) -> None:
         self._prefer_thread_for_cuda = prefer_thread_for_cuda
         self._worker_count = max(1, int(worker_count))
         self._max_workers_per_model = max(1, int(max_workers_per_model))
+        self._max_cached_models = max(1, int(max_cached_models))
         self._queue: asyncio.Queue[_EmbeddingRequest] = asyncio.Queue()
         self._workers: List[asyncio.Task] = []
         self._started = asyncio.Event()
@@ -233,7 +236,7 @@ class EmbeddingService:
             self._started.set()
 
     async def _worker_loop(self) -> None:
-        embedder_cache: Dict[Tuple[str, str], Embedder] = {}
+        embedder_cache: "OrderedDict[Tuple[str, str], Embedder]" = OrderedDict()
         try:
             while True:
                 req = await self._queue.get()
@@ -247,6 +250,12 @@ class EmbeddingService:
                         max_workers=self._max_workers_per_model,
                     )
                     embedder_cache[key] = embedder
+                    embedder_cache.move_to_end(key)
+                    while len(embedder_cache) > self._max_cached_models:
+                        old_key, old_embedder = embedder_cache.popitem(last=False)
+                        old_embedder.close()
+                else:
+                    embedder_cache.move_to_end(key)
                 try:
                     vectors = await embedder.embed_texts(req.texts)
                 except Exception as exc:

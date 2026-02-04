@@ -178,8 +178,8 @@ class SearchEngine:
 
         # Load in thread to avoid blocking event loop
         def _load():
-            # Use IO_FLAG_READ_ONLY instead of MMAP to avoid SIGBUS issues
-            return faiss.read_index(index_path)
+            # Use read-only mode to avoid keeping write locks / mmap handles open.
+            return faiss.read_index(index_path, faiss.IO_FLAG_READ_ONLY)
 
         loop = asyncio.get_running_loop()
         index = await loop.run_in_executor(None, _load)
