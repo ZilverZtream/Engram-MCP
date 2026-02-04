@@ -201,16 +201,16 @@ def hash_and_parse_file(
         raise ValueError(f"File too large: {path} ({size} bytes)")
 
     ext = path.suffix.lower()
-    rel = str(path.relative_to(root))
-    base_meta: Dict[str, object] = {
-        "item_name": rel,
-        "path": str(path),
-        "ext": ext,
-        "type": "file",
-        "project_type": project_type,
-    }
 
     if ext in SUPPORTED_TEXT_EXTS:
+        rel = str(path.relative_to(root))
+        base_meta: Dict[str, object] = {
+            "item_name": rel,
+            "path": str(path),
+            "ext": ext,
+            "type": "file",
+            "project_type": project_type,
+        }
         hasher = hashlib.sha256()
         decoder = codecs.getincrementaldecoder("utf-8")(errors="ignore")
         buffer = ""
@@ -250,60 +250,19 @@ def hash_and_parse_file(
         )
         return chunks, hasher.hexdigest()
 
-    if ext == ".pdf":
-        from pypdf import PdfReader
-
-        content_hash = hash_file(path_context, path, Path(root), max_bytes)
-        max_text_chars = max_bytes * 4
-        with path_context.open_file(path, "rb") as fh:
-            reader = PdfReader(fh)
-        chunks: List[Chunk] = []
-        base_id = make_chunk_id(str(path))
-        total_chars = 0
-        for i, page in enumerate(reader.pages):
-            page_text = page.extract_text() or ""
-            page_len = len(page_text)
-            if total_chars + page_len > max_text_chars:
-                raise ValueError(f"PDF extracted text too large: {path}")
-            total_chars += page_len
-            if not page_text.strip():
-                continue
-            page_meta = {**base_meta, "type": "pdf_page", "page": i + 1}
-            if token_count(page_text) <= chunk_size_tokens * 2:
-                cid = make_chunk_id(base_id, f"page:{i+1}", page_text)
-                chunks.append(Chunk(cid, page_text, token_count(page_text), page_meta))
-            else:
-                chunks.extend(
-                    chunk_text(
-                        text=page_text,
-                        base_id=make_chunk_id(base_id, f"page:{i+1}"),
-                        meta=page_meta,
-                        target_tokens=chunk_size_tokens,
-                        overlap_tokens=overlap_tokens,
-                    )
-                )
-        return chunks, content_hash
-
-    if ext == ".docx":
-        from docx import Document
-
-        content_hash = hash_file(path_context, path, Path(root), max_bytes)
-        with path_context.open_file(path, "rb") as fh:
-            doc = Document(fh)
-        paras = [p.text for p in doc.paragraphs if p.text and p.text.strip()]
-        text = "\n".join(paras)
-        base_id = make_chunk_id(str(path))
-        chunks = chunk_text(
-            text=text,
-            base_id=base_id,
-            meta={**base_meta, "type": "docx"},
-            target_tokens=chunk_size_tokens,
-            overlap_tokens=overlap_tokens,
-        )
-        return chunks, content_hash
-
+    # PDF, DOCX, and unsupported: hash first, then delegate parsing
+    # to parse_file_to_chunks so binary-format logic lives in one place.
     content_hash = hash_file(path_context, path, Path(root), max_bytes)
-    return [], content_hash
+    chunks = parse_file_to_chunks(
+        path_context=path_context,
+        path=path,
+        root=root,
+        project_type=project_type,
+        chunk_size_tokens=chunk_size_tokens,
+        overlap_tokens=overlap_tokens,
+        max_file_size_mb=max_file_size_mb,
+    )
+    return chunks, content_hash
 
 
 @dataclass(frozen=True)

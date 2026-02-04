@@ -1186,6 +1186,11 @@ class Indexer:
                             shard_indexes.append(None)
 
                     async with rwlock.write_lock():
+                        # --- dirty-flag protocol: mark before any DB write.
+                        # Crash between upsert_chunks and FAISS disk-write
+                        # is recovered on next update_project call. ---
+                        await dbmod.mark_project_dirty(self.cfg.db_path, str(project))
+
                         if internal_ids_to_delete:
                             for shard_id, index in enumerate(shard_indexes):
                                 if index is None:
@@ -1234,6 +1239,8 @@ class Indexer:
                                 await asyncio.to_thread(
                                     _write_index_uuid, self.index_path_context, current_path, index_uuid
                                 )
+                        # All shards safely on disk — clear the dirty flag.
+                        await dbmod.clear_project_dirty(self.cfg.db_path, str(project))
                         await dbmod.upsert_project(
                             self.cfg.db_path,
                             project_id=str(project),
@@ -1244,7 +1251,7 @@ class Indexer:
                             embedding_dim=int(proj.get("embedding_dim") or 0),
                             metadata=metadata,
                             faiss_index_uuid=index_uuid,
-                            index_dirty=proj.get("index_dirty") or 0,
+                            index_dirty=0,
                             deleting=proj.get("deleting") or 0,
                         )
                 else:
@@ -1255,6 +1262,11 @@ class Indexer:
                     )
 
                     async with rwlock.write_lock():
+                        # --- dirty-flag protocol: mark before any DB write.
+                        # Crash between upsert_chunks and FAISS disk-write
+                        # is recovered on next update_project call. ---
+                        await dbmod.mark_project_dirty(self.cfg.db_path, str(project))
+
                         if internal_ids_to_delete:
                             index.remove_ids(np.asarray(internal_ids_to_delete, dtype=np.int64))
 
@@ -1278,6 +1290,8 @@ class Indexer:
                         await asyncio.to_thread(
                             _write_index_uuid, self.index_path_context, index_current, index_uuid
                         )
+                        # Index safely on disk — clear the dirty flag.
+                        await dbmod.clear_project_dirty(self.cfg.db_path, str(project))
                         await dbmod.upsert_project(
                             self.cfg.db_path,
                             project_id=str(project),
@@ -1288,7 +1302,7 @@ class Indexer:
                             embedding_dim=int(proj.get("embedding_dim") or 0),
                             metadata=metadata,
                             faiss_index_uuid=index_uuid,
-                            index_dirty=proj.get("index_dirty") or 0,
+                            index_dirty=0,
                             deleting=proj.get("deleting") or 0,
                         )
 
