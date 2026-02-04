@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 import os
 import time
 from collections import OrderedDict
@@ -176,13 +177,38 @@ class SearchEngine:
                 return cached[1]
             _faiss_cache.pop(index_path, None)
 
-        # Load in thread to avoid blocking event loop
+        # --- Fix #7: memory-mapped load ---
+        # IO_FLAG_MMAP tells FAISS to mmap the file; the OS pages in only
+        # the regions actually touched during search.  For large IVF
+        # indices this avoids loading the entire file into resident RAM.
         def _load():
-            # Use read-only mode to avoid keeping write locks / mmap handles open.
-            return faiss.read_index(index_path, faiss.IO_FLAG_READ_ONLY)
+            return faiss.read_index(index_path, faiss.IO_FLAG_MMAP)
 
         loop = asyncio.get_running_loop()
         index = await loop.run_in_executor(None, _load)
+
+        # --- Fix #12: UUID integrity check ---
+        # A companion .uuid file is written beside every FAISS index file
+        # when it is saved.  If the file and the project metadata disagree
+        # the index and DB have diverged (e.g. one was deleted manually);
+        # refuse to serve stale / ghost results.
+        uuid_path = index_path + ".uuid"
+        if self.index_path_context.exists(uuid_path):
+            try:
+                with self.index_path_context.open_file(uuid_path, "r", encoding="utf-8") as uf:
+                    file_uuid = uf.read().strip()
+                proj = await dbmod.get_project(self.db_path, project_id)
+                expected_uuid = (proj.get("metadata") or {}).get("faiss_index_uuid") if proj else None
+                if expected_uuid and file_uuid and file_uuid != expected_uuid:
+                    raise RuntimeError(
+                        f"FAISS index UUID mismatch for project {project_id}: "
+                        f"on-disk={file_uuid} vs metadata={expected_uuid}. "
+                        f"The index and database have diverged — re-index required."
+                    )
+            except RuntimeError:
+                raise
+            except Exception:
+                logging.warning("UUID verification skipped for %s", index_path, exc_info=True)
 
         async with _faiss_cache_lock:
             _faiss_cache[index_path] = (index_mtime, index)

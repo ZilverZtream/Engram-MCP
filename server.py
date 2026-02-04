@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import atexit
 import asyncio
 import os
+import signal
 from typing import Any, Dict
 
 from fastmcp import FastMCP
@@ -22,9 +24,15 @@ mcp = FastMCP(name="Engram MCP")
 
 project_path_context = PathContext(cfg.allowed_roots)
 index_path_context = PathContext([cfg.index_dir])
+# Fix #11: honour the configured embedding back-end
 embedding_service = EmbeddingService(
     prefer_thread_for_cuda=cfg.prefer_thread_for_cuda,
     worker_count=max(1, min(4, os.cpu_count() or 4)),
+    embedding_backend=cfg.embedding_backend,
+    ollama_model=cfg.ollama_model,
+    ollama_url=cfg.ollama_url,
+    openai_api_key=cfg.openai_api_key,
+    openai_embedding_model=cfg.openai_embedding_model,
 )
 jobs = JobManager(cfg.db_path)
 indexer = Indexer(cfg, embedding_service, project_path_context, index_path_context)
@@ -33,6 +41,42 @@ search_engine = SearchEngine(
     index_dir=cfg.index_dir,
     index_path_context=index_path_context,
 )
+
+
+# ---------------------------------------------------------------------------
+# Fix #6: graceful shutdown – ensure embedding pools (thread + process)
+# are torn down on exit so that no orphan workers survive.
+# ---------------------------------------------------------------------------
+def _sync_cleanup() -> None:
+    """Best-effort shutdown of embedding pools on interpreter exit."""
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_closed():
+            return
+        if loop.is_running():
+            # Can't block inside a running loop; just cancel worker tasks.
+            for task in embedding_service._workers:
+                task.cancel()
+        else:
+            loop.run_until_complete(embedding_service.close())
+    except Exception:
+        pass
+
+
+atexit.register(_sync_cleanup)
+
+_original_sigterm = signal.getsignal(signal.SIGTERM)
+
+
+def _sigterm_handler(sig: int, frame: Any) -> None:
+    _sync_cleanup()
+    if callable(_original_sigterm):
+        _original_sigterm(sig, frame)  # type: ignore[arg-type]
+    else:
+        raise SystemExit(0)
+
+
+signal.signal(signal.SIGTERM, _sigterm_handler)
 
 
 def _device() -> str:
@@ -185,6 +229,9 @@ async def delete_project(project_id: str) -> str:
             if entry.startswith(shard_prefix) and entry.endswith(".index.current"):
                 index_paths.append(os.path.join(cfg.index_dir, entry))
             if entry.startswith(shard_prefix) and entry.endswith(".index.new"):
+                index_paths.append(os.path.join(cfg.index_dir, entry))
+            # Fix #12: clean up UUID companion files
+            if entry.startswith(str(safe_id)) and entry.endswith(".uuid"):
                 index_paths.append(os.path.join(cfg.index_dir, entry))
         for path in index_paths:
             if index_path_context.exists(path):

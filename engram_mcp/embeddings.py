@@ -2,17 +2,97 @@ from __future__ import annotations
 
 import asyncio
 import multiprocessing
+import os
 import threading
 from collections import OrderedDict
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Any, AsyncIterator, Dict, List, Optional, Sequence, Tuple
+from typing import Any, AsyncIterator, Dict, List, Optional, Protocol, Sequence, Tuple, runtime_checkable
 
 import numpy as np
 
 
+# ---------------------------------------------------------------------------
+# Backend protocol – any class with an async encode() + close() qualifies.
+# ---------------------------------------------------------------------------
+@runtime_checkable
+class EmbedderBackend(Protocol):
+    """Minimal interface that every embedding back-end must satisfy."""
+
+    async def encode(self, texts: List[str]) -> np.ndarray:
+        ...
+
+    async def close(self) -> None:
+        ...
+
+
+# ---------------------------------------------------------------------------
+# Ollama back-end  (local inference server)
+# ---------------------------------------------------------------------------
+class OllamaBackend:
+    """Calls a local Ollama server's /api/embed endpoint."""
+
+    def __init__(self, model_name: str, url: str = "http://localhost:11434") -> None:
+        self.model_name = model_name
+        self.url = url.rstrip("/")
+
+    async def encode(self, texts: List[str]) -> np.ndarray:
+        import httpx
+
+        vectors: List[List[float]] = []
+        async with httpx.AsyncClient() as client:
+            # Ollama accepts a list of inputs in one request.
+            resp = await client.post(
+                f"{self.url}/api/embed",
+                json={"model": self.model_name, "input": texts},
+                timeout=120.0,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            vectors = data.get("embeddings", [])
+        return np.asarray(vectors, dtype=np.float32)
+
+    async def close(self) -> None:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# OpenAI-compatible back-end  (OpenAI, Together, Groq, …)
+# ---------------------------------------------------------------------------
+class OpenAIBackend:
+    """Calls an OpenAI-compatible /embeddings endpoint."""
+
+    def __init__(
+        self,
+        model_name: str,
+        api_key: str,
+        api_base: str = "https://api.openai.com/v1",
+    ) -> None:
+        self.model_name = model_name
+        self.api_key = api_key
+        self.api_base = api_base.rstrip("/")
+
+    async def encode(self, texts: List[str]) -> np.ndarray:
+        import httpx
+
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                f"{self.api_base}/embeddings",
+                headers={"Authorization": f"Bearer {self.api_key}"},
+                json={"model": self.model_name, "input": texts},
+                timeout=120.0,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            vectors = [item["embedding"] for item in data["data"]]
+        return np.asarray(vectors, dtype=np.float32)
+
+    async def close(self) -> None:
+        pass
+
+
 # -----------------
-# Process-pool worker
+# Process-pool worker  (sentence_transformers / local model)
 # -----------------
 _WORKER_MODEL: Any = None
 _WORKER_MODEL_NAME: Optional[str] = None
@@ -75,6 +155,12 @@ class Embedder:
         use_thread = (self.device.startswith("cuda") and self.prefer_thread_for_cuda) or (
             not self.device.startswith("cuda") and self.prefer_thread_for_cpu
         )
+        # Thread-pool worker count: PyTorch releases the GIL during
+        # inference, so multiple workers genuinely overlap on both CPU
+        # and CUDA.  Scale to max_workers (default 2) instead of 1 to
+        # avoid serialising all embedding calls site-wide when several
+        # projects share the same model.
+        _thread_workers = max(1, self.max_workers)
         if use_thread:
             if self.shared:
                 key = (self.model_name, self.device)
@@ -82,13 +168,13 @@ class Embedder:
                     if self._shared_key is None:
                         pool, ref = self._shared_thread_pools.get(key, (None, 0))
                         if pool is None:
-                            pool = ThreadPoolExecutor(max_workers=1)
+                            pool = ThreadPoolExecutor(max_workers=_thread_workers)
                         self._shared_thread_pools[key] = (pool, ref + 1)
                         self._shared_key = ("thread", key)
                     pool = self._shared_thread_pools[key][0]
                 return "thread", pool
             if self._thread_pool is None:
-                self._thread_pool = ThreadPoolExecutor(max_workers=1)
+                self._thread_pool = ThreadPoolExecutor(max_workers=_thread_workers)
             return "thread", self._thread_pool
 
         if self.shared:
@@ -217,6 +303,12 @@ class EmbeddingService:
         worker_count: int = 2,
         max_workers_per_model: int = 2,
         max_cached_models: int = 4,
+        # Backend selection (Fix #11)
+        embedding_backend: str = "sentence_transformers",
+        ollama_model: str = "nomic-embed-text",
+        ollama_url: str = "http://localhost:11434",
+        openai_api_key: str = "",
+        openai_embedding_model: str = "text-embedding-3-small",
     ) -> None:
         self._prefer_thread_for_cuda = prefer_thread_for_cuda
         self._worker_count = max(1, int(worker_count))
@@ -226,6 +318,19 @@ class EmbeddingService:
         self._workers: List[asyncio.Task] = []
         self._started = asyncio.Event()
         self._start_lock = asyncio.Lock()
+
+        # --- backend wiring (Fix #11) ---
+        self._backend_type = embedding_backend
+        self._remote_backend: Optional[EmbedderBackend] = None
+        if embedding_backend == "ollama":
+            self._remote_backend = OllamaBackend(
+                model_name=ollama_model, url=ollama_url
+            )
+        elif embedding_backend == "openai":
+            self._remote_backend = OpenAIBackend(
+                model_name=openai_embedding_model,
+                api_key=openai_api_key,
+            )
 
     async def start(self) -> None:
         async with self._start_lock:
@@ -270,10 +375,17 @@ class EmbeddingService:
             raise
 
     async def embed_texts(self, texts: Sequence[str], *, model_name: str, device: str) -> np.ndarray:
-        await self.start()
         text_list = list(texts)
         if not text_list:
             return np.zeros((0, 0), dtype=np.float32)
+
+        # Remote back-ends (ollama / openai) bypass the local worker loop
+        # entirely — no model files, no process pools, no GIL concerns.
+        if self._remote_backend is not None:
+            return await self._remote_backend.encode(text_list)
+
+        # sentence_transformers path: dispatch through the managed worker loop.
+        await self.start()
         loop = asyncio.get_running_loop()
         future: asyncio.Future = loop.create_future()
         await self._queue.put(
@@ -291,3 +403,5 @@ class EmbeddingService:
         if self._workers:
             await asyncio.gather(*self._workers, return_exceptions=True)
         self._workers.clear()
+        if self._remote_backend is not None:
+            await self._remote_backend.close()

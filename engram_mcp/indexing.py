@@ -20,14 +20,32 @@ from .parsing import (
     ParsedFile,
     iter_files,
     parse_file_to_chunks,
+    hash_and_parse_file,
     SUPPORTED_DOC_EXTS,
     SUPPORTED_TEXT_EXTS,
     hash_file,
 )
+
+# Maximum chunks persisted (embedded + written) in a single batch.
+# Keeps per-file peak memory bounded: 100 chunks × 384-dim float32 ≈ 150 KB
+# of vectors regardless of file size.
+_PERSIST_BATCH_SIZE = 100
 from .locks import get_project_lock, get_project_rwlock
 from .search import invalidate_faiss_cache
 from .security import PathContext, ProjectID
 from . import db as dbmod
+
+
+def _write_index_uuid(path_context: PathContext, index_path: str, uuid_str: str) -> None:
+    """Write a companion .uuid file next to a FAISS index.
+
+    On load (search.py) the UUID is compared against the project metadata
+    row.  A mismatch means the DB and the index have diverged and stale
+    vectors must not be served.
+    """
+    uuid_path = index_path + ".uuid"
+    with path_context.open_file(uuid_path, "w", encoding="utf-8") as f:
+        f.write(uuid_str)
 
 
 def _slug(s: str) -> str:
@@ -204,9 +222,18 @@ class Indexer:
         file_rows: List[dbmod.FileMetadataRow],
         index_path: str,
         rwlock: Any,
+        index_uuid: Optional[str] = None,
     ) -> None:
         chunk_ids = [row[0] for row in rows]
         file_paths = [row.file_path for row in file_rows]
+
+        # --- Fix #2: WAL / dirty-flag protocol ---
+        # Mark the project dirty *before* committing chunks to the DB.
+        # If the process is killed after the DB commit but before the
+        # FAISS file is written, the flag survives in SQLite and triggers
+        # a full index rebuild on the next ``update_project`` call.
+        await dbmod.mark_project_dirty(self.cfg.db_path, project_id)
+
         await dbmod.upsert_file_metadata(self.cfg.db_path, project_id, file_rows)
         await dbmod.upsert_chunks(self.cfg.db_path, project_id=project_id, rows=rows)
         try:
@@ -214,6 +241,13 @@ class Indexer:
             async with rwlock.write_lock():
                 await invalidate_faiss_cache(index_path)
                 await asyncio.to_thread(_save_faiss, index, self.index_path_context, index_path)
+                # --- Fix #12: write UUID companion file ---
+                if index_uuid:
+                    await asyncio.to_thread(
+                        _write_index_uuid, self.index_path_context, index_path, index_uuid
+                    )
+            # FAISS + UUID both on disk — safe to clear dirty flag.
+            await dbmod.clear_project_dirty(self.cfg.db_path, project_id)
         except Exception:
             await dbmod.delete_chunks(self.cfg.db_path, project_id, chunk_ids)
             if file_paths:
@@ -260,12 +294,15 @@ class Indexer:
             max_bytes = int(self.cfg.max_file_size_mb) * 1024 * 1024
 
             async def parse_one(path: Any) -> Optional[ParsedFile]:
+                # Fix #8: single-pass hash + parse to eliminate the
+                # duplicate full-file read that hash_file + parse_file
+                # used to perform.
                 rel = str(path.relative_to(directory))
                 async with sem:
                     try:
-                        async def _parse() -> List[Any]:
+                        async def _hash_and_parse() -> "tuple[List[Any], str]":
                             return await asyncio.to_thread(
-                                parse_file_to_chunks,
+                                hash_and_parse_file,
                                 path_context=self.project_path_context,
                                 path=path,
                                 root=directory,
@@ -277,16 +314,9 @@ class Indexer:
 
                         if str(path.suffix).lower() == ".pdf":
                             async with pdf_sem:
-                                chunks = await asyncio.wait_for(_parse(), timeout=30)
+                                chunks, content_hash = await asyncio.wait_for(_hash_and_parse(), timeout=30)
                         else:
-                            chunks = await asyncio.wait_for(_parse(), timeout=30)
-                        content_hash = await asyncio.to_thread(
-                            hash_file,
-                            self.project_path_context,
-                            path,
-                            Path(directory),
-                            max_bytes,
-                        )
+                            chunks, content_hash = await asyncio.wait_for(_hash_and_parse(), timeout=30)
                     except Exception:
                         logging.warning("Failed to parse %s", rel, exc_info=True)
                         return None
@@ -313,6 +343,9 @@ class Indexer:
             rwlock = await get_project_rwlock(str(project_id))
             parse_failures = 0
             parse_attempts = 0
+            # Fix #12: one stable UUID per project, written alongside every
+            # FAISS index file so search.py can verify consistency.
+            index_uuid = uuid.uuid4().hex
 
             async for parsed in _bounded_gather(iter_indexable_files(), parse_one, max(1, int(os.cpu_count() or 4))):
                 parse_attempts += 1
@@ -322,97 +355,115 @@ class Indexer:
                         raise RuntimeError("Too many files failed to parse; aborting indexing.")
                     continue
 
-                chunk_ids = [c.chunk_id for c in parsed.chunks]
+                all_chunk_ids = [c.chunk_id for c in parsed.chunks]
                 file_row = dbmod.FileMetadataRow(
                     file_path=parsed.file_path,
                     mtime_ns=parsed.mtime_ns,
                     size_bytes=parsed.size_bytes,
                     content_hash=parsed.content_hash,
-                    chunk_ids=chunk_ids,
+                    chunk_ids=all_chunk_ids,
                 )
                 if not parsed.chunks:
                     await dbmod.upsert_file_metadata(self.cfg.db_path, str(project_id), [file_row])
                     continue
-                file_rows = [file_row]
 
-                vectors = await self._embed_chunks_cached(parsed.chunks, model_name=model_name, device=device)
-                if vectors.size == 0:
-                    continue
-                if embedding_dim is None:
-                    embedding_dim = int(vectors.shape[1])
+                # --- Fix #3: batch embed + persist in groups of
+                # _PERSIST_BATCH_SIZE so that vector memory is bounded.
+                # Reserve all internal IDs for this file up-front (cheap
+                # single DB round-trip) then iterate in fixed-size windows.
+                internal_ids = await dbmod.reserve_internal_ids(
+                    self.cfg.db_path, str(project_id), len(parsed.chunks)
+                )
 
-                if not project_initialized:
-                    await dbmod.upsert_project(
-                        self.cfg.db_path,
-                        project_id=str(project_id),
-                        project_name=project_name,
-                        project_type=project_type,
-                        directory=directory,
-                        embedding_dim=embedding_dim,
-                        metadata={
-                            "chunk_size_tokens": self.cfg.chunk_size_tokens,
-                            "overlap_tokens": self.cfg.overlap_tokens,
-                            "model_name": model_name,
-                            "device": device,
-                            "shard_count": 1,
-                            "shard_size": int(self.cfg.shard_size),
-                            "directory_realpath": directory_realpath,
-                        },
-                    )
-                    project_initialized = True
+                for batch_start in range(0, len(parsed.chunks), _PERSIST_BATCH_SIZE):
+                    batch_end = min(batch_start + _PERSIST_BATCH_SIZE, len(parsed.chunks))
+                    batch_chunks = parsed.chunks[batch_start:batch_end]
+                    batch_iids = internal_ids[batch_start:batch_end]
+                    batch_ids_arr = np.asarray(batch_iids, dtype=np.int64)
 
-                internal_ids = await dbmod.reserve_internal_ids(self.cfg.db_path, str(project_id), len(parsed.chunks))
-                ids = np.asarray(internal_ids, dtype=np.int64)
+                    vectors = await self._embed_chunks_cached(batch_chunks, model_name=model_name, device=device)
+                    if vectors.size == 0:
+                        continue
+                    if embedding_dim is None:
+                        embedding_dim = int(vectors.shape[1])
 
-                rows = [
-                    (c.chunk_id, int(iid), c.content, int(c.token_count), c.metadata)
-                    for c, iid in zip(parsed.chunks, internal_ids)
-                ]
-
-                if index is None:
-                    training_vectors.append(vectors)
-                    pending_vectors.append(vectors)
-                    pending_ids.append(ids)
-                    pending_rows.append(rows)
-                    pending_file_rows.append(file_rows)
-                    if sum(v.shape[0] for v in training_vectors) >= train_target:
-                        train_vecs = np.vstack(training_vectors)
-                        pending_total = sum(v.shape[0] for v in pending_vectors)
-                        index = await self._build_faiss_index(
-                            train_vecs,
-                            total_vectors=sum(v.shape[0] for v in training_vectors) + pending_total,
+                    if not project_initialized:
+                        await dbmod.upsert_project(
+                            self.cfg.db_path,
+                            project_id=str(project_id),
+                            project_name=project_name,
+                            project_type=project_type,
+                            directory=directory,
+                            embedding_dim=embedding_dim,
+                            metadata={
+                                "chunk_size_tokens": self.cfg.chunk_size_tokens,
+                                "overlap_tokens": self.cfg.overlap_tokens,
+                                "model_name": model_name,
+                                "device": device,
+                                "shard_count": 1,
+                                "shard_size": int(self.cfg.shard_size),
+                                "directory_realpath": directory_realpath,
+                                "faiss_index_uuid": index_uuid,
+                            },
                         )
-                        for vec_batch, id_batch, row_batch, file_row_batch in zip(
-                            pending_vectors, pending_ids, pending_rows, pending_file_rows
-                        ):
-                            await self._persist_index_batch(
-                                project_id=str(project_id),
-                                index=index,
-                                vectors=vec_batch,
-                                ids=id_batch,
-                                rows=row_batch,
-                                file_rows=file_row_batch,
-                                index_path=index_path,
-                                rwlock=rwlock,
-                            )
-                        training_vectors.clear()
-                        pending_vectors.clear()
-                        pending_ids.clear()
-                        pending_rows.clear()
-                        pending_file_rows.clear()
-                else:
-                    await self._persist_index_batch(
-                        project_id=str(project_id),
-                        index=index,
-                        vectors=vectors,
-                        ids=ids,
-                        rows=rows,
-                        file_rows=file_rows,
-                        index_path=index_path,
-                        rwlock=rwlock,
-                    )
+                        project_initialized = True
 
-                total_chunks += len(parsed.chunks)
+                    batch_rows = [
+                        (c.chunk_id, int(iid), c.content, int(c.token_count), c.metadata)
+                        for c, iid in zip(batch_chunks, batch_iids)
+                    ]
+
+                    # File metadata is written once after ALL batches for
+                    # this file succeed (see below the batch loop).
+                    if index is None:
+                        training_vectors.append(vectors)
+                        pending_vectors.append(vectors)
+                        pending_ids.append(batch_ids_arr)
+                        pending_rows.append(batch_rows)
+                        pending_file_rows.append([])  # file_rows handled post-loop
+                        if sum(v.shape[0] for v in training_vectors) >= train_target:
+                            train_vecs = np.vstack(training_vectors)
+                            pending_total = sum(v.shape[0] for v in pending_vectors)
+                            index = await self._build_faiss_index(
+                                train_vecs,
+                                total_vectors=sum(v.shape[0] for v in training_vectors) + pending_total,
+                            )
+                            for vec_batch, id_batch, row_batch, file_row_batch in zip(
+                                pending_vectors, pending_ids, pending_rows, pending_file_rows
+                            ):
+                                await self._persist_index_batch(
+                                    project_id=str(project_id),
+                                    index=index,
+                                    vectors=vec_batch,
+                                    ids=id_batch,
+                                    rows=row_batch,
+                                    file_rows=file_row_batch,
+                                    index_path=index_path,
+                                    rwlock=rwlock,
+                                    index_uuid=index_uuid,
+                                )
+                            training_vectors.clear()
+                            pending_vectors.clear()
+                            pending_ids.clear()
+                            pending_rows.clear()
+                            pending_file_rows.clear()
+                    else:
+                        await self._persist_index_batch(
+                            project_id=str(project_id),
+                            index=index,
+                            vectors=vectors,
+                            ids=batch_ids_arr,
+                            rows=batch_rows,
+                            file_rows=[],
+                            index_path=index_path,
+                            rwlock=rwlock,
+                            index_uuid=index_uuid,
+                        )
+
+                    total_chunks += len(batch_chunks)
+
+                # All batches for this file persisted; now write its metadata.
+                await dbmod.upsert_file_metadata(self.cfg.db_path, str(project_id), [file_row])
 
             if file_count == 0:
                 raise ValueError("No indexable content found.")
@@ -439,6 +490,7 @@ class Indexer:
                         "shard_count": 1,
                         "shard_size": int(self.cfg.shard_size),
                         "directory_realpath": directory_realpath,
+                        "faiss_index_uuid": index_uuid,
                     },
                 )
 
@@ -457,6 +509,7 @@ class Indexer:
                         file_rows=file_row_batch,
                         index_path=index_path,
                         rwlock=rwlock,
+                        index_uuid=index_uuid,
                     )
                 pending_rows.clear()
                 pending_file_rows.clear()
@@ -514,6 +567,21 @@ class Indexer:
 
         model_name = stored_model or current_model
         device = metadata.get("device") or ("cuda" if _cuda_available() else "cpu")
+
+        # --- Fix #2: dirty-flag recovery ---
+        # If a previous indexing run crashed after writing chunks to the
+        # DB but before persisting the FAISS index, the dirty flag is set.
+        # Rebuild the entire FAISS index from DB state before proceeding.
+        if metadata.get("index_dirty"):
+            logging.warning(
+                "Project %s has index_dirty set (incomplete previous write). "
+                "Rebuilding FAISS index from database.",
+                project_id,
+            )
+            await self._rebuild_index_from_db(project_id=str(project), metadata=metadata)
+            # Re-fetch metadata in case UUID was regenerated
+            proj = await dbmod.get_project(self.cfg.db_path, str(project))
+            metadata = proj.get("metadata") or {}
 
         lock = await get_project_lock(str(project))
         async with lock:
@@ -689,6 +757,8 @@ class Indexer:
                                 await self._add_vectors(shard_indexes[shard_id], shard_vectors, shard_ids)
                             added_count += len(parsed.chunks)
 
+                        # Regenerate UUID so search verifies freshness
+                        index_uuid = uuid.uuid4().hex
                         replacements: List[Tuple[str, str]] = []
                         for shard_id, index in enumerate(shard_indexes):
                             if index is None:
@@ -701,9 +771,19 @@ class Indexer:
                                 self.index_path_context,
                                 new_path,
                             )
+                            # Write UUID companion for each shard
+                            await asyncio.to_thread(
+                                _write_index_uuid, self.index_path_context, new_path, index_uuid
+                            )
                             replacements.append((new_path, current_path))
                         if replacements:
                             _swap_index_files(self.index_path_context, replacements)
+                            # Copy UUID files to .current paths after swap
+                            for new_path, current_path in replacements:
+                                await asyncio.to_thread(
+                                    _write_index_uuid, self.index_path_context, current_path, index_uuid
+                                )
+                        metadata["faiss_index_uuid"] = index_uuid
                 else:
                     index_current, index_new = _index_paths(self.cfg.index_dir, project)
                     index_path = index_current
@@ -747,7 +827,17 @@ class Indexer:
 
                         await invalidate_faiss_cache(index_path)
                         await asyncio.to_thread(_save_faiss, index, self.index_path_context, index_new)
+                        # Write UUID companion; regenerate so search picks up freshness
+                        index_uuid = uuid.uuid4().hex
+                        await asyncio.to_thread(
+                            _write_index_uuid, self.index_path_context, index_new, index_uuid
+                        )
                         _replace_with_retries(self.index_path_context, index_new, index_current)
+                        # Also write UUID on the .current path after rename
+                        await asyncio.to_thread(
+                            _write_index_uuid, self.index_path_context, index_current, index_uuid
+                        )
+                        metadata["faiss_index_uuid"] = index_uuid
 
                 if to_delete_chunk_ids:
                     await dbmod.delete_chunks(self.cfg.db_path, str(project), to_delete_chunk_ids)
@@ -849,6 +939,106 @@ class Indexer:
                 if added_chunk_ids:
                     await dbmod.delete_chunks(self.cfg.db_path, project_id, added_chunk_ids)
                 raise
+
+    async def _rebuild_index_from_db(self, *, project_id: str, metadata: Dict[str, Any]) -> None:
+        """Rebuild the FAISS index entirely from chunks in SQLite.
+
+        Called when the ``index_dirty`` flag indicates a previous crash
+        between a DB commit and a FAISS disk write.  The flag is the
+        only persistent crash-recovery signal; this method restores
+        consistency and clears it.
+        """
+        model_name = metadata.get("model_name") or _pick_model_name("", self.cfg)
+        device = metadata.get("device") or ("cuda" if _cuda_available() else "cpu")
+        project = ProjectID(project_id)
+        shard_count = int(metadata.get("shard_count") or 1)
+        rwlock = await get_project_rwlock(project_id)
+        batch_size = max(1, int(self.cfg.embedding_batch_size))
+
+        # Stream all chunks from DB in batches, embed, and accumulate.
+        all_vectors: List[np.ndarray] = []
+        all_ids: List[int] = []
+        last_internal_id = -1
+
+        while True:
+            batch = await dbmod.fetch_chunk_batch(
+                self.cfg.db_path, project_id,
+                last_internal_id=last_internal_id, batch_size=batch_size,
+            )
+            if not batch:
+                break
+            last_internal_id = batch[-1]["internal_id"]
+            vectors = await self._embed_chunks_cached(
+                [r["chunk"] for r in batch],
+                model_name=model_name, device=device,
+            )
+            all_vectors.append(vectors)
+            all_ids.extend(r["internal_id"] for r in batch)
+
+        if not all_vectors:
+            # No chunks at all; just clear the flag.
+            await dbmod.clear_project_dirty(self.cfg.db_path, project_id)
+            return
+
+        combined_vecs = np.vstack(all_vectors).astype(np.float32)
+        combined_ids = np.asarray(all_ids, dtype=np.int64)
+
+        # Generate a fresh UUID for the rebuilt index.
+        index_uuid = uuid.uuid4().hex
+
+        async with rwlock.write_lock():
+            if shard_count > 1:
+                shard_vecs: Dict[int, List[np.ndarray]] = {s: [] for s in range(shard_count)}
+                shard_ids_map: Dict[int, List[int]] = {s: [] for s in range(shard_count)}
+                for i, iid in enumerate(all_ids):
+                    s = iid % shard_count
+                    shard_vecs[s].append(combined_vecs[i : i + 1])
+                    shard_ids_map[s].append(iid)
+                for shard_id in range(shard_count):
+                    if not shard_vecs[shard_id]:
+                        continue
+                    vecs = np.vstack(shard_vecs[shard_id])
+                    ids_arr = np.asarray(shard_ids_map[shard_id], dtype=np.int64)
+                    index = await self._build_faiss_index(vecs, total_vectors=len(ids_arr))
+                    await self._add_vectors(index, vecs, ids_arr)
+                    current_path, new_path = _index_paths(self.cfg.index_dir, project, shard_id)
+                    await invalidate_faiss_cache(current_path)
+                    await asyncio.to_thread(_save_faiss, index, self.index_path_context, new_path)
+                    await asyncio.to_thread(
+                        _write_index_uuid, self.index_path_context, new_path, index_uuid
+                    )
+                    _replace_with_retries(self.index_path_context, new_path, current_path)
+                    await asyncio.to_thread(
+                        _write_index_uuid, self.index_path_context, current_path, index_uuid
+                    )
+            else:
+                index = await self._build_faiss_index(combined_vecs, total_vectors=len(all_ids))
+                await self._add_vectors(index, combined_vecs, combined_ids)
+                current_path, new_path = _index_paths(self.cfg.index_dir, project)
+                await invalidate_faiss_cache(current_path)
+                await asyncio.to_thread(_save_faiss, index, self.index_path_context, new_path)
+                await asyncio.to_thread(
+                    _write_index_uuid, self.index_path_context, new_path, index_uuid
+                )
+                _replace_with_retries(self.index_path_context, new_path, current_path)
+                await asyncio.to_thread(
+                    _write_index_uuid, self.index_path_context, current_path, index_uuid
+                )
+
+        # Persist the new UUID and clear dirty flag atomically.
+        metadata["faiss_index_uuid"] = index_uuid
+        metadata["index_dirty"] = 0
+        proj = await dbmod.get_project(self.cfg.db_path, project_id)
+        await dbmod.upsert_project(
+            self.cfg.db_path,
+            project_id=project_id,
+            project_name=proj.get("project_name", ""),
+            project_type=proj.get("project_type", ""),
+            directory=proj.get("directory", ""),
+            embedding_dim=int(proj.get("embedding_dim") or 0),
+            metadata=metadata,
+        )
+        logging.info("Rebuilt FAISS index for project %s; dirty flag cleared.", project_id)
 
     async def _maybe_shard_project(self, *, project_id: str) -> None:
         proj = await dbmod.get_project(self.cfg.db_path, project_id)

@@ -173,6 +173,115 @@ def parse_file_to_chunks(
     return []
 
 
+def hash_and_parse_file(
+    *,
+    path_context: PathContext,
+    path: Path,
+    root: str,
+    project_type: str,
+    chunk_size_tokens: int,
+    overlap_tokens: int,
+    max_file_size_mb: int,
+) -> "tuple[List[Chunk], str]":
+    """Read a file exactly once, returning both its chunks and its SHA-256 hash.
+
+    ``parse_file_to_chunks`` and ``hash_file`` each perform an independent
+    full read.  For large repositories the second read doubles I/O and
+    latency unnecessarily.  This function loads the raw bytes once into a
+    bounded buffer (capped at ``max_file_size_mb``), computes the hash from
+    those bytes, and then parses the same buffer without touching the disk
+    again.
+    """
+    import io
+
+    max_bytes = int(max_file_size_mb) * 1024 * 1024
+    root_path = path_context.resolve_path(root)
+    if root_path not in path.parents and path != root_path:
+        raise ValueError(f"Path escapes root: {path}")
+
+    size = path_context.stat(path).st_size
+    if size > max_bytes:
+        raise ValueError(f"File too large: {path} ({size} bytes)")
+
+    # Single disk read
+    with path_context.open_file(path, "rb") as fh:
+        raw_data = fh.read()
+
+    content_hash = hashlib.sha256(raw_data).hexdigest()
+
+    ext = path.suffix.lower()
+    rel = str(path.relative_to(root))
+    base_meta: Dict[str, object] = {
+        "item_name": rel,
+        "path": str(path),
+        "ext": ext,
+        "type": "file",
+        "project_type": project_type,
+    }
+
+    if ext in SUPPORTED_TEXT_EXTS:
+        text = raw_data.decode("utf-8", errors="ignore")
+        base_id = make_chunk_id(str(path))
+        chunks = chunk_lines(
+            lines=iter(text.splitlines(keepends=True)),
+            base_id=base_id,
+            meta=base_meta,
+            target_tokens=chunk_size_tokens,
+            overlap_tokens=overlap_tokens,
+        )
+        return chunks, content_hash
+
+    if ext == ".pdf":
+        from pypdf import PdfReader
+
+        max_text_chars = max_bytes * 4
+        reader = PdfReader(io.BytesIO(raw_data))
+        chunks: List[Chunk] = []
+        base_id = make_chunk_id(str(path))
+        total_chars = 0
+        for i, page in enumerate(reader.pages):
+            page_text = page.extract_text() or ""
+            page_len = len(page_text)
+            if total_chars + page_len > max_text_chars:
+                raise ValueError(f"PDF extracted text too large: {path}")
+            total_chars += page_len
+            if not page_text.strip():
+                continue
+            page_meta = {**base_meta, "type": "pdf_page", "page": i + 1}
+            if token_count(page_text) <= chunk_size_tokens * 2:
+                cid = make_chunk_id(base_id, f"page:{i+1}", page_text)
+                chunks.append(Chunk(cid, page_text, token_count(page_text), page_meta))
+            else:
+                chunks.extend(
+                    chunk_text(
+                        text=page_text,
+                        base_id=make_chunk_id(base_id, f"page:{i+1}"),
+                        meta=page_meta,
+                        target_tokens=chunk_size_tokens,
+                        overlap_tokens=overlap_tokens,
+                    )
+                )
+        return chunks, content_hash
+
+    if ext == ".docx":
+        from docx import Document
+
+        doc = Document(io.BytesIO(raw_data))
+        paras = [p.text for p in doc.paragraphs if p.text and p.text.strip()]
+        text = "\n".join(paras)
+        base_id = make_chunk_id(str(path))
+        chunks = chunk_text(
+            text=text,
+            base_id=base_id,
+            meta={**base_meta, "type": "docx"},
+            target_tokens=chunk_size_tokens,
+            overlap_tokens=overlap_tokens,
+        )
+        return chunks, content_hash
+
+    return [], content_hash
+
+
 @dataclass(frozen=True)
 class ParsedFile:
     file_path: str

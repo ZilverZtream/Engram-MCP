@@ -168,37 +168,48 @@ class _ConnectionPool:
         except asyncio.TimeoutError as exc:
             raise TimeoutError("Timed out waiting for database connection") from exc
 
+        # Everything after semaphore acquisition is wrapped so that any
+        # failure releases the semaphore.  Without this guard a failed
+        # aiosqlite.connect() (permission error, disk full, locked file)
+        # permanently burns one semaphore slot; after maxsize failures the
+        # pool deadlocks.
         try:
-            conn = self._queue.get_nowait()
-            return conn
-        except asyncio.QueueEmpty:
-            async with self._lock:
-                if self._created < self.maxsize:
-                    conn = await aiosqlite.connect(self.db_path)
-                    await conn.execute("PRAGMA foreign_keys=ON;")
-                    await conn.execute("PRAGMA journal_mode=WAL;")
-                    self._created += 1
-                    self._all.add(conn)
-                    return conn
-            conn = await self._queue.get()
-            return conn
+            try:
+                conn = self._queue.get_nowait()
+                return conn
+            except asyncio.QueueEmpty:
+                async with self._lock:
+                    if self._created < self.maxsize:
+                        conn = await aiosqlite.connect(self.db_path)
+                        await conn.execute("PRAGMA foreign_keys=ON;")
+                        await conn.execute("PRAGMA journal_mode=WAL;")
+                        self._created += 1
+                        self._all.add(conn)
+                        return conn
+                conn = await self._queue.get()
+                return conn
+        except Exception:
+            self._semaphore.release()
+            raise
 
     async def release(self, conn: aiosqlite.Connection) -> None:
+        # The semaphore is released unconditionally in `finally` so that a
+        # failed rollback or a failed queue.put() cannot leak a slot.
         try:
             if conn.in_transaction:
                 await conn.rollback()
+            await self._queue.put(conn)
         except Exception:
-            logging.warning("Failed to rollback pooled connection; closing.", exc_info=True)
+            logging.warning("Failed to rollback or return pooled connection; closing.", exc_info=True)
             try:
                 await conn.close()
-            finally:
-                self._all.discard(conn)
-                if self._created > 0:
-                    self._created -= 1
-                self._semaphore.release()
-                return
-        await self._queue.put(conn)
-        self._semaphore.release()
+            except Exception:
+                logging.warning("Failed to close connection during release", exc_info=True)
+            self._all.discard(conn)
+            if self._created > 0:
+                self._created -= 1
+        finally:
+            self._semaphore.release()
 
     async def close(self) -> None:
         self._closing = True
@@ -564,9 +575,26 @@ async def refresh_project_stats(db_path: str, project_id: str) -> None:
 
 
 def _sanitize_fts_query(query: str) -> str:
+    """Sanitise *query* for FTS5 MATCH while preserving code punctuation.
+
+    The previous implementation stripped everything except [A-Za-z0-9_],
+    which destroyed code-search precision:  ``std::vector`` became two
+    independent AND terms instead of a phrase match, ``@component``
+    lost its decorator prefix, and ``C++`` collapsed to ``C``.
+
+    FTS5 only needs a handful of structural operators removed to avoid
+    query-parse errors (*  "  ^  +  (  )  {  }).  Angle brackets are
+    replaced with spaces so that ``vector<int>`` tokenises the same way
+    at query time as at index time.  Each whitespace-delimited token is
+    then quoted so FTS5 treats it as a phrase; the ``unicode61``
+    tokeniser splits on the same boundaries used during indexing, making
+    ``"std::vector"`` match the adjacent-token pair (std, vector).
+    """
     if not query or not query.strip():
         return '""'
-    tokens = re.findall(r"[A-Za-z0-9_]+", query)
+    # Replace FTS5 syntax operators and angle-brackets with spaces.
+    cleaned = re.sub(r'[*"^+(){}<>]', ' ', query)
+    tokens = [t for t in cleaned.split() if t]
     if not tokens:
         return '""'
     tokens = [t[:64] for t in tokens[:50]]
@@ -956,3 +984,30 @@ async def fetch_chunk_batch(
             }
         )
     return out
+
+
+async def mark_project_dirty(db_path: str, project_id: str) -> None:
+    """Set index_dirty flag before writing chunks to the DB.
+
+    If the process crashes after the DB commit but before the FAISS index
+    is persisted to disk, the flag survives and ``update_project`` will
+    trigger a full index rebuild on next startup.
+    """
+    async with get_connection(db_path) as db:
+        await db.execute(
+            "UPDATE projects SET metadata = json_set(metadata, '$.index_dirty', 1), "
+            "updated_at = datetime('now') WHERE project_id = ?",
+            (project_id,),
+        )
+        await db.commit()
+
+
+async def clear_project_dirty(db_path: str, project_id: str) -> None:
+    """Clear index_dirty after a successful FAISS disk write."""
+    async with get_connection(db_path) as db:
+        await db.execute(
+            "UPDATE projects SET metadata = json_set(metadata, '$.index_dirty', 0), "
+            "updated_at = datetime('now') WHERE project_id = ?",
+            (project_id,),
+        )
+        await db.commit()
