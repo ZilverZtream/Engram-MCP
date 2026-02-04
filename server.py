@@ -2,23 +2,27 @@ from __future__ import annotations
 
 import atexit
 import asyncio
+import logging
 import os
 import signal
+import time
 from typing import Any, Dict
 
 from fastmcp import FastMCP
 
 from engram_mcp.config import load_config
 from engram_mcp.embeddings import EmbeddingService
-from engram_mcp.indexing import Indexer
-from engram_mcp.locks import get_project_lock, remove_project_lock, remove_project_rwlock
+from engram_mcp.indexing import Indexer, ensure_index_permissions
+from engram_mcp.locks import get_project_lock, get_project_rwlock, remove_project_lock, remove_project_rwlock
 from engram_mcp.jobs import JobManager
 from engram_mcp.search import SearchEngine
-from engram_mcp.security import PathContext, PathNotAllowed, ProjectID
+from engram_mcp.security import PathContext, PathNotAllowed, ProjectID, validate_project_field
 from engram_mcp import db as dbmod
+from engram_mcp import chunking
 
 
 cfg = load_config()
+dbmod.ensure_db_permissions(cfg.db_path)
 
 mcp = FastMCP(name="Engram MCP")
 
@@ -42,25 +46,31 @@ search_engine = SearchEngine(
     index_path_context=index_path_context,
 )
 
+ensure_index_permissions(index_path_context, cfg.index_dir)
+
 
 # ---------------------------------------------------------------------------
 # Fix #6: graceful shutdown – ensure embedding pools (thread + process)
 # are torn down on exit so that no orphan workers survive.
 # ---------------------------------------------------------------------------
+async def _cleanup_async() -> None:
+    await embedding_service.close(graceful=True)
+    await dbmod.close_db_pool()
+
+
 def _sync_cleanup() -> None:
-    """Best-effort shutdown of embedding pools on interpreter exit."""
+    """Best-effort shutdown of embedding pools and DB connections on exit."""
     try:
-        loop = asyncio.get_event_loop()
-        if loop.is_closed():
-            return
-        if loop.is_running():
-            # Can't block inside a running loop; just cancel worker tasks.
-            for task in embedding_service._workers:
-                task.cancel()
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop and loop.is_running():
+            loop.create_task(_cleanup_async())
         else:
-            loop.run_until_complete(embedding_service.close())
+            asyncio.run(_cleanup_async())
     except Exception:
-        pass
+        logging.warning("Shutdown cleanup failed", exc_info=True)
 
 
 atexit.register(_sync_cleanup)
@@ -93,35 +103,71 @@ async def index_project(
     directory: str,
     project_name: str,
     project_type: str,
+    wait: bool = True,
 ) -> str:
     """Index a directory (within allowed_roots) for hybrid search."""
     try:
         directory = str(project_path_context.resolve_path(directory))
     except PathNotAllowed as e:
         return f"❌ {e}"
+    try:
+        project_name = validate_project_field(project_name, field_name="project_name")
+        project_type = validate_project_field(project_type, field_name="project_type")
+    except ValueError as e:
+        return f"❌ {e}"
 
     async def _run() -> str:
+        start = time.time()
         pid = await indexer.index_project(directory=directory, project_name=project_name, project_type=project_type)
+        logging.info(
+            "index_project",
+            extra={
+                "project_id": pid,
+                "operation": "index",
+                "project_name": project_name,
+                "project_type": project_type,
+                "duration_ms": int((time.time() - start) * 1000),
+            },
+        )
         return f"✅ Indexed '{project_name}' as project_id: {pid}"
 
     job = await jobs.create("index", _run())
     # Wait for completion (Claude expects tool result), but the event loop remains responsive.
     try:
+        if not wait:
+            return f"🆔 Index job queued: {job.job_id}"
         return await job.task
     except asyncio.CancelledError:
         return f"🛑 Index job cancelled: {job.job_id}"
 
 
 @mcp.tool
-async def update_project(project_id: str) -> str:
+async def update_project(project_id: str, wait: bool = True) -> str:
     """Update an existing project by scanning its stored directory."""
 
     async def _run() -> str:
-        changes = await indexer.update_project(project_id=project_id)
+        lock = await get_project_lock(project_id)
+        rwlock = await get_project_rwlock(project_id)
+        async with lock:
+            async with rwlock.write_lock():
+                start = time.time()
+                changes = await indexer.update_project(project_id=project_id)
+                logging.info(
+                    "update_project",
+                    extra={
+                        "project_id": project_id,
+                        "operation": "update",
+                        "duration_ms": int((time.time() - start) * 1000),
+                        "added": changes.get("added"),
+                        "deleted": changes.get("deleted"),
+                    },
+                )
         return f"✅ Updated {project_id}: +{changes['added']} added, -{changes['deleted']} deleted"
 
     job = await jobs.create("update", _run())
     try:
+        if not wait:
+            return f"🆔 Update job queued: {job.job_id}"
         return await job.task
     except asyncio.CancelledError:
         return f"🛑 Update job cancelled: {job.job_id}"
@@ -150,27 +196,48 @@ async def search_memory(
     project_id: str,
     max_results: int = 10,
     use_mmr: bool = True,
+    fts_mode: str = "strict",
 ) -> Dict[str, Any]:
     """Hybrid search: SQLite FTS5 (lexical) + FAISS (vector) with RRF, optional MMR."""
     await dbmod.init_db(cfg.db_path)
     proj = await dbmod.get_project(cfg.db_path, project_id)
     if not proj:
         return {"error": f"Project not found: {project_id}"}
+    max_chars = int(getattr(cfg, "max_query_chars", 4096))
+    max_tokens = int(getattr(cfg, "max_query_tokens", 256))
+    if len(query) > max_chars:
+        return {"error": f"Query too long ({len(query)} chars). Max is {max_chars}."}
+    token_count = chunking.token_count(query)
+    if token_count > max_tokens:
+        return {"error": f"Query too long ({token_count} tokens). Max is {max_tokens}."}
 
     md = proj.get("metadata") or {}
     model_name = md.get("model_name") or cfg.model_name_text
     device = md.get("device") or _device()
-    qv = await embedding_service.embed_one(query, model_name=model_name, device=device)
+    rwlock = await get_project_rwlock(project_id)
+    start = time.time()
+    async with rwlock.read_lock():
+        qv = await embedding_service.embed_one(query, model_name=model_name, device=device)
 
-    results = await search_engine.search(
-        project_id=project_id,
-        query=query,
-        query_vec=qv,
-        fts_top_k=cfg.fts_top_k,
-        vector_top_k=cfg.vector_top_k,
-        return_k=max(1, min(50, int(max_results))),
-        enable_mmr=bool(use_mmr and cfg.enable_mmr),
-        mmr_lambda=float(cfg.mmr_lambda),
+        results = await search_engine.search(
+            project_id=project_id,
+            query=query,
+            query_vec=qv,
+            fts_top_k=cfg.fts_top_k,
+            vector_top_k=cfg.vector_top_k,
+            return_k=max(1, min(50, int(max_results))),
+            enable_mmr=bool(use_mmr and cfg.enable_mmr),
+            mmr_lambda=float(cfg.mmr_lambda),
+            fts_mode=fts_mode,
+        )
+    logging.info(
+        "search_memory",
+        extra={
+            "project_id": project_id,
+            "operation": "search",
+            "duration_ms": int((time.time() - start) * 1000),
+            "result_count": len(results),
+        },
     )
 
     # Compact response (clients can format)
@@ -217,27 +284,29 @@ async def delete_project(project_id: str) -> str:
     except ValueError as e:
         return f"❌ {e}"
     lock = await get_project_lock(project_id)
+    rwlock = await get_project_rwlock(project_id)
     async with lock:
-        await dbmod.delete_project(cfg.db_path, project_id)
-        index_paths = [
-            os.path.join(cfg.index_dir, str(safe_id) + ".index.current"),
-            os.path.join(cfg.index_dir, str(safe_id) + ".index.new"),
-        ]
-        shard_prefix = str(safe_id) + ".shard"
-        entries = index_path_context.list_dir(cfg.index_dir)
-        for entry in entries:
-            if entry.startswith(shard_prefix) and entry.endswith(".index.current"):
-                index_paths.append(os.path.join(cfg.index_dir, entry))
-            if entry.startswith(shard_prefix) and entry.endswith(".index.new"):
-                index_paths.append(os.path.join(cfg.index_dir, entry))
-            # Fix #12: clean up UUID companion files
-            if entry.startswith(str(safe_id)) and entry.endswith(".uuid"):
-                index_paths.append(os.path.join(cfg.index_dir, entry))
-        for path in index_paths:
-            if index_path_context.exists(path):
-                index_path_context.unlink(path)
-        await remove_project_lock(project_id)
-        await remove_project_rwlock(project_id)
+        async with rwlock.write_lock():
+            await dbmod.delete_project(cfg.db_path, project_id)
+            index_paths = [
+                os.path.join(cfg.index_dir, str(safe_id) + ".index.current"),
+                os.path.join(cfg.index_dir, str(safe_id) + ".index.new"),
+            ]
+            shard_prefix = str(safe_id) + ".shard"
+            entries = index_path_context.list_dir(cfg.index_dir)
+            for entry in entries:
+                if entry.startswith(shard_prefix) and entry.endswith(".index.current"):
+                    index_paths.append(os.path.join(cfg.index_dir, entry))
+                if entry.startswith(shard_prefix) and entry.endswith(".index.new"):
+                    index_paths.append(os.path.join(cfg.index_dir, entry))
+                # Fix #12: clean up UUID companion files
+                if entry.startswith(str(safe_id)) and entry.endswith(".uuid"):
+                    index_paths.append(os.path.join(cfg.index_dir, entry))
+            for path in index_paths:
+                if index_path_context.exists(path):
+                    index_path_context.unlink(path)
+    await remove_project_lock(project_id)
+    await remove_project_rwlock(project_id)
     return f"✅ Deleted {project_id}"
 
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import re
 import tempfile
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Iterator, List, Optional
@@ -13,6 +14,7 @@ class PathNotAllowed(Exception):
 
 
 PROJECT_ID_PATTERN = re.compile(r"^[a-zA-Z0-9_-]+$")
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
 
 
 @dataclass(frozen=True)
@@ -136,9 +138,40 @@ class PathContext:
 
     def create_temp_file(self, *, dir_path: str | Path, suffix: str) -> str:
         resolved_dir = self.resolve_path(dir_path)
-        temp = tempfile.NamedTemporaryFile(mode="wb", delete=False, dir=resolved_dir, suffix=suffix)
-        temp.close()
-        return temp.name
+        fd, temp_path = tempfile.mkstemp(dir=resolved_dir, suffix=suffix)
+        os.close(fd)
+        try:
+            os.chmod(temp_path, 0o600)
+        except OSError:
+            logging.debug("Failed to chmod temp file %s", temp_path, exc_info=True)
+        return temp_path
+
+    def chmod(self, path: str | Path, mode: int) -> None:
+        resolved = self.resolve_path(path)
+        os.chmod(resolved, mode)
+
+    def write_text_atomic(self, path: str | Path, text: str, *, encoding: str = "utf-8") -> None:
+        resolved = self.resolve_path(path)
+        dir_path = resolved.parent
+        temp_path = self.create_temp_file(dir_path=dir_path, suffix=".tmp")
+        try:
+            with open(temp_path, "w", encoding=encoding) as handle:
+                handle.write(text)
+            try:
+                os.chmod(temp_path, 0o600)
+            except OSError:
+                logging.debug("Failed to chmod temp file %s", temp_path, exc_info=True)
+            os.replace(temp_path, resolved)
+            try:
+                os.chmod(resolved, 0o600)
+            except OSError:
+                logging.debug("Failed to chmod %s", resolved, exc_info=True)
+        finally:
+            if os.path.exists(temp_path):
+                try:
+                    os.unlink(temp_path)
+                except OSError:
+                    logging.debug("Failed to cleanup temp file %s", temp_path, exc_info=True)
 
 def is_within_allowed_roots(path: str, allowed_roots: Iterable[str]) -> bool:
     """Return True if path is within any allowed root (prefix match by commonpath)."""
@@ -169,3 +202,18 @@ def enforce_allowed_roots(path: str, allowed_roots: Iterable[str]) -> str:
             f"Path '{ap}' is outside allowed_roots. Allowed roots: {roots}"
         )
     return ap
+
+
+def validate_project_field(value: str, *, field_name: str, max_length: int = 200) -> str:
+    if value is None:
+        raise ValueError(f"{field_name} is required.")
+    cleaned = str(value).strip()
+    if not cleaned:
+        raise ValueError(f"{field_name} cannot be empty.")
+    if len(cleaned) > max_length:
+        raise ValueError(f"{field_name} exceeds max length of {max_length}.")
+    if _CONTROL_CHARS.search(cleaned):
+        raise ValueError(f"{field_name} contains control characters.")
+    if not cleaned.isprintable():
+        raise ValueError(f"{field_name} contains non-printable characters.")
+    return cleaned

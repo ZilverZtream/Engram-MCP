@@ -4,8 +4,10 @@ allowed_roots:
   - /Users/you/Projects
 
 # Optional overrides
-# db_path: /Users/you/.engram_mcp/memory.db
-# index_dir: /Users/you/.engram_mcp
+# db_path: /Users/you/.local/share/engram/memory.db
+# index_dir: /Users/you/.local/share/engram/indexes
+# max_query_chars: 4096
+# max_query_tokens: 256
 # chunk_size_tokens: 200
 # overlap_tokens: 30
 # max_file_size_mb: 200

@@ -93,8 +93,20 @@ cd engram-mcp
 ---
 
 ### 2️⃣ Configure allowed paths
+
+Engram reads its config from a **user-scoped location by default**:
+
+| OS | Config path |
+| --- | --- |
+| Linux | `~/.config/engram/engram_mcp.yaml` |
+| macOS | `~/.config/engram/engram_mcp.yaml` |
+| Windows | `%APPDATA%\\engram\\engram_mcp.yaml` |
+
+Create the file there (or set `ENGRAM_CONFIG_PATH` to a file *inside* that directory).
+
 ```bash
-cp engram_mcp.yaml.example engram_mcp.yaml
+mkdir -p ~/.config/engram
+cp engram_mcp.yaml.example ~/.config/engram/engram_mcp.yaml
 ```
 
 Edit **`allowed_roots`**:
@@ -136,7 +148,10 @@ Indexes a directory (must be within `allowed_roots`).
 
 ```json
 {
-  "path": "/Users/you/Projects/my_repo"
+  "directory": "/Users/you/Projects/my_repo",
+  "project_name": "my_repo",
+  "project_type": "code",
+  "wait": true
 }
 ```
 
@@ -148,11 +163,23 @@ Hybrid semantic + lexical search.
 ```json
 {
   "query": "async sqlite performance issues",
-  "limit": 10
+  "project_id": "my_repo_123",
+  "max_results": 10,
+  "fts_mode": "strict"
 }
 ```
 
 ---
+
+### `update_project`
+Updates an existing project (use `wait: false` to queue and poll job status).
+
+```json
+{
+  "project_id": "my_repo_123",
+  "wait": true
+}
+```
 
 ### `delete_project`
 Removes all indexed content for a project root.
@@ -175,6 +202,23 @@ This prevents accidental indexing of:
 
 Security is **opt‑in by configuration**, not implicit trust.
 
+### Storage defaults (privacy-safe)
+By default, Engram writes all state into a **user-scoped data directory** (never the current working directory):
+
+| OS | Data directory |
+| --- | --- |
+| Linux | `~/.local/share/engram/` |
+| macOS | `~/Library/Application Support/engram/` |
+| Windows | `%APPDATA%\\engram\\` |
+
+The SQLite DB and FAISS index files are created with **owner-only permissions**. Override `db_path`/`index_dir`
+explicitly if you want storage in a custom location. On Windows, permissions are best-effort and may rely
+on the existing directory ACLs.
+
+### Query limits
+`search_memory` enforces `max_query_chars` and `max_query_tokens` from config (defaults: 4096 chars / 256 tokens)
+to prevent runaway embedding costs.
+
 ---
 
 ## ⚙️ Performance Notes
@@ -188,6 +232,29 @@ Security is **opt‑in by configuration**, not implicit trust.
 - Vector search via FAISS
 - Lexical search via SQLite FTS5
 - No in‑memory BM25 structures
+
+### Search mode
+`search_memory` supports `fts_mode`:
+- `strict` (default): `AND` across tokens
+- `any`: `OR` across tokens
+
+Quoted phrases are preserved in either mode.
+
+## 🧪 Development
+
+### Dependency locking
+This repo uses **pip-tools**. Update locks with:
+
+```bash
+pip install pip-tools
+pip-compile requirements.in
+pip-compile requirements-dev.in
+```
+
+### Tests
+```bash
+pytest
+```
 
 ### Indexing
 - Streaming file readers

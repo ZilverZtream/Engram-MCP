@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 from dataclasses import dataclass, field
 from typing import List, Optional
 
 import yaml
 from .security import PathContext
-from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, ValidationError, field_validator, Field
 
 
 DEFAULT_IGNORE_PATTERNS: List[str] = [
@@ -30,8 +31,10 @@ DEFAULT_IGNORE_PATTERNS: List[str] = [
 @dataclass
 class EngramConfig:
     # Storage
-    db_path: str = "memory.db"
-    index_dir: str = "."  # where *.index files are stored
+    db_path: str = field(default_factory=lambda: os.path.join(_default_data_dir(), "memory.db"))
+    index_dir: str = field(
+        default_factory=lambda: os.path.join(_default_data_dir(), "indexes")
+    )  # where *.index files are stored
 
     # Security
     allowed_roots: List[str] = field(default_factory=list)
@@ -54,6 +57,8 @@ class EngramConfig:
     return_k: int = 10
     enable_mmr: bool = True
     mmr_lambda: float = 0.7
+    max_query_chars: int = 4096
+    max_query_tokens: int = 256
 
     # Embeddings
     model_name_text: str = "paraphrase-multilingual-MiniLM-L12-v2"
@@ -84,8 +89,8 @@ class AllowedConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     # Storage
-    db_path: str = "memory.db"
-    index_dir: str = "."
+    db_path: str = Field(default_factory=lambda: os.path.join(_default_data_dir(), "memory.db"))
+    index_dir: str = Field(default_factory=lambda: os.path.join(_default_data_dir(), "indexes"))
 
     # Security
     allowed_roots: List[str] = []
@@ -108,6 +113,8 @@ class AllowedConfig(BaseModel):
     return_k: int = 10
     enable_mmr: bool = True
     mmr_lambda: float = 0.7
+    max_query_chars: int = 4096
+    max_query_tokens: int = 256
 
     # Embeddings
     model_name_text: str = "paraphrase-multilingual-MiniLM-L12-v2"
@@ -143,12 +150,13 @@ class AllowedConfig(BaseModel):
 def load_config(path: Optional[str] = None) -> EngramConfig:
     """Load config from YAML.
 
-    Default path: ./engram_mcp.yaml
+    Default path: ~/.config/engram/engram_mcp.yaml (unless ENGRAM_CONFIG_PATH is set
+    within that directory)
 
     Example:
 
-        db_path: memory.db
-        index_dir: .
+        db_path: ~/.local/share/engram/memory.db
+        index_dir: ~/.local/share/engram/indexes
         allowed_roots:
           - /Users/you/Documents
     """
@@ -178,6 +186,7 @@ def load_config(path: Optional[str] = None) -> EngramConfig:
     config_root = os.path.dirname(os.path.abspath(path)) or os.getcwd()
     path_context = PathContext([config_root])
     if not path_context.exists(path):
+        _ensure_storage_dirs(cfg)
         return cfg
     with path_context.open_file(path, "r", encoding="utf-8") as f:
         data = yaml.safe_load(f) or {}
@@ -207,4 +216,29 @@ def load_config(path: Optional[str] = None) -> EngramConfig:
         )
         cfg.overlap_tokens = max(0, int(cfg.chunk_size_tokens) - 1)
 
+    _ensure_storage_dirs(cfg)
     return cfg
+
+
+def _default_data_dir() -> str:
+    if os.name == "nt":
+        base = os.environ.get("APPDATA") or os.path.expanduser("~")
+        return os.path.join(base, "engram")
+    if sys.platform == "darwin":
+        return os.path.join(os.path.expanduser("~"), "Library", "Application Support", "engram")
+    return os.path.join(os.path.expanduser("~"), ".local", "share", "engram")
+
+
+def _ensure_dir(path: str, *, mode: int = 0o700) -> None:
+    os.makedirs(path, mode=mode, exist_ok=True)
+    if os.name != "nt":
+        try:
+            os.chmod(path, mode)
+        except OSError:
+            logging.warning("Failed to chmod %s to %s", path, oct(mode), exc_info=True)
+
+
+def _ensure_storage_dirs(cfg: EngramConfig) -> None:
+    db_dir = os.path.dirname(os.path.abspath(cfg.db_path))
+    _ensure_dir(db_dir, mode=0o700)
+    _ensure_dir(os.path.abspath(cfg.index_dir), mode=0o700)
