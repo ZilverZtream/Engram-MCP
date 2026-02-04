@@ -50,6 +50,7 @@ class EngramConfig:
     index_timeout_s: int = 3600
     embedding_batch_size: int = 128
     embedding_cache_ttl_s: int = 0
+    embedding_cache_max_rows: int = 0
 
     # Search
     fts_top_k: int = 200
@@ -57,6 +58,7 @@ class EngramConfig:
     return_k: int = 10
     enable_mmr: bool = True
     mmr_lambda: float = 0.7
+    enable_numba: bool = True
     max_query_chars: int = 4096
     max_query_tokens: int = 256
 
@@ -106,6 +108,7 @@ class AllowedConfig(BaseModel):
     index_timeout_s: int = 3600
     embedding_batch_size: int = 128
     embedding_cache_ttl_s: int = 0
+    embedding_cache_max_rows: int = 0
 
     # Search
     fts_top_k: int = 200
@@ -113,6 +116,7 @@ class AllowedConfig(BaseModel):
     return_k: int = 10
     enable_mmr: bool = True
     mmr_lambda: float = 0.7
+    enable_numba: bool = True
     max_query_chars: int = 4096
     max_query_tokens: int = 256
 
