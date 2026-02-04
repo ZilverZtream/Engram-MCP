@@ -72,6 +72,13 @@ class EngramConfig:
     shard_chunk_threshold: int = 1_000_000
     shard_size: int = 250_000
 
+    # Embedding backend selection
+    embedding_backend: str = "sentence_transformers"  # "sentence_transformers" | "ollama" | "openai"
+    ollama_model: str = "nomic-embed-text"
+    ollama_url: str = "http://localhost:11434"
+    openai_api_key: str = ""
+    openai_embedding_model: str = "text-embedding-3-small"
+
 
 class AllowedConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -117,6 +124,13 @@ class AllowedConfig(BaseModel):
     shard_chunk_threshold: int = 1_000_000
     shard_size: int = 250_000
 
+    # Embedding backend selection
+    embedding_backend: str = "sentence_transformers"
+    ollama_model: str = "nomic-embed-text"
+    ollama_url: str = "http://localhost:11434"
+    openai_api_key: str = ""
+    openai_embedding_model: str = "text-embedding-3-small"
+
     @field_validator("overlap_tokens")
     @classmethod
     def validate_overlap(cls, value: int, info):  # type: ignore[override]
@@ -140,7 +154,17 @@ def load_config(path: Optional[str] = None) -> EngramConfig:
     """
 
     if path is None:
-        path = os.path.join(os.getcwd(), "engram_mcp.yaml")
+        # 1) Honour an explicit environment variable.
+        # 2) Fall back to the user-scoped config directory so that an
+        #    attacker who drops a crafted engram_mcp.yaml into a shared
+        #    /tmp or a cloned repo cannot silently alter allowed_roots.
+        env_path = os.environ.get("ENGRAM_CONFIG_PATH")
+        if env_path:
+            path = env_path
+        else:
+            path = os.path.join(
+                os.path.expanduser("~"), ".config", "engram", "engram_mcp.yaml"
+            )
 
     cfg = EngramConfig()
     config_root = os.path.dirname(os.path.abspath(path)) or os.getcwd()
