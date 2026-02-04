@@ -31,6 +31,17 @@ from .parsing import (
 # Keeps per-file peak memory bounded: 100 chunks × 384-dim float32 ≈ 150 KB
 # of vectors regardless of file size.
 _PERSIST_BATCH_SIZE = 100
+
+# Upper bound on file-parsing / embedding concurrency.  On high-core-count
+# servers (64 cores) defaulting to cpu_count causes massive I/O contention.
+_CONCURRENCY_CAP = 8
+
+
+def _capped_concurrency() -> int:
+    """Return file-parsing concurrency capped at _CONCURRENCY_CAP."""
+    return min(os.cpu_count() or 4, _CONCURRENCY_CAP)
+
+
 from .locks import get_project_lock, get_project_rwlock
 from .search import invalidate_faiss_cache, invalidate_search_cache_project, is_faiss_available
 from .security import PathContext, ProjectID, validate_project_field
@@ -138,7 +149,7 @@ class Indexer:
                         file_count += 1
                         yield p
 
-            sem = asyncio.Semaphore(os.cpu_count() or 4)
+            sem = asyncio.Semaphore(_capped_concurrency())
             pdf_sem = asyncio.Semaphore(1)
 
             async def parse_one(path: Any) -> Optional[ParsedFile]:
@@ -178,7 +189,7 @@ class Indexer:
                 async for parsed in _bounded_gather(
                     iter_indexable_files(),
                     parse_one,
-                    max(1, int(os.cpu_count() or 4)),
+                    _capped_concurrency(),
                 ):
                     parse_attempts += 1
                     if parsed is None:
@@ -296,7 +307,7 @@ class Indexer:
         added_chunk_ids: List[str] = []
         added_count = 0
         updated_file_rows: List[dbmod.FileMetadataRow] = []
-        sem = asyncio.Semaphore(os.cpu_count() or 4)
+        sem = asyncio.Semaphore(_capped_concurrency())
         pdf_sem = asyncio.Semaphore(1)
 
         async def parse_one(rel_path: str) -> Optional[ParsedFile]:
@@ -333,7 +344,7 @@ class Indexer:
 
         try:
             async for parsed in _bounded_gather(
-                sorted(changed_files), parse_one, max(1, int(os.cpu_count() or 4))
+                sorted(changed_files), parse_one, _capped_concurrency()
             ):
                 if parsed is None:
                     continue
@@ -611,193 +622,249 @@ class Indexer:
         project_id = ProjectID(f"{_slug(project_name)}_{time.time_ns()}_{uuid.uuid4().hex[:8]}")
         rwlock = await get_project_rwlock(str(project_id))
 
-        async with rwlock.write_lock():
-            model_name = _pick_model_name(project_type, self.cfg)
-            device = "cuda" if _cuda_available() else "cpu"
-            project_initialized = False
-            index_path: Optional[str] = None
-            index_current: Optional[str] = None
-            try:
+        try:
+            async with rwlock.write_lock():
+                model_name = _pick_model_name(project_type, self.cfg)
+                device = "cuda" if _cuda_available() else "cpu"
+                project_initialized = False
+                index_path: Optional[str] = None
+                index_current: Optional[str] = None
                 file_count = 0
 
-            def iter_indexable_files() -> Iterable[Any]:
-                nonlocal file_count
-                for p in iter_files(self.project_path_context, directory, self.cfg.ignore_patterns):
-                    ext = p.suffix.lower()
-                    if ext in SUPPORTED_TEXT_EXTS or ext in SUPPORTED_DOC_EXTS:
-                        file_count += 1
-                        yield p
+                def iter_indexable_files() -> Iterable[Any]:
+                    nonlocal file_count
+                    for p in iter_files(self.project_path_context, directory, self.cfg.ignore_patterns):
+                        ext = p.suffix.lower()
+                        if ext in SUPPORTED_TEXT_EXTS or ext in SUPPORTED_DOC_EXTS:
+                            file_count += 1
+                            yield p
 
-            sem = asyncio.Semaphore(os.cpu_count() or 4)
-            pdf_sem = asyncio.Semaphore(1)
-            max_bytes = int(self.cfg.max_file_size_mb) * 1024 * 1024
+                sem = asyncio.Semaphore(_capped_concurrency())
+                pdf_sem = asyncio.Semaphore(1)
+                max_bytes = int(self.cfg.max_file_size_mb) * 1024 * 1024
 
-            async def parse_one(path: Any) -> Optional[ParsedFile]:
-                # Fix #8: single-pass hash + parse to eliminate the
-                # duplicate full-file read that hash_file + parse_file
-                # used to perform.
-                rel = str(path.relative_to(directory))
-                async with sem:
-                    try:
-                        async def _hash_and_parse() -> "tuple[List[Any], str]":
-                            return await asyncio.to_thread(
-                                hash_and_parse_file,
-                                path_context=self.project_path_context,
-                                path=path,
-                                root=directory,
-                                project_type=project_type,
-                                chunk_size_tokens=self.cfg.chunk_size_tokens,
-                                overlap_tokens=self.cfg.overlap_tokens,
-                                max_file_size_mb=self.cfg.max_file_size_mb,
-                            )
-
-                        if str(path.suffix).lower() == ".pdf":
-                            async with pdf_sem:
-                                chunks, content_hash = await asyncio.wait_for(_hash_and_parse(), timeout=30)
-                        else:
-                            chunks, content_hash = await asyncio.wait_for(_hash_and_parse(), timeout=30)
-                    except Exception:
-                        logging.warning("Failed to parse %s", rel, exc_info=True)
-                        return None
-                stat = self.project_path_context.stat(path)
-                return ParsedFile(
-                    file_path=str(path.relative_to(directory)),
-                    mtime_ns=stat.st_mtime_ns,
-                    size_bytes=stat.st_size,
-                    content_hash=content_hash,
-                    chunks=chunks,
-                )
-
-            embedding_dim: Optional[int] = None
-            index: Optional[Any] = None
-            pending_vectors: List[np.ndarray] = []
-            pending_ids: List[np.ndarray] = []
-            pending_rows: List[List[Tuple[str, int, str, int, Dict[str, Any]]]] = []
-            pending_file_rows: List[List[dbmod.FileMetadataRow]] = []
-            training_vectors: List[np.ndarray] = []
-            total_chunks = 0
-            train_target = max(1000, int(self.cfg.faiss_nlist) * 20)
-            index_current, index_new = _index_paths(self.cfg.index_dir, project_id)
-            index_path = index_new
-            parse_failures = 0
-            parse_attempts = 0
-            dirty_marked = False
-            # Fix #12: one stable UUID per project, written alongside every
-            # FAISS index file so search.py can verify consistency.
-            index_uuid = uuid.uuid4().hex
-
-            async for parsed in _bounded_gather(iter_indexable_files(), parse_one, max(1, int(os.cpu_count() or 4))):
-                parse_attempts += 1
-                if parsed is None:
-                    parse_failures += 1
-                    if parse_failures >= max(5, int(math.ceil(parse_attempts * 0.1))):
-                        raise RuntimeError("Too many files failed to parse; aborting indexing.")
-                    continue
-
-                all_chunk_ids = [c.chunk_id for c in parsed.chunks]
-                file_row = dbmod.FileMetadataRow(
-                    file_path=parsed.file_path,
-                    mtime_ns=parsed.mtime_ns,
-                    size_bytes=parsed.size_bytes,
-                    content_hash=parsed.content_hash,
-                    chunk_ids=all_chunk_ids,
-                )
-                if not parsed.chunks:
-                    await dbmod.upsert_file_metadata(self.cfg.db_path, str(project_id), [file_row])
-                    continue
-
-                # --- Fix #3: batch embed + persist in groups of
-                # _PERSIST_BATCH_SIZE so that vector memory is bounded.
-                # Reserve all internal IDs for this file up-front (cheap
-                # single DB round-trip) then iterate in fixed-size windows.
-                internal_ids = await dbmod.reserve_internal_ids(
-                    self.cfg.db_path, str(project_id), len(parsed.chunks)
-                )
-
-                for batch_start in range(0, len(parsed.chunks), _PERSIST_BATCH_SIZE):
-                    batch_end = min(batch_start + _PERSIST_BATCH_SIZE, len(parsed.chunks))
-                    batch_chunks = parsed.chunks[batch_start:batch_end]
-                    batch_iids = internal_ids[batch_start:batch_end]
-                    batch_ids_arr = np.asarray(batch_iids, dtype=np.int64)
-
-                    vectors = await self._embed_chunks_cached(batch_chunks, model_name=model_name, device=device)
-                    if vectors.size == 0:
-                        continue
-                    if embedding_dim is None:
-                        embedding_dim = int(vectors.shape[1])
-
-                    if not project_initialized:
-                        await dbmod.upsert_project(
-                            self.cfg.db_path,
-                            project_id=str(project_id),
-                            project_name=project_name,
-                            project_type=project_type,
-                            directory=directory,
-                            directory_realpath=directory_realpath,
-                            embedding_dim=embedding_dim,
-                            metadata={
-                                "chunk_size_tokens": self.cfg.chunk_size_tokens,
-                                "overlap_tokens": self.cfg.overlap_tokens,
-                                "model_name": model_name,
-                                "device": device,
-                                "shard_count": 1,
-                                "shard_size": int(self.cfg.shard_size),
-                            },
-                            faiss_index_uuid=index_uuid,
-                        )
-                        project_initialized = True
-
-                    batch_rows = [
-                        (c.chunk_id, int(iid), c.content, int(c.token_count), c.metadata)
-                        for c, iid in zip(batch_chunks, batch_iids)
-                    ]
-
-                    # File metadata is written once after ALL batches for
-                    # this file succeed (see below the batch loop).
-                    if index is None:
-                        training_vectors.append(vectors)
-                        pending_vectors.append(vectors)
-                        pending_ids.append(batch_ids_arr)
-                        pending_rows.append(batch_rows)
-                        pending_file_rows.append([])  # file_rows handled post-loop
-                        if sum(v.shape[0] for v in training_vectors) >= train_target:
-                            train_vecs = np.vstack(training_vectors)
-                            pending_total = sum(v.shape[0] for v in pending_vectors)
-                            index = await self._build_faiss_index(
-                                train_vecs,
-                                total_vectors=sum(v.shape[0] for v in training_vectors) + pending_total,
-                            )
-                            for vec_batch, id_batch, row_batch, file_row_batch in zip(
-                                pending_vectors, pending_ids, pending_rows, pending_file_rows
-                            ):
-                                await self._persist_index_batch(
-                                    project_id=str(project_id),
-                                    index=index,
-                                    vectors=vec_batch,
-                                    ids=id_batch,
-                                    rows=row_batch,
-                                    file_rows=file_row_batch,
-                                    index_path=index_path,
-                                    rwlock=rwlock,
-                                    index_uuid=index_uuid,
-                                    persist_index=False,
-                                    mark_dirty=not dirty_marked,
-                                    clear_dirty=False,
+                async def parse_one(path: Any) -> Optional[ParsedFile]:
+                    # Fix #8: single-pass hash + parse to eliminate the
+                    # duplicate full-file read that hash_file + parse_file
+                    # used to perform.
+                    rel = str(path.relative_to(directory))
+                    async with sem:
+                        try:
+                            async def _hash_and_parse() -> "tuple[List[Any], str]":
+                                return await asyncio.to_thread(
+                                    hash_and_parse_file,
+                                    path_context=self.project_path_context,
+                                    path=path,
+                                    root=directory,
+                                    project_type=project_type,
+                                    chunk_size_tokens=self.cfg.chunk_size_tokens,
+                                    overlap_tokens=self.cfg.overlap_tokens,
+                                    max_file_size_mb=self.cfg.max_file_size_mb,
                                 )
-                                dirty_marked = True
-                            training_vectors.clear()
-                            pending_vectors.clear()
-                            pending_ids.clear()
-                            pending_rows.clear()
-                            pending_file_rows.clear()
-                    else:
+
+                            if str(path.suffix).lower() == ".pdf":
+                                async with pdf_sem:
+                                    chunks, content_hash = await asyncio.wait_for(_hash_and_parse(), timeout=30)
+                            else:
+                                chunks, content_hash = await asyncio.wait_for(_hash_and_parse(), timeout=30)
+                        except Exception:
+                            logging.warning("Failed to parse %s", rel, exc_info=True)
+                            return None
+                    stat = self.project_path_context.stat(path)
+                    return ParsedFile(
+                        file_path=str(path.relative_to(directory)),
+                        mtime_ns=stat.st_mtime_ns,
+                        size_bytes=stat.st_size,
+                        content_hash=content_hash,
+                        chunks=chunks,
+                    )
+
+                embedding_dim: Optional[int] = None
+                index: Optional[Any] = None
+                pending_vectors: List[np.ndarray] = []
+                pending_ids: List[np.ndarray] = []
+                pending_rows: List[List[Tuple[str, int, str, int, Dict[str, Any]]]] = []
+                pending_file_rows: List[List[dbmod.FileMetadataRow]] = []
+                training_vectors: List[np.ndarray] = []
+                total_chunks = 0
+                train_target = max(1000, int(self.cfg.faiss_nlist) * 20)
+                index_current, index_new = _index_paths(self.cfg.index_dir, project_id)
+                index_path = index_new
+                parse_failures = 0
+                parse_attempts = 0
+                dirty_marked = False
+                # Fix #12: one stable UUID per project, written alongside every
+                # FAISS index file so search.py can verify consistency.
+                index_uuid = uuid.uuid4().hex
+
+                async for parsed in _bounded_gather(iter_indexable_files(), parse_one, _capped_concurrency()):
+                    parse_attempts += 1
+                    if parsed is None:
+                        parse_failures += 1
+                        if parse_failures >= max(5, int(math.ceil(parse_attempts * 0.1))):
+                            raise RuntimeError("Too many files failed to parse; aborting indexing.")
+                        continue
+
+                    all_chunk_ids = [c.chunk_id for c in parsed.chunks]
+                    file_row = dbmod.FileMetadataRow(
+                        file_path=parsed.file_path,
+                        mtime_ns=parsed.mtime_ns,
+                        size_bytes=parsed.size_bytes,
+                        content_hash=parsed.content_hash,
+                        chunk_ids=all_chunk_ids,
+                    )
+                    if not parsed.chunks:
+                        await dbmod.upsert_file_metadata(self.cfg.db_path, str(project_id), [file_row])
+                        continue
+
+                    # --- Fix #3: batch embed + persist in groups of
+                    # _PERSIST_BATCH_SIZE so that vector memory is bounded.
+                    # Reserve all internal IDs for this file up-front (cheap
+                    # single DB round-trip) then iterate in fixed-size windows.
+                    internal_ids = await dbmod.reserve_internal_ids(
+                        self.cfg.db_path, str(project_id), len(parsed.chunks)
+                    )
+
+                    for batch_start in range(0, len(parsed.chunks), _PERSIST_BATCH_SIZE):
+                        batch_end = min(batch_start + _PERSIST_BATCH_SIZE, len(parsed.chunks))
+                        batch_chunks = parsed.chunks[batch_start:batch_end]
+                        batch_iids = internal_ids[batch_start:batch_end]
+                        batch_ids_arr = np.asarray(batch_iids, dtype=np.int64)
+
+                        vectors = await self._embed_chunks_cached(batch_chunks, model_name=model_name, device=device)
+                        if vectors.size == 0:
+                            continue
+                        if embedding_dim is None:
+                            embedding_dim = int(vectors.shape[1])
+
+                        if not project_initialized:
+                            await dbmod.upsert_project(
+                                self.cfg.db_path,
+                                project_id=str(project_id),
+                                project_name=project_name,
+                                project_type=project_type,
+                                directory=directory,
+                                directory_realpath=directory_realpath,
+                                embedding_dim=embedding_dim,
+                                metadata={
+                                    "chunk_size_tokens": self.cfg.chunk_size_tokens,
+                                    "overlap_tokens": self.cfg.overlap_tokens,
+                                    "model_name": model_name,
+                                    "device": device,
+                                    "shard_count": 1,
+                                    "shard_size": int(self.cfg.shard_size),
+                                },
+                                faiss_index_uuid=index_uuid,
+                            )
+                            project_initialized = True
+
+                        batch_rows = [
+                            (c.chunk_id, int(iid), c.content, int(c.token_count), c.metadata)
+                            for c, iid in zip(batch_chunks, batch_iids)
+                        ]
+
+                        # File metadata is written once after ALL batches for
+                        # this file succeed (see below the batch loop).
+                        if index is None:
+                            training_vectors.append(vectors)
+                            pending_vectors.append(vectors)
+                            pending_ids.append(batch_ids_arr)
+                            pending_rows.append(batch_rows)
+                            pending_file_rows.append([])  # file_rows handled post-loop
+                            if sum(v.shape[0] for v in training_vectors) >= train_target:
+                                train_vecs = np.vstack(training_vectors)
+                                pending_total = sum(v.shape[0] for v in pending_vectors)
+                                index = await self._build_faiss_index(
+                                    train_vecs,
+                                    total_vectors=sum(v.shape[0] for v in training_vectors) + pending_total,
+                                )
+                                for vec_batch, id_batch, row_batch, file_row_batch in zip(
+                                    pending_vectors, pending_ids, pending_rows, pending_file_rows
+                                ):
+                                    await self._persist_index_batch(
+                                        project_id=str(project_id),
+                                        index=index,
+                                        vectors=vec_batch,
+                                        ids=id_batch,
+                                        rows=row_batch,
+                                        file_rows=file_row_batch,
+                                        index_path=index_path,
+                                        rwlock=rwlock,
+                                        index_uuid=index_uuid,
+                                        persist_index=False,
+                                        mark_dirty=not dirty_marked,
+                                        clear_dirty=False,
+                                    )
+                                    dirty_marked = True
+                                training_vectors.clear()
+                                pending_vectors.clear()
+                                pending_ids.clear()
+                                pending_rows.clear()
+                                pending_file_rows.clear()
+                        else:
+                            await self._persist_index_batch(
+                                project_id=str(project_id),
+                                index=index,
+                                vectors=vectors,
+                                ids=batch_ids_arr,
+                                rows=batch_rows,
+                                file_rows=[],
+                                index_path=index_path,
+                                rwlock=rwlock,
+                                index_uuid=index_uuid,
+                                persist_index=False,
+                                mark_dirty=not dirty_marked,
+                                clear_dirty=False,
+                            )
+                            dirty_marked = True
+
+                        total_chunks += len(batch_chunks)
+
+                    # All batches for this file persisted; now write its metadata.
+                    await dbmod.upsert_file_metadata(self.cfg.db_path, str(project_id), [file_row])
+
+                if file_count == 0:
+                    raise ValueError("No indexable content found.")
+
+                if total_chunks == 0:
+                    raise ValueError("No indexable content found.")
+
+                if embedding_dim is None:
+                    raise ValueError("Embedding generation produced no vectors.")
+
+                if not project_initialized:
+                    await dbmod.upsert_project(
+                        self.cfg.db_path,
+                        project_id=str(project_id),
+                        project_name=project_name,
+                        project_type=project_type,
+                        directory=directory,
+                        directory_realpath=directory_realpath,
+                        embedding_dim=embedding_dim,
+                        metadata={
+                            "chunk_size_tokens": self.cfg.chunk_size_tokens,
+                            "overlap_tokens": self.cfg.overlap_tokens,
+                            "model_name": model_name,
+                            "device": device,
+                            "shard_count": 1,
+                            "shard_size": int(self.cfg.shard_size),
+                        },
+                        faiss_index_uuid=index_uuid,
+                    )
+
+                if index is None:
+                    train_vecs = np.vstack(training_vectors) if training_vectors else np.vstack(pending_vectors)
+                    index = await self._build_faiss_index(train_vecs, total_vectors=total_chunks)
+                    for vec_batch, id_batch, row_batch, file_row_batch in zip(
+                        pending_vectors, pending_ids, pending_rows, pending_file_rows
+                    ):
                         await self._persist_index_batch(
                             project_id=str(project_id),
                             index=index,
-                            vectors=vectors,
-                            ids=batch_ids_arr,
-                            rows=batch_rows,
-                            file_rows=[],
+                            vectors=vec_batch,
+                            ids=id_batch,
+                            rows=row_batch,
+                            file_rows=file_row_batch,
                             index_path=index_path,
                             rwlock=rwlock,
                             index_uuid=index_uuid,
@@ -806,93 +873,37 @@ class Indexer:
                             clear_dirty=False,
                         )
                         dirty_marked = True
+                    pending_rows.clear()
+                    pending_file_rows.clear()
 
-                    total_chunks += len(batch_chunks)
+                if index_path and index is not None:
+                    async with rwlock.write_lock():
+                        await invalidate_faiss_cache(index_path)
+                        await asyncio.to_thread(_save_faiss, index, self.index_path_context, index_path)
+                        if index_uuid:
+                            await asyncio.to_thread(
+                                _write_index_uuid, self.index_path_context, index_path, index_uuid
+                            )
+                    if dirty_marked:
+                        await dbmod.clear_project_dirty(self.cfg.db_path, str(project_id))
 
-                # All batches for this file persisted; now write its metadata.
-                await dbmod.upsert_file_metadata(self.cfg.db_path, str(project_id), [file_row])
+                await dbmod.refresh_project_stats(self.cfg.db_path, str(project_id))
+                await dbmod.set_file_count(self.cfg.db_path, str(project_id), file_count)
 
-            if file_count == 0:
-                raise ValueError("No indexable content found.")
-
-            if total_chunks == 0:
-                raise ValueError("No indexable content found.")
-
-            if embedding_dim is None:
-                raise ValueError("Embedding generation produced no vectors.")
-
-            if not project_initialized:
-                await dbmod.upsert_project(
-                    self.cfg.db_path,
-                    project_id=str(project_id),
-                    project_name=project_name,
-                    project_type=project_type,
-                    directory=directory,
-                    directory_realpath=directory_realpath,
-                    embedding_dim=embedding_dim,
-                    metadata={
-                        "chunk_size_tokens": self.cfg.chunk_size_tokens,
-                        "overlap_tokens": self.cfg.overlap_tokens,
-                        "model_name": model_name,
-                        "device": device,
-                        "shard_count": 1,
-                        "shard_size": int(self.cfg.shard_size),
-                    },
-                    faiss_index_uuid=index_uuid,
-                )
-
-            if index is None:
-                train_vecs = np.vstack(training_vectors) if training_vectors else np.vstack(pending_vectors)
-                index = await self._build_faiss_index(train_vecs, total_vectors=total_chunks)
-                for vec_batch, id_batch, row_batch, file_row_batch in zip(
-                    pending_vectors, pending_ids, pending_rows, pending_file_rows
-                ):
-                    await self._persist_index_batch(
-                        project_id=str(project_id),
-                        index=index,
-                        vectors=vec_batch,
-                        ids=id_batch,
-                        rows=row_batch,
-                        file_rows=file_row_batch,
-                        index_path=index_path,
-                        rwlock=rwlock,
-                        index_uuid=index_uuid,
-                        persist_index=False,
-                        mark_dirty=not dirty_marked,
-                        clear_dirty=False,
-                    )
-                    dirty_marked = True
-                pending_rows.clear()
-                pending_file_rows.clear()
-
-            if index_path and index is not None:
-                async with rwlock.write_lock():
-                    await invalidate_faiss_cache(index_path)
-                    await asyncio.to_thread(_save_faiss, index, self.index_path_context, index_path)
+                if index_path and index_current and self.index_path_context.exists(index_path):
+                    _replace_with_retries(self.index_path_context, index_path, index_current)
+                    await invalidate_faiss_cache(index_current)
                     if index_uuid:
                         await asyncio.to_thread(
-                            _write_index_uuid, self.index_path_context, index_path, index_uuid
+                            _write_index_uuid, self.index_path_context, index_current, index_uuid
                         )
-                if dirty_marked:
-                    await dbmod.clear_project_dirty(self.cfg.db_path, str(project_id))
 
-            await dbmod.refresh_project_stats(self.cfg.db_path, str(project_id))
-            await dbmod.set_file_count(self.cfg.db_path, str(project_id), file_count)
-
-            if index_path and index_current and self.index_path_context.exists(index_path):
-                _replace_with_retries(self.index_path_context, index_path, index_current)
-                await invalidate_faiss_cache(index_current)
-                if index_uuid:
-                    await asyncio.to_thread(
-                        _write_index_uuid, self.index_path_context, index_current, index_uuid
-                    )
-
-            await self._maybe_shard_project(project_id=str(project_id))
-            proj = await dbmod.get_project(self.cfg.db_path, str(project_id))
-            shard_count = int((proj or {}).get("metadata", {}).get("shard_count") or 1)
-            await self._sync_project_artifacts(project_id=project_id, shard_count=shard_count)
-            await invalidate_search_cache_project(str(project_id))
-            return str(project_id)
+                await self._maybe_shard_project(project_id=str(project_id))
+                proj = await dbmod.get_project(self.cfg.db_path, str(project_id))
+                shard_count = int((proj or {}).get("metadata", {}).get("shard_count") or 1)
+                await self._sync_project_artifacts(project_id=project_id, shard_count=shard_count)
+                await invalidate_search_cache_project(str(project_id))
+                return str(project_id)
         except BaseException:
             if project_initialized:
                 if index_path and self.index_path_context.exists(index_path):
@@ -971,23 +982,18 @@ class Indexer:
                     continue
                 rel = str(p.relative_to(directory))
                 stat = self.project_path_context.stat(p)
-                content_hash = ""
                 existing = existing_meta.get(rel)
+                # mtime + size both unchanged → file is unchanged; reuse
+                # the stored hash and skip the full-file read entirely.
                 if existing and existing.mtime_ns == stat.st_mtime_ns and existing.size_bytes == stat.st_size:
-                    try:
-                        content_hash = hash_file(self.project_path_context, p, Path(directory), max_bytes)
-                    except Exception:
-                        logging.warning("Failed to hash %s", rel, exc_info=True)
-                        continue
-                    if existing.content_hash == content_hash:
-                        current_files[rel] = (stat.st_mtime_ns, stat.st_size, content_hash, p)
-                        continue
-                if not content_hash:
-                    try:
-                        content_hash = hash_file(self.project_path_context, p, Path(directory), max_bytes)
-                    except Exception:
-                        logging.warning("Failed to hash %s", rel, exc_info=True)
-                        continue
+                    current_files[rel] = (stat.st_mtime_ns, stat.st_size, existing.content_hash, p)
+                    continue
+                # File is new or modified; hash it now.
+                try:
+                    content_hash = hash_file(self.project_path_context, p, Path(directory), max_bytes)
+                except Exception:
+                    logging.warning("Failed to hash %s", rel, exc_info=True)
+                    continue
                 current_files[rel] = (stat.st_mtime_ns, stat.st_size, content_hash, p)
 
             if not self.faiss_available:
@@ -1046,7 +1052,7 @@ class Indexer:
                 shard_count = int(metadata.get("shard_count") or 1)
                 added_count = 0
                 updated_file_rows: List[dbmod.FileMetadataRow] = []
-                sem = asyncio.Semaphore(os.cpu_count() or 4)
+                sem = asyncio.Semaphore(_capped_concurrency())
                 pdf_sem = asyncio.Semaphore(1)
 
                 async def parse_one(rel_path: str) -> Optional[ParsedFile]:
@@ -1109,7 +1115,7 @@ class Indexer:
                                     index.remove_ids(np.asarray(ids_for_shard, dtype=np.int64))
 
                         async for parsed in _bounded_gather(
-                            sorted(changed_files), parse_one, max(1, int(os.cpu_count() or 4))
+                            sorted(changed_files), parse_one, _capped_concurrency()
                         ):
                             if parsed is None:
                                 continue
@@ -1199,7 +1205,7 @@ class Indexer:
                         if internal_ids_to_delete:
                             index.remove_ids(np.asarray(internal_ids_to_delete, dtype=np.int64))
                         async for parsed in _bounded_gather(
-                            sorted(changed_files), parse_one, max(1, int(os.cpu_count() or 4))
+                            sorted(changed_files), parse_one, _capped_concurrency()
                         ):
                             if parsed is None:
                                 continue
@@ -1309,6 +1315,13 @@ class Indexer:
 
         async with rwlock.write_lock():
             try:
+                # --- dirty-flag protocol for crash recovery ---
+                # Set the flag *before* any DB writes.  If the process is
+                # killed after the DB commit but before all shards are on
+                # disk, the flag survives in SQLite and triggers a full
+                # rebuild via update_project → _rebuild_index_from_db.
+                await dbmod.mark_project_dirty(self.cfg.db_path, project_id)
+
                 if internal_ids_to_delete:
                     for shard_id, index in enumerate(shard_indexes):
                         if index is None:
@@ -1351,6 +1364,9 @@ class Indexer:
                     new_paths.append((new_path, current_path))
                 if new_paths:
                     _swap_index_files(self.index_path_context, new_paths)
+
+                # All shards safely on disk — clear the dirty flag.
+                await dbmod.clear_project_dirty(self.cfg.db_path, project_id)
             except Exception:
                 logging.error("Failed to update sharded indexes for project %s", project_id, exc_info=True)
                 if added_chunk_ids:
@@ -1759,11 +1775,13 @@ def _index_artifacts(index_dir: str, project_id: ProjectID, shard_count: int) ->
         current_path, _ = _index_paths(index_dir, project_id)
         artifacts.append((current_path, "faiss_index"))
         artifacts.append((current_path + ".uuid", "faiss_uuid"))
+        artifacts.append((current_path + ".checksum", "faiss_checksum"))
         return artifacts
     for shard_id in range(shard_count):
         current_path, _ = _index_paths(index_dir, project_id, shard_id)
         artifacts.append((current_path, "faiss_index"))
         artifacts.append((current_path + ".uuid", "faiss_uuid"))
+        artifacts.append((current_path + ".checksum", "faiss_checksum"))
     return artifacts
 
 
@@ -1805,6 +1823,18 @@ def _enable_direct_map(index: Any) -> None:
             logging.debug("Failed to create FAISS inner direct map", exc_info=True)
 
 
+def _compute_file_checksum(path: str) -> str:
+    """SHA-256 of *path* in streaming fashion (no full-file memory)."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(1024 * 1024)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def _save_faiss(index: Any, path_context: PathContext, path: str) -> None:
     import faiss
     path_context.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
@@ -1812,7 +1842,12 @@ def _save_faiss(index: Any, path_context: PathContext, path: str) -> None:
     tmp_path = path_context.create_temp_file(dir_path=dir_path, suffix=".index.tmp")
     try:
         faiss.write_index(index, tmp_path)
+        # Compute the checksum *before* the atomic replace so the hash
+        # covers exactly the bytes that end up at *path*.
+        checksum = _compute_file_checksum(tmp_path)
         _replace_with_retries(path_context, tmp_path, path)
+        # Persist checksum companion so project_health can detect bit-rot.
+        path_context.write_text_atomic(path + ".checksum", checksum, encoding="utf-8")
         try:
             path_context.chmod(path, 0o600)
         except OSError:

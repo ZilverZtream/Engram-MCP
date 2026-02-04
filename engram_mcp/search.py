@@ -239,6 +239,32 @@ class SearchEngine:
         if stat.S_ISLNK(st.st_mode):
             raise RuntimeError(f"Refusing to load FAISS index symlink: {safe_path}")
 
+        # --- TOCTOU hardening: re-open with O_NOFOLLOW and verify inode ---
+        # Between the lstat above and the faiss.read_index call below an
+        # attacker with local access could atomically replace the file with
+        # a symlink.  Opening with O_NOFOLLOW fails immediately if the path
+        # *is* a symlink at the moment of the syscall, and the subsequent
+        # inode comparison ensures the file was not swapped for a different
+        # regular file in the same window.
+        _oflags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            _oflags |= os.O_NOFOLLOW
+        try:
+            _fd = os.open(safe_path, _oflags)
+        except OSError as exc:
+            raise RuntimeError(
+                f"Cannot open FAISS index {safe_path}: "
+                "possible symlink swap between check and open"
+            ) from exc
+        try:
+            _st2 = os.fstat(_fd)
+        finally:
+            os.close(_fd)
+        if st.st_ino != _st2.st_ino or st.st_dev != _st2.st_dev:
+            raise RuntimeError(
+                f"FAISS index file changed between check and open: {safe_path}"
+            )
+
         index_mtime = st.st_mtime
         async with _faiss_cache_lock:
             cached = _faiss_cache.get(safe_path)

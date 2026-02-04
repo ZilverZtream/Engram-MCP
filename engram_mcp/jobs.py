@@ -92,11 +92,18 @@ class JobManager:
                     await dbmod.update_job_status(self._db_path, job_id=job_id, status="COMPLETED")
                     return result
                 finally:
-                    await dbmod.prune_jobs(
-                        self._db_path,
-                        max_age_days=self._job_retention_days,
-                        max_rows=self._job_retention_max,
-                    )
+                    # Skip maintenance I/O during shutdown: the event loop
+                    # may already be torn down and further awaits would
+                    # raise or produce noisy incomplete-future warnings.
+                    if not self._shutting_down:
+                        try:
+                            await dbmod.prune_jobs(
+                                self._db_path,
+                                max_age_days=self._job_retention_days,
+                                max_rows=self._job_retention_max,
+                            )
+                        except Exception:
+                            pass
 
         task = asyncio.create_task(_wrapped_coro())
         job = Job(job_id=job_id, kind=kind, created_at=time.time(), task=task)

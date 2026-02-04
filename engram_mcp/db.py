@@ -218,7 +218,7 @@ class _ConnectionPool:
                         raise
                 conn = await self._queue.get()
                 return conn
-        except Exception:
+        except BaseException:
             self._semaphore.release()
             raise
 
@@ -828,7 +828,9 @@ def _sanitize_fts_query(query: str) -> str:
     if not query or not query.strip():
         return '""'
     # Replace FTS5 syntax operators and angle-brackets with spaces.
-    cleaned = re.sub(r'[*^+(){}<>]', ' ', query)
+    # Note: '+' is deliberately NOT stripped — it is not an FTS5 operator
+    # and stripping it collapses "C++" to "C".
+    cleaned = re.sub(r'[*^(){}<>]', ' ', query)
     tokens = [t for t in cleaned.split() if t]
     if not tokens:
         return '""'
@@ -840,7 +842,8 @@ def build_fts_query(query: str, *, mode: str = "strict") -> str:
     """Build a sanitized FTS5 query string supporting AND/OR modes and phrases."""
     if not query or not query.strip():
         return '""'
-    cleaned = re.sub(r'[*^+(){}<>]', ' ', query)
+    # '+' is not an FTS5 operator; keeping it preserves "C++" precision.
+    cleaned = re.sub(r'[*^(){}<>]', ' ', query)
     mode_lower = str(mode).lower()
     if mode_lower == "phrase":
         cleaned_phrase = re.sub(r'\s+', ' ', cleaned).strip()

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import atexit
 import asyncio
+import hashlib
 import importlib.util
 import logging
 import os
@@ -497,6 +498,31 @@ async def project_health(project_id: str) -> Dict[str, Any]:
                         uuid_mismatches.append({"path": path, "on_disk": on_disk_uuid, "expected": index_uuid})
                 except Exception as exc:
                     uuid_mismatches.append({"path": path, "error": str(exc)})
+            # Verify index-file integrity against the stored SHA-256
+            # checksum.  Detects silent bit-rot before faiss touches the
+            # data (a corrupted mmap can segfault inside the C++ layer).
+            checksum_path = safe_path + ".checksum"
+            if index_path_context.exists(checksum_path):
+                try:
+                    with index_path_context.open_file(checksum_path, "r", encoding="utf-8") as cf:
+                        stored_checksum = cf.read().strip()
+                    h = hashlib.sha256()
+                    with index_path_context.open_file(safe_path, "rb") as f:
+                        while True:
+                            buf = f.read(1024 * 1024)
+                            if not buf:
+                                break
+                            h.update(buf)
+                    actual_checksum = h.hexdigest()
+                    if stored_checksum != actual_checksum:
+                        missing_files.append(
+                            f"{safe_path} (checksum mismatch: "
+                            f"stored={stored_checksum[:16]}… actual={actual_checksum[:16]}…)"
+                        )
+                        continue
+                except Exception as exc:
+                    missing_files.append(f"{safe_path} (checksum verification failed: {exc})")
+                    continue
             try:
                 index = faiss.read_index(safe_path, faiss.IO_FLAG_MMAP)
                 faiss_totals.append(int(getattr(index, "ntotal", 0)))
