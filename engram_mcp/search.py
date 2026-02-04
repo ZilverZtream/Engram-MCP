@@ -13,7 +13,7 @@ import numpy as np
 from numba import jit
 
 from . import db as dbmod
-from .locks import get_project_lock
+from .locks import get_project_rwlock
 
 
 def _sanitize_project_id(project_id: str) -> str:
@@ -155,6 +155,11 @@ _faiss_cache_max_items = 8
 _faiss_cache_lock = asyncio.Lock()
 
 
+async def invalidate_faiss_cache(index_path: str) -> None:
+    async with _faiss_cache_lock:
+        _faiss_cache.pop(index_path, None)
+
+
 @dataclass
 class SearchEngine:
     db_path: str
@@ -181,16 +186,13 @@ class SearchEngine:
                 return cached[1]
             _faiss_cache.pop(index_path, None)
 
-        # Acquire lock to prevent race condition with updates
-        lock = await get_project_lock(project_id)
-        async with lock:
-            # Load in thread to avoid blocking event loop
-            def _load():
-                # Use IO_FLAG_READ_ONLY instead of MMAP to avoid SIGBUS issues
-                return faiss.read_index(index_path)
+        # Load in thread to avoid blocking event loop
+        def _load():
+            # Use IO_FLAG_READ_ONLY instead of MMAP to avoid SIGBUS issues
+            return faiss.read_index(index_path)
 
-            loop = asyncio.get_running_loop()
-            index = await loop.run_in_executor(None, _load)
+        loop = asyncio.get_running_loop()
+        index = await loop.run_in_executor(None, _load)
 
         async with _faiss_cache_lock:
             _faiss_cache[index_path] = (index_mtime, index)
@@ -209,29 +211,32 @@ class SearchEngine:
         if not internal_ids:
             return {}
         embeddings: Dict[int, np.ndarray] = {}
+        rwlock = await get_project_rwlock(project_id)
         if shard_count > 1:
             safe_id = _sanitize_project_id(project_id)
             shard_map: Dict[int, List[int]] = {}
             for iid in internal_ids:
                 shard_map.setdefault(iid % shard_count, []).append(iid)
-            for shard_id, ids in shard_map.items():
-                index_path = os.path.join(self.index_dir, f"{safe_id}.shard{shard_id}.index")
-                if not os.path.exists(index_path):
-                    continue
-                index = await self._load_faiss_path(project_id, index_path)
-                for iid in ids:
-                    try:
-                        embeddings[iid] = index.reconstruct(int(iid))
-                    except Exception:
+            async with rwlock.read_lock():
+                for shard_id, ids in shard_map.items():
+                    index_path = os.path.join(self.index_dir, f"{safe_id}.shard{shard_id}.index")
+                    if not os.path.exists(index_path):
                         continue
+                    index = await self._load_faiss_path(project_id, index_path)
+                    for iid in ids:
+                        try:
+                            embeddings[iid] = index.reconstruct(int(iid))
+                        except Exception:
+                            continue
             return embeddings
 
-        index = await self._load_faiss(project_id)
-        for iid in internal_ids:
-            try:
-                embeddings[iid] = index.reconstruct(int(iid))
-            except Exception:
-                continue
+        async with rwlock.read_lock():
+            index = await self._load_faiss(project_id)
+            for iid in internal_ids:
+                try:
+                    embeddings[iid] = index.reconstruct(int(iid))
+                except Exception:
+                    continue
         return embeddings
 
     async def vector_search(
@@ -246,17 +251,19 @@ class SearchEngine:
         import faiss
 
         loop = asyncio.get_running_loop()
-        index = await self._load_faiss_path(project_id, index_path) if index_path else await self._load_faiss(project_id)
+        rwlock = await get_project_rwlock(project_id)
+        async with rwlock.read_lock():
+            index = await self._load_faiss_path(project_id, index_path) if index_path else await self._load_faiss(project_id)
 
-        def _search_sync() -> Tuple[List[int], List[float]]:
-            q = np.asarray([query_vec], dtype=np.float32)
-            faiss.normalize_L2(q)
-            D, I = index.search(q, top_k)
-            ids = [int(i) for i in I[0] if int(i) != -1]
-            scores = [float(d) for d, i in zip(D[0], I[0]) if int(i) != -1]
-            return ids, scores
+            def _search_sync() -> Tuple[List[int], List[float]]:
+                q = np.asarray([query_vec], dtype=np.float32)
+                faiss.normalize_L2(q)
+                D, I = index.search(q, top_k)
+                ids = [int(i) for i in I[0] if int(i) != -1]
+                scores = [float(d) for d, i in zip(D[0], I[0]) if int(i) != -1]
+                return ids, scores
 
-        internal_ids, scores = await loop.run_in_executor(None, _search_sync)
+            internal_ids, scores = await loop.run_in_executor(None, _search_sync)
         rows = await dbmod.fetch_chunks_by_internal_ids(self.db_path, project_id, internal_ids)
 
         # Map internal_id -> score rank (distance unavailable in this abstraction; rank is ok for RRF)

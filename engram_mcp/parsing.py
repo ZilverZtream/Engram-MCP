@@ -47,21 +47,32 @@ def iter_files(root: str, ignore_patterns: List[str]) -> Iterator[Path]:
         yield p
 
 
-def read_text_streaming(path: Path, max_bytes: int) -> str:
+def _open_relative(root: Path, path: Path, mode: str, *, encoding: Optional[str] = None):
+    rel = path.relative_to(root)
+    root_fd = os.open(root, os.O_RDONLY)
+    try:
+        flags = os.O_RDONLY
+        fd = os.open(str(rel), flags, dir_fd=root_fd, follow_symlinks=False)
+        return os.fdopen(fd, mode, encoding=encoding, errors="ignore" if "b" not in mode else None)
+    finally:
+        os.close(root_fd)
+
+
+def read_text_streaming(path: Path, root: Path, max_bytes: int) -> str:
     # Avoid reading enormous files at once.
     size = path.stat().st_size
     if size > max_bytes:
         raise ValueError(f"File too large: {path} ({size} bytes)")
-    with path.open("r", encoding="utf-8", errors="ignore") as f:
+    with _open_relative(root, path, "r", encoding="utf-8") as f:
         return f.read()
 
 
-def hash_file(path: Path, max_bytes: int) -> str:
+def hash_file(path: Path, root: Path, max_bytes: int) -> str:
     size = path.stat().st_size
     if size > max_bytes:
         raise ValueError(f"File too large: {path} ({size} bytes)")
     h = hashlib.sha256()
-    with path.open("rb") as f:
+    with _open_relative(root, path, "rb") as f:
         while True:
             chunk = f.read(1024 * 1024)
             if not chunk:
@@ -94,8 +105,8 @@ def parse_file_to_chunks(
     max_bytes = int(max_file_size_mb) * 1024 * 1024
 
     if ext in SUPPORTED_TEXT_EXTS:
-        text = read_text_streaming(path, max_bytes=max_bytes)
-        base_id = make_chunk_id(str(path), str(path.stat().st_mtime_ns))
+        text = read_text_streaming(path, root=Path(root), max_bytes=max_bytes)
+        base_id = make_chunk_id(str(path))
         return chunk_text(
             text=text,
             base_id=base_id,
@@ -113,17 +124,23 @@ def parse_file_to_chunks(
         if size > max_bytes:
             raise ValueError(f"PDF file too large: {path} ({size} bytes)")
 
-        reader = PdfReader(str(path))
+        max_text_chars = max_bytes * 4
+        with _open_relative(Path(root), path, "rb") as f:
+            reader = PdfReader(f)
         chunks: List[Chunk] = []
-        base_id = make_chunk_id(str(path), str(path.stat().st_mtime_ns))
+        base_id = make_chunk_id(str(path))
+        total_chars = 0
         for i, page in enumerate(reader.pages):
             page_text = page.extract_text() or ""
+            total_chars += len(page_text)
+            if total_chars > max_text_chars:
+                raise ValueError(f"PDF extracted text too large: {path}")
             if not page_text.strip():
                 continue
             page_meta = {**base_meta, "type": "pdf_page", "page": i + 1}
             # Keep pages as their own units, then chunk if needed
             if token_count(page_text) <= chunk_size_tokens * 2:
-                cid = make_chunk_id(base_id, f"page:{i+1}")
+                cid = make_chunk_id(base_id, f"page:{i+1}", page_text)
                 chunks.append(Chunk(cid, page_text, token_count(page_text), page_meta))
             else:
                 chunks.extend(
@@ -140,10 +157,11 @@ def parse_file_to_chunks(
     if ext == ".docx":
         from docx import Document
 
-        doc = Document(str(path))
+        with _open_relative(Path(root), path, "rb") as f:
+            doc = Document(f)
         paras = [p.text for p in doc.paragraphs if p.text and p.text.strip()]
         text = "\n".join(paras)
-        base_id = make_chunk_id(str(path), str(path.stat().st_mtime_ns))
+        base_id = make_chunk_id(str(path))
         return chunk_text(
             text=text,
             base_id=base_id,
@@ -203,7 +221,7 @@ async def parse_directory(
         file_hash: Optional[str] = None
         if existing and existing.mtime_ns == stat.st_mtime_ns and existing.size_bytes == stat.st_size:
             try:
-                file_hash = await asyncio.to_thread(hash_file, path, max_file_size_mb * 1024 * 1024)
+                file_hash = await asyncio.to_thread(hash_file, path, Path(root), max_file_size_mb * 1024 * 1024)
             except Exception:
                 logging.warning("Failed to hash %s", rel, exc_info=True)
             if file_hash and existing.content_hash == file_hash:
@@ -212,7 +230,7 @@ async def parse_directory(
 
         if file_hash is None:
             try:
-                file_hash = await asyncio.to_thread(hash_file, path, max_file_size_mb * 1024 * 1024)
+                file_hash = await asyncio.to_thread(hash_file, path, Path(root), max_file_size_mb * 1024 * 1024)
             except Exception:
                 logging.warning("Failed to hash %s", rel, exc_info=True)
                 return None

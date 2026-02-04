@@ -79,10 +79,20 @@ CREATE TABLE IF NOT EXISTS file_metadata (
     mtime_ns INTEGER NOT NULL,
     size_bytes INTEGER NOT NULL,
     content_hash TEXT NOT NULL DEFAULT '',
-    chunk_ids TEXT NOT NULL,
     PRIMARY KEY (project_id, file_path),
     FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE
 );
+
+CREATE TABLE IF NOT EXISTS file_chunks (
+    project_id TEXT NOT NULL,
+    file_path TEXT NOT NULL,
+    chunk_id TEXT NOT NULL,
+    PRIMARY KEY (project_id, file_path, chunk_id),
+    FOREIGN KEY(project_id, file_path) REFERENCES file_metadata(project_id, file_path) ON DELETE CASCADE,
+    FOREIGN KEY(chunk_id) REFERENCES chunks(chunk_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_file_chunks_project_file ON file_chunks(project_id, file_path);
 
 CREATE TABLE IF NOT EXISTS internal_id_sequence (
     project_id TEXT PRIMARY KEY,
@@ -167,6 +177,7 @@ async def init_db(db_path: str) -> None:
     async with get_connection(db_path) as db:
         await db.executescript(SCHEMA_SQL)
         await _ensure_file_metadata_schema(db)
+        await _ensure_file_chunks_schema(db)
         await _ensure_fts_tokenizer(db)
         await db.commit()
 
@@ -176,6 +187,55 @@ async def _ensure_file_metadata_schema(db: aiosqlite.Connection) -> None:
     columns = {r[1] for r in rows}
     if "content_hash" not in columns:
         await db.execute("ALTER TABLE file_metadata ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''")
+
+
+async def _ensure_file_chunks_schema(db: aiosqlite.Connection) -> None:
+    row = await db.execute_fetchone(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'file_chunks'"
+    )
+    if row:
+        return
+    await db.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS file_chunks (
+            project_id TEXT NOT NULL,
+            file_path TEXT NOT NULL,
+            chunk_id TEXT NOT NULL,
+            PRIMARY KEY (project_id, file_path, chunk_id),
+            FOREIGN KEY(project_id, file_path) REFERENCES file_metadata(project_id, file_path) ON DELETE CASCADE,
+            FOREIGN KEY(chunk_id) REFERENCES chunks(chunk_id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_file_chunks_project_file ON file_chunks(project_id, file_path);
+        """
+    )
+    await _migrate_file_chunks_from_metadata(db)
+
+
+async def _migrate_file_chunks_from_metadata(db: aiosqlite.Connection) -> None:
+    rows = await db.execute_fetchall("PRAGMA table_info(file_metadata)")
+    columns = {r[1] for r in rows}
+    if "chunk_ids" not in columns:
+        return
+    cursor = await db.execute("SELECT project_id, file_path, chunk_ids FROM file_metadata")
+    batch: List[Tuple[str, str, str]] = []
+    async for project_id, file_path, chunk_ids_json in cursor:
+        try:
+            chunk_ids = json.loads(chunk_ids_json or "[]")
+        except Exception:
+            chunk_ids = []
+        for chunk_id in chunk_ids:
+            batch.append((str(project_id), str(file_path), str(chunk_id)))
+        if len(batch) >= 500:
+            await db.executemany(
+                "INSERT OR IGNORE INTO file_chunks(project_id, file_path, chunk_id) VALUES(?,?,?)",
+                batch,
+            )
+            batch.clear()
+    if batch:
+        await db.executemany(
+            "INSERT OR IGNORE INTO file_chunks(project_id, file_path, chunk_id) VALUES(?,?,?)",
+            batch,
+        )
 
 
 async def _ensure_fts_tokenizer(db: aiosqlite.Connection) -> None:
@@ -352,21 +412,24 @@ async def fetch_chunks_by_internal_ids(
 ) -> List[ChunkRow]:
     if not internal_ids:
         return []
-    placeholders = ",".join(["?"] * len(internal_ids))
+    batch_size = 900
+    row_map: Dict[int, ChunkRow] = {}
     async with get_connection(db_path) as db:
-        rows = await db.execute_fetchall(
-            f"""
-            SELECT chunk_id, internal_id, content, token_count, metadata, access_count
-            FROM chunks
-            WHERE project_id = ? AND internal_id IN ({placeholders})
-            """,
-            (project_id, *internal_ids),
-        )
-    out: List[ChunkRow] = []
-    for r in rows:
-        meta = json.loads(r[4] or "{}")
-        out.append(ChunkRow(r[0], int(r[1]), r[2], int(r[3]), meta, int(r[5] or 0)))
-    return out
+        for i in range(0, len(internal_ids), batch_size):
+            batch = internal_ids[i:i + batch_size]
+            placeholders = ",".join(["?"] * len(batch))
+            rows = await db.execute_fetchall(
+                f"""
+                SELECT chunk_id, internal_id, content, token_count, metadata, access_count
+                FROM chunks
+                WHERE project_id = ? AND internal_id IN ({placeholders})
+                """,
+                (project_id, *batch),
+            )
+            for r in rows:
+                meta = json.loads(r[4] or "{}")
+                row_map[int(r[1])] = ChunkRow(r[0], int(r[1]), r[2], int(r[3]), meta, int(r[5] or 0))
+    return [row_map[iid] for iid in internal_ids if iid in row_map]
 
 
 async def bump_access_counts(db_path: str, project_id: str, chunk_ids: List[str]) -> None:
@@ -400,6 +463,13 @@ async def refresh_project_stats(db_path: str, project_id: str) -> None:
         await db.commit()
 
 
+def _sanitize_fts_query(query: str) -> str:
+    if not query or not query.strip():
+        return '""'
+    escaped = query.replace('"', '""')
+    return f'"{escaped}"'
+
+
 async def fts_search(
     db_path: str,
     *,
@@ -408,6 +478,7 @@ async def fts_search(
     limit: int,
 ) -> List[Dict[str, Any]]:
     """Lexical search using FTS5 + bm25 ranking."""
+    sanitized = _sanitize_fts_query(query)
     try:
         async with get_connection(db_path) as db:
             db.row_factory = aiosqlite.Row
@@ -421,7 +492,7 @@ async def fts_search(
                 ORDER BY score ASC
                 LIMIT ?
                 """,
-                (project_id, query, limit),
+                (project_id, sanitized, limit),
             )
     except aiosqlite.OperationalError:
         logging.warning("FTS query failed for %s", project_id, exc_info=True)
@@ -449,42 +520,69 @@ async def fetch_internal_ids_for_chunk_ids(
 ) -> List[int]:
     if not chunk_ids:
         return []
-    placeholders = ",".join(["?"] * len(chunk_ids))
+    batch_size = 900
+    out: List[int] = []
     async with get_connection(db_path) as db:
-        rows = await db.execute_fetchall(
-            f"""
-            SELECT internal_id
-            FROM chunks
-            WHERE project_id = ? AND chunk_id IN ({placeholders})
-            """,
-            (project_id, *chunk_ids),
-        )
-    return [int(r[0]) for r in rows]
+        for i in range(0, len(chunk_ids), batch_size):
+            batch = chunk_ids[i:i + batch_size]
+            placeholders = ",".join(["?"] * len(batch))
+            rows = await db.execute_fetchall(
+                f"""
+                SELECT internal_id
+                FROM chunks
+                WHERE project_id = ? AND chunk_id IN ({placeholders})
+                """,
+                (project_id, *batch),
+            )
+            out.extend(int(r[0]) for r in rows)
+    return out
 
 
 async def fetch_file_metadata(db_path: str, project_id: str) -> Dict[str, FileMetadataRow]:
     async with get_connection(db_path) as db:
         rows = await db.execute_fetchall(
             """
-            SELECT file_path, mtime_ns, size_bytes, content_hash, chunk_ids
+            SELECT file_path, mtime_ns, size_bytes, content_hash
             FROM file_metadata
             WHERE project_id = ?
             """,
             (project_id,),
         )
     out: Dict[str, FileMetadataRow] = {}
-    for path, mtime_ns, size_bytes, content_hash, chunk_ids_json in rows:
-        try:
-            chunk_ids = json.loads(chunk_ids_json or "[]")
-        except Exception:
-            chunk_ids = []
+    for path, mtime_ns, size_bytes, content_hash in rows:
         out[path] = FileMetadataRow(
             file_path=path,
             mtime_ns=int(mtime_ns),
             size_bytes=int(size_bytes),
             content_hash=str(content_hash or ""),
-            chunk_ids=[str(cid) for cid in chunk_ids],
+            chunk_ids=[],
         )
+    return out
+
+
+async def fetch_file_chunk_ids(
+    db_path: str,
+    project_id: str,
+    file_paths: List[str],
+) -> Dict[str, List[str]]:
+    if not file_paths:
+        return {}
+    out: Dict[str, List[str]] = {path: [] for path in file_paths}
+    batch_size = 900
+    async with get_connection(db_path) as db:
+        for i in range(0, len(file_paths), batch_size):
+            batch = file_paths[i:i + batch_size]
+            placeholders = ",".join(["?"] * len(batch))
+            rows = await db.execute_fetchall(
+                f"""
+                SELECT file_path, chunk_id
+                FROM file_chunks
+                WHERE project_id = ? AND file_path IN ({placeholders})
+                """,
+                (project_id, *batch),
+            )
+            for file_path, chunk_id in rows:
+                out[str(file_path)].append(str(chunk_id))
     return out
 
 
@@ -496,40 +594,85 @@ async def upsert_file_metadata(
     if not rows:
         return
     async with get_connection(db_path) as db:
-        await db.executemany(
-            """
-            INSERT INTO file_metadata(project_id, file_path, mtime_ns, size_bytes, content_hash, chunk_ids)
-            VALUES(?,?,?,?,?,?)
-            ON CONFLICT(project_id, file_path) DO UPDATE SET
-              mtime_ns = excluded.mtime_ns,
-              size_bytes = excluded.size_bytes,
-              content_hash = excluded.content_hash,
-              chunk_ids = excluded.chunk_ids
-            """,
-            [
-                (
-                    project_id,
-                    r.file_path,
-                    int(r.mtime_ns),
-                    int(r.size_bytes),
-                    r.content_hash,
-                    json.dumps(r.chunk_ids),
-                )
-                for r in rows
-            ],
-        )
+        columns = await db.execute_fetchall("PRAGMA table_info(file_metadata)")
+        has_chunk_ids = any(col[1] == "chunk_ids" for col in columns)
+        if has_chunk_ids:
+            await db.executemany(
+                """
+                INSERT INTO file_metadata(project_id, file_path, mtime_ns, size_bytes, content_hash, chunk_ids)
+                VALUES(?,?,?,?,?,?)
+                ON CONFLICT(project_id, file_path) DO UPDATE SET
+                  mtime_ns = excluded.mtime_ns,
+                  size_bytes = excluded.size_bytes,
+                  content_hash = excluded.content_hash,
+                  chunk_ids = excluded.chunk_ids
+                """,
+                [
+                    (
+                        project_id,
+                        r.file_path,
+                        int(r.mtime_ns),
+                        int(r.size_bytes),
+                        r.content_hash,
+                        "[]",
+                    )
+                    for r in rows
+                ],
+            )
+        else:
+            await db.executemany(
+                """
+                INSERT INTO file_metadata(project_id, file_path, mtime_ns, size_bytes, content_hash)
+                VALUES(?,?,?,?,?)
+                ON CONFLICT(project_id, file_path) DO UPDATE SET
+                  mtime_ns = excluded.mtime_ns,
+                  size_bytes = excluded.size_bytes,
+                  content_hash = excluded.content_hash
+                """,
+                [
+                    (
+                        project_id,
+                        r.file_path,
+                        int(r.mtime_ns),
+                        int(r.size_bytes),
+                        r.content_hash,
+                    )
+                    for r in rows
+                ],
+            )
+        file_paths = [r.file_path for r in rows]
+        batch_size = 900
+        for i in range(0, len(file_paths), batch_size):
+            batch = file_paths[i:i + batch_size]
+            placeholders = ",".join(["?"] * len(batch))
+            await db.execute(
+                f"DELETE FROM file_chunks WHERE project_id = ? AND file_path IN ({placeholders})",
+                (project_id, *batch),
+            )
+        chunk_rows: List[Tuple[str, str, str]] = []
+        for r in rows:
+            for chunk_id in r.chunk_ids:
+                chunk_rows.append((project_id, r.file_path, chunk_id))
+        if chunk_rows:
+            await db.executemany(
+                "INSERT OR IGNORE INTO file_chunks(project_id, file_path, chunk_id) VALUES(?,?,?)",
+                chunk_rows,
+            )
         await db.commit()
 
 
 async def delete_file_metadata(db_path: str, project_id: str, file_paths: List[str]) -> None:
     if not file_paths:
         return
-    placeholders = ",".join(["?"] * len(file_paths))
     async with get_connection(db_path) as db:
-        await db.execute(
-            f"DELETE FROM file_metadata WHERE project_id = ? AND file_path IN ({placeholders})",
-            (project_id, *file_paths),
-        )
+        batch_size = 900
+        for i in range(0, len(file_paths), batch_size):
+            batch = file_paths[i:i + batch_size]
+            placeholders = ",".join(["?"] * len(batch))
+            await db.execute(
+                f"DELETE FROM file_metadata WHERE project_id = ? AND file_path IN ({placeholders})",
+                (project_id, *batch),
+            )
         await db.commit()
 
 
@@ -559,6 +702,7 @@ async def upsert_embedding_cache(
     *,
     model_name: str,
     rows: List[Tuple[str, bytes]],
+    ttl_s: int = 0,
 ) -> None:
     if not rows:
         return
@@ -574,4 +718,13 @@ async def upsert_embedding_cache(
             """,
             [(content_hash, embedding, model_name) for content_hash, embedding in rows],
         )
+        if int(ttl_s) > 0:
+            await db.execute(
+                """
+                DELETE FROM embedding_cache
+                WHERE model_name = ?
+                  AND created_at < datetime('now', ?)
+                """,
+                (model_name, f"-{int(ttl_s)} seconds"),
+            )
         await db.commit()
