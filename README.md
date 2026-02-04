@@ -114,8 +114,9 @@ allowed_roots:
 pip install -r requirements.txt
 ```
 
-All dependencies are resolved **at install time**.  
-No runtime downloads. No surprises.
+Dependencies are resolved **at install time**.  
+SentenceTransformers models are downloaded on first use unless you pre-download them (for air‑gapped setups, cache the models or point `model_name_*` to a local path).  
+No surprises once the model cache is in place.
 
 ---
 

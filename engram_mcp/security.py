@@ -84,7 +84,16 @@ class PathContext:
         errors: Optional[str] = None,
     ):
         resolved = self.resolve_path(path)
-        return open(resolved, mode, encoding=encoding, errors=errors)
+        if "r" not in mode:
+            return open(resolved, mode, encoding=encoding, errors=errors)
+
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        fd = os.open(resolved, flags)
+        return os.fdopen(fd, mode, encoding=encoding, errors=errors)
 
     def list_dir(self, path: str | Path) -> List[str]:
         resolved = self.resolve_path(path)

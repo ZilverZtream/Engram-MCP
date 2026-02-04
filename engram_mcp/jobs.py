@@ -17,11 +17,17 @@ class Job:
 
 
 class JobManager:
-    def __init__(self, db_path: str, max_concurrent_jobs: int = 5) -> None:
+    def __init__(
+        self,
+        db_path: str,
+        max_concurrent_jobs: int = 5,
+        max_queue_size: int = 1000,
+    ) -> None:
         self._jobs: Dict[str, Job] = {}
         self._lock = asyncio.Lock()
         # Semaphore to limit concurrent jobs and prevent DoS
         self._semaphore = asyncio.Semaphore(max_concurrent_jobs)
+        self._max_queue_size = max(1, int(max_queue_size))
         self._db_path = db_path
         self._reconciled = False
         self._reconcile_lock = asyncio.Lock()
@@ -41,6 +47,9 @@ class JobManager:
 
     async def create(self, kind: str, coro: Awaitable[Any]) -> Job:
         await self._ensure_reconciled()
+        async with self._lock:
+            if len(self._jobs) >= self._max_queue_size:
+                raise RuntimeError("Job queue is full; try again later.")
         job_id = f"{kind}_{int(time.time()*1000)}"
         await dbmod.init_db(self._db_path)
         await dbmod.create_job(self._db_path, job_id=job_id, kind=kind, status="QUEUED")
