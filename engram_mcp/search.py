@@ -198,7 +198,7 @@ class SearchEngine:
                 with self.index_path_context.open_file(uuid_path, "r", encoding="utf-8") as uf:
                     file_uuid = uf.read().strip()
                 proj = await dbmod.get_project(self.db_path, project_id)
-                expected_uuid = (proj.get("metadata") or {}).get("faiss_index_uuid") if proj else None
+                expected_uuid = proj.get("faiss_index_uuid") if proj else None
                 if expected_uuid and file_uuid and file_uuid != expected_uuid:
                     raise RuntimeError(
                         f"FAISS index UUID mismatch for project {project_id}: "
@@ -352,8 +352,12 @@ class SearchEngine:
         mmr_lambda: float,
         fts_mode: str = "strict",
     ) -> List[Dict[str, Any]]:
+        allowed_modes = {"strict", "any", "phrase"}
+        mode = str(fts_mode).lower()
+        if mode not in allowed_modes:
+            raise ValueError(f"Invalid fts_mode '{fts_mode}'. Allowed: {sorted(allowed_modes)}")
         params_hash = hashlib.sha256(
-            f"{fts_top_k}:{vector_top_k}:{return_k}:{enable_mmr}:{mmr_lambda}".encode("utf-8")
+            f"{fts_top_k}:{vector_top_k}:{return_k}:{enable_mmr}:{mmr_lambda}:{mode}".encode("utf-8")
         ).hexdigest()
         cache_key = f"{project_id}:{hashlib.sha256(query.encode('utf-8')).hexdigest()}:{params_hash}"
         async with _cache_lock:
@@ -367,7 +371,7 @@ class SearchEngine:
         rwlock = await get_project_rwlock(project_id)
         async with rwlock.read_lock():
             lex = await dbmod.fts_search(
-                self.db_path, project_id=project_id, query=query, limit=fts_top_k, mode=fts_mode
+                self.db_path, project_id=project_id, query=query, limit=fts_top_k, mode=mode
             )
             proj = await dbmod.get_project(self.db_path, project_id)
             shard_count = int((proj.get("metadata") or {}).get("shard_count") or 1) if proj else 1

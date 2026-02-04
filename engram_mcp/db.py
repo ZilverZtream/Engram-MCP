@@ -22,8 +22,12 @@ CREATE TABLE IF NOT EXISTS projects (
     project_name TEXT NOT NULL,
     project_type TEXT NOT NULL,
     directory TEXT,
+    directory_realpath TEXT,
     embedding_dim INTEGER NOT NULL,
     metadata TEXT,
+    index_dirty INTEGER NOT NULL DEFAULT 0,
+    faiss_index_uuid TEXT,
+    deleting INTEGER NOT NULL DEFAULT 0,
     chunk_count INTEGER DEFAULT 0,
     file_count INTEGER DEFAULT 0,
     total_tokens INTEGER DEFAULT 0,
@@ -115,6 +119,15 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
     name TEXT PRIMARY KEY,
     applied_at TEXT DEFAULT (datetime('now'))
 );
+
+CREATE TABLE IF NOT EXISTS project_artifacts (
+    project_id TEXT NOT NULL,
+    artifact_path TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    created_at TEXT DEFAULT (datetime('now')),
+    PRIMARY KEY (project_id, artifact_path),
+    FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE
+);
 """
 
 
@@ -147,6 +160,14 @@ def build_in_query(prefix_sql: str, values: Sequence[Any], suffix_sql: str = "")
     placeholders = ",".join(["?"] * len(values))
     sql = prefix_sql + "(" + placeholders + ")" + suffix_sql
     return SQLQuery(sql, tuple(values))
+
+
+def _safe_load_metadata(raw: Optional[str], *, context: str) -> Dict[str, Any]:
+    try:
+        return json.loads(raw or "{}")
+    except json.JSONDecodeError:
+        logging.warning("Failed to decode metadata for %s", context, exc_info=True)
+        return {}
 
 
 class _ConnectionPool:
@@ -295,11 +316,24 @@ async def init_db(db_path: str) -> None:
     ensure_db_permissions(db_path)
     async with get_connection(db_path) as db:
         await db.executescript(SCHEMA_SQL)
+        await _ensure_projects_schema(db)
         await _ensure_file_metadata_schema(db)
         await _ensure_file_chunks_schema(db)
         await _ensure_fts_tokenizer(db)
         await _ensure_fts_triggers(db)
         await db.commit()
+
+async def _ensure_projects_schema(db: aiosqlite.Connection) -> None:
+    rows = await db.execute_fetchall("PRAGMA table_info(projects)")
+    columns = {r[1] for r in rows}
+    if "directory_realpath" not in columns:
+        await db.execute("ALTER TABLE projects ADD COLUMN directory_realpath TEXT")
+    if "index_dirty" not in columns:
+        await db.execute("ALTER TABLE projects ADD COLUMN index_dirty INTEGER NOT NULL DEFAULT 0")
+    if "faiss_index_uuid" not in columns:
+        await db.execute("ALTER TABLE projects ADD COLUMN faiss_index_uuid TEXT")
+    if "deleting" not in columns:
+        await db.execute("ALTER TABLE projects ADD COLUMN deleting INTEGER NOT NULL DEFAULT 0")
 
 
 async def _ensure_file_metadata_schema(db: aiosqlite.Connection) -> None:
@@ -429,23 +463,54 @@ async def upsert_project(
     project_name: str,
     project_type: str,
     directory: Optional[str],
+    directory_realpath: Optional[str],
     embedding_dim: int,
     metadata: Dict[str, Any],
+    index_dirty: int = 0,
+    faiss_index_uuid: Optional[str] = None,
+    deleting: int = 0,
 ) -> None:
     async with get_connection(db_path) as db:
         await db.execute(
             """
-            INSERT INTO projects(project_id, project_name, project_type, directory, embedding_dim, metadata, updated_at)
-            VALUES(?,?,?,?,?,?, datetime('now'))
+            INSERT INTO projects(
+                project_id,
+                project_name,
+                project_type,
+                directory,
+                directory_realpath,
+                embedding_dim,
+                metadata,
+                index_dirty,
+                faiss_index_uuid,
+                deleting,
+                updated_at
+            )
+            VALUES(?,?,?,?,?,?,?,?,?,?, datetime('now'))
             ON CONFLICT(project_id) DO UPDATE SET
               project_name = excluded.project_name,
               project_type = excluded.project_type,
               directory = excluded.directory,
+              directory_realpath = excluded.directory_realpath,
               embedding_dim = excluded.embedding_dim,
               metadata = excluded.metadata,
+              index_dirty = excluded.index_dirty,
+              faiss_index_uuid = excluded.faiss_index_uuid,
+              deleting = excluded.deleting,
               updated_at = datetime('now')
             """,
-            (project_id, project_name, project_type, directory, embedding_dim, json.dumps(metadata)),
+            (
+                project_id,
+                project_name,
+                project_type,
+                directory,
+                directory_realpath,
+                embedding_dim,
+                json.dumps(metadata),
+                int(index_dirty),
+                faiss_index_uuid,
+                int(deleting),
+            ),
         )
         await db.commit()
 
@@ -456,12 +521,55 @@ async def delete_project(db_path: str, project_id: str) -> None:
         await db.commit()
 
 
+async def replace_project_artifacts(
+    db_path: str,
+    *,
+    project_id: str,
+    artifacts: Sequence[Tuple[str, str]],
+) -> None:
+    async with get_connection(db_path) as db:
+        await db.execute("DELETE FROM project_artifacts WHERE project_id = ?", (project_id,))
+        if artifacts:
+            await db.executemany(
+                """
+                INSERT OR REPLACE INTO project_artifacts(project_id, artifact_path, kind)
+                VALUES(?,?,?)
+                """,
+                [(project_id, path, kind) for path, kind in artifacts],
+            )
+        await db.commit()
+
+
+async def list_project_artifacts(db_path: str, project_id: str) -> List[Dict[str, str]]:
+    async with get_connection(db_path) as db:
+        db.row_factory = aiosqlite.Row
+        rows = await db.execute_fetchall(
+            """
+            SELECT artifact_path, kind
+            FROM project_artifacts
+            WHERE project_id = ?
+            ORDER BY created_at DESC
+            """,
+            (project_id,),
+        )
+        return [dict(r) for r in rows]
+
+
+async def list_all_project_artifacts(db_path: str) -> List[str]:
+    async with get_connection(db_path) as db:
+        rows = await db.execute_fetchall(
+            "SELECT artifact_path FROM project_artifacts ORDER BY created_at DESC"
+        )
+        return [str(r[0]) for r in rows]
+
+
 async def list_projects(db_path: str) -> List[Dict[str, Any]]:
     async with get_connection(db_path) as db:
         db.row_factory = aiosqlite.Row
         rows = await db.execute_fetchall(
             """
-            SELECT project_id, project_name, project_type, directory, chunk_count, file_count, total_tokens, updated_at
+            SELECT project_id, project_name, project_type, directory, directory_realpath,
+                   chunk_count, file_count, total_tokens, updated_at, deleting
             FROM projects
             ORDER BY updated_at DESC
             """
@@ -474,7 +582,8 @@ async def get_project(db_path: str, project_id: str) -> Optional[Dict[str, Any]]
         db.row_factory = aiosqlite.Row
         row = await db.execute_fetchone(
             """
-            SELECT project_id, project_name, project_type, directory, embedding_dim, metadata, chunk_count, file_count, total_tokens, updated_at
+            SELECT project_id, project_name, project_type, directory, directory_realpath, embedding_dim, metadata,
+                   index_dirty, faiss_index_uuid, deleting, chunk_count, file_count, total_tokens, updated_at
             FROM projects
             WHERE project_id = ?
             """,
@@ -483,7 +592,8 @@ async def get_project(db_path: str, project_id: str) -> Optional[Dict[str, Any]]
         if not row:
             return None
         d = dict(row)
-        d["metadata"] = json.loads(d.get("metadata") or "{}")
+        d["metadata"] = _safe_load_metadata(d.get("metadata"), context=f"project:{project_id}")
+        d["index_dirty"] = int(d.get("index_dirty") or 0)
         return d
 
 
@@ -496,7 +606,8 @@ async def get_project_by_name(
         db.row_factory = aiosqlite.Row
         row = await db.execute_fetchone(
             """
-            SELECT project_id, project_name, project_type, directory, embedding_dim, metadata, chunk_count, file_count, total_tokens, updated_at
+            SELECT project_id, project_name, project_type, directory, directory_realpath, embedding_dim, metadata,
+                   index_dirty, faiss_index_uuid, deleting, chunk_count, file_count, total_tokens, updated_at
             FROM projects
             WHERE project_name = ?
             """,
@@ -505,8 +616,61 @@ async def get_project_by_name(
         if not row:
             return None
         d = dict(row)
-        d["metadata"] = json.loads(d.get("metadata") or "{}")
+        d["metadata"] = _safe_load_metadata(d.get("metadata"), context=f"project_name:{project_name}")
+        d["index_dirty"] = int(d.get("index_dirty") or 0)
         return d
+
+
+async def get_project_by_directory_realpath(
+    db_path: str,
+    *,
+    directory_realpath: str,
+) -> Optional[Dict[str, Any]]:
+    async with get_connection(db_path) as db:
+        db.row_factory = aiosqlite.Row
+        row = await db.execute_fetchone(
+            """
+            SELECT project_id, project_name, project_type, directory, directory_realpath, embedding_dim, metadata,
+                   index_dirty, faiss_index_uuid, deleting, chunk_count, file_count, total_tokens, updated_at
+            FROM projects
+            WHERE directory_realpath = ?
+            """,
+            (directory_realpath,),
+        )
+        if not row:
+            return None
+        d = dict(row)
+        d["metadata"] = _safe_load_metadata(
+            d.get("metadata"), context=f"project_directory:{directory_realpath}"
+        )
+        d["index_dirty"] = int(d.get("index_dirty") or 0)
+        return d
+
+
+async def set_project_index_uuid(db_path: str, project_id: str, index_uuid: str) -> None:
+    async with get_connection(db_path) as db:
+        await db.execute(
+            """
+            UPDATE projects
+            SET faiss_index_uuid = ?, updated_at = datetime('now')
+            WHERE project_id = ?
+            """,
+            (index_uuid, project_id),
+        )
+        await db.commit()
+
+
+async def set_project_deleting(db_path: str, project_id: str, deleting: bool) -> None:
+    async with get_connection(db_path) as db:
+        await db.execute(
+            """
+            UPDATE projects
+            SET deleting = ?, updated_at = datetime('now')
+            WHERE project_id = ?
+            """,
+            (1 if deleting else 0, project_id),
+        )
+        await db.commit()
 
 
 async def reserve_internal_ids(db_path: str, project_id: str, count: int) -> List[int]:
@@ -677,6 +841,10 @@ def build_fts_query(query: str, *, mode: str = "strict") -> str:
     if not query or not query.strip():
         return '""'
     cleaned = re.sub(r'[*^+(){}<>]', ' ', query)
+    mode_lower = str(mode).lower()
+    if mode_lower == "phrase":
+        cleaned_phrase = re.sub(r'\s+', ' ', cleaned).strip()
+        return f'"{cleaned_phrase[:256]}"' if cleaned_phrase else '""'
     parts = re.findall(r'"([^"]+)"|(\S+)', cleaned)
     tokens: List[str] = []
     for quoted, plain in parts:
@@ -691,7 +859,7 @@ def build_fts_query(query: str, *, mode: str = "strict") -> str:
     if not tokens:
         return '""'
     tokens = [t[:64] for t in tokens[:50]]
-    joiner = " OR " if str(mode).lower() == "any" else " AND "
+    joiner = " OR " if mode_lower == "any" else " AND "
     return joiner.join(f'"{t}"' for t in tokens)
 
 
@@ -726,7 +894,7 @@ async def fts_search(
 
     out: List[Dict[str, Any]] = []
     for r in rows:
-        meta = json.loads(r[4] or "{}")
+        meta = _safe_load_metadata(r[4], context=f"chunk:{r[0]}")
         out.append(
             {
                 "id": r[0],
@@ -1026,6 +1194,32 @@ async def list_jobs(db_path: str) -> List[Dict[str, Any]]:
     return [dict(row) for row in rows]
 
 
+async def prune_jobs(db_path: str, *, max_age_days: int, max_rows: int) -> None:
+    max_age_days = max(1, int(max_age_days))
+    max_rows = max(1, int(max_rows))
+    async with get_connection(db_path) as db:
+        await db.execute(
+            """
+            DELETE FROM jobs
+            WHERE created_at < datetime('now', ?)
+            """,
+            (f"-{max_age_days} days",),
+        )
+        await db.execute(
+            """
+            DELETE FROM jobs
+            WHERE job_id NOT IN (
+                SELECT job_id
+                FROM jobs
+                ORDER BY created_at DESC
+                LIMIT ?
+            )
+            """,
+            (max_rows,),
+        )
+        await db.commit()
+
+
 async def set_file_count(db_path: str, project_id: str, file_count: int) -> None:
     async with get_connection(db_path) as db:
         await db.execute(
@@ -1082,6 +1276,34 @@ async def fetch_chunk_batch(
     return out
 
 
+async def fetch_chunk_by_id(db_path: str, *, project_id: str, chunk_id: str) -> Optional[Dict[str, Any]]:
+    async with get_connection(db_path) as db:
+        row = await db.execute_fetchone(
+            """
+            SELECT chunk_id, internal_id, content, token_count, metadata, access_count
+            FROM chunks
+            WHERE project_id = ? AND chunk_id = ?
+            """,
+            (project_id, chunk_id),
+        )
+    if not row:
+        return None
+    meta = {}
+    try:
+        meta = json.loads(row[4] or "{}")
+    except json.JSONDecodeError:
+        logging.warning("Failed to decode chunk metadata for %s", row[0], exc_info=True)
+        meta = {}
+    return {
+        "id": row[0],
+        "internal_id": int(row[1]),
+        "content": row[2],
+        "token_count": int(row[3]),
+        "metadata": meta,
+        "access_count": int(row[5] or 0),
+    }
+
+
 async def mark_project_dirty(db_path: str, project_id: str) -> None:
     """Set index_dirty flag before writing chunks to the DB.
 
@@ -1091,8 +1313,7 @@ async def mark_project_dirty(db_path: str, project_id: str) -> None:
     """
     async with get_connection(db_path) as db:
         await db.execute(
-            "UPDATE projects SET metadata = json_set(metadata, '$.index_dirty', 1), "
-            "updated_at = datetime('now') WHERE project_id = ?",
+            "UPDATE projects SET index_dirty = 1, updated_at = datetime('now') WHERE project_id = ?",
             (project_id,),
         )
         await db.commit()
@@ -1102,8 +1323,7 @@ async def clear_project_dirty(db_path: str, project_id: str) -> None:
     """Clear index_dirty after a successful FAISS disk write."""
     async with get_connection(db_path) as db:
         await db.execute(
-            "UPDATE projects SET metadata = json_set(metadata, '$.index_dirty', 0), "
-            "updated_at = datetime('now') WHERE project_id = ?",
+            "UPDATE projects SET index_dirty = 0, updated_at = datetime('now') WHERE project_id = ?",
             (project_id,),
         )
         await db.commit()

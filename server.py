@@ -6,7 +6,7 @@ import logging
 import os
 import signal
 import time
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from fastmcp import FastMCP
 
@@ -46,16 +46,33 @@ search_engine = SearchEngine(
     index_path_context=index_path_context,
 )
 
-ensure_index_permissions(index_path_context, cfg.index_dir)
+ensure_index_permissions(index_path_context, cfg.index_dir, db_path=cfg.db_path)
 
 
 # ---------------------------------------------------------------------------
-# Fix #6: graceful shutdown – ensure embedding pools (thread + process)
-# are torn down on exit so that no orphan workers survive.
+# Fix #6: coordinated shutdown – ensure embedding pools (thread + process)
+# and the DB pool are torn down, and active jobs are cancelled.
 # ---------------------------------------------------------------------------
-async def _cleanup_async() -> None:
-    await embedding_service.close(graceful=True)
-    await dbmod.close_db_pool()
+_shutdown_lock = asyncio.Lock()
+_shutdown_started = False
+
+
+async def _shutdown(reason: str, *, loop: Optional[asyncio.AbstractEventLoop] = None) -> None:
+    global _shutdown_started
+    async with _shutdown_lock:
+        if _shutdown_started:
+            return
+        _shutdown_started = True
+    logging.info("Shutdown initiated (%s)", reason)
+    try:
+        await asyncio.wait_for(jobs.shutdown(timeout_s=5.0), timeout=6.0)
+        await asyncio.wait_for(embedding_service.close(graceful=True), timeout=10.0)
+        await asyncio.wait_for(dbmod.close_db_pool(), timeout=5.0)
+    except Exception:
+        logging.warning("Shutdown cleanup failed", exc_info=True)
+    finally:
+        if loop and loop.is_running():
+            loop.stop()
 
 
 def _sync_cleanup() -> None:
@@ -66,27 +83,44 @@ def _sync_cleanup() -> None:
         except RuntimeError:
             loop = None
         if loop and loop.is_running():
-            loop.create_task(_cleanup_async())
+            loop.call_soon_threadsafe(lambda: asyncio.create_task(_shutdown("atexit", loop=loop)))
         else:
-            asyncio.run(_cleanup_async())
+            asyncio.run(_shutdown("atexit"))
     except Exception:
         logging.warning("Shutdown cleanup failed", exc_info=True)
 
 
+def _register_signal_handlers() -> bool:
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        return False
+    if not hasattr(loop, "add_signal_handler"):
+        return False
+    try:
+        loop.add_signal_handler(
+            signal.SIGTERM,
+            lambda: asyncio.create_task(_shutdown("SIGTERM", loop=loop)),
+        )
+        return True
+    except (NotImplementedError, RuntimeError):
+        return False
+
+
+_uses_asyncio_signals = _register_signal_handlers()
 atexit.register(_sync_cleanup)
 
-_original_sigterm = signal.getsignal(signal.SIGTERM)
+if not _uses_asyncio_signals:
+    _original_sigterm = signal.getsignal(signal.SIGTERM)
 
+    def _sigterm_handler(sig: int, frame: Any) -> None:
+        _sync_cleanup()
+        if callable(_original_sigterm):
+            _original_sigterm(sig, frame)  # type: ignore[arg-type]
+        else:
+            raise SystemExit(0)
 
-def _sigterm_handler(sig: int, frame: Any) -> None:
-    _sync_cleanup()
-    if callable(_original_sigterm):
-        _original_sigterm(sig, frame)  # type: ignore[arg-type]
-    else:
-        raise SystemExit(0)
-
-
-signal.signal(signal.SIGTERM, _sigterm_handler)
+    signal.signal(signal.SIGTERM, _sigterm_handler)
 
 
 def _device() -> str:
@@ -104,6 +138,7 @@ async def index_project(
     project_name: str,
     project_type: str,
     wait: bool = True,
+    dedupe_by_directory: bool = True,
 ) -> str:
     """Index a directory (within allowed_roots) for hybrid search."""
     try:
@@ -118,7 +153,12 @@ async def index_project(
 
     async def _run() -> str:
         start = time.time()
-        pid = await indexer.index_project(directory=directory, project_name=project_name, project_type=project_type)
+        pid = await indexer.index_project(
+            directory=directory,
+            project_name=project_name,
+            project_type=project_type,
+            dedupe_by_directory=bool(dedupe_by_directory),
+        )
         logging.info(
             "index_project",
             extra={
@@ -197,8 +237,13 @@ async def search_memory(
     max_results: int = 10,
     use_mmr: bool = True,
     fts_mode: str = "strict",
+    include_content: bool = True,
+    max_content_chars_per_result: int = 1200,
 ) -> Dict[str, Any]:
-    """Hybrid search: SQLite FTS5 (lexical) + FAISS (vector) with RRF, optional MMR."""
+    """Hybrid search: SQLite FTS5 (lexical) + FAISS (vector) with RRF, optional MMR.
+
+    fts_mode: "strict" (AND), "any" (OR), or "phrase".
+    """
     await dbmod.init_db(cfg.db_path)
     proj = await dbmod.get_project(cfg.db_path, project_id)
     if not proj:
@@ -219,17 +264,20 @@ async def search_memory(
     async with rwlock.read_lock():
         qv = await embedding_service.embed_one(query, model_name=model_name, device=device)
 
-        results = await search_engine.search(
-            project_id=project_id,
-            query=query,
-            query_vec=qv,
-            fts_top_k=cfg.fts_top_k,
-            vector_top_k=cfg.vector_top_k,
-            return_k=max(1, min(50, int(max_results))),
-            enable_mmr=bool(use_mmr and cfg.enable_mmr),
-            mmr_lambda=float(cfg.mmr_lambda),
-            fts_mode=fts_mode,
-        )
+        try:
+            results = await search_engine.search(
+                project_id=project_id,
+                query=query,
+                query_vec=qv,
+                fts_top_k=cfg.fts_top_k,
+                vector_top_k=cfg.vector_top_k,
+                return_k=max(1, min(50, int(max_results))),
+                enable_mmr=bool(use_mmr and cfg.enable_mmr),
+                mmr_lambda=float(cfg.mmr_lambda),
+                fts_mode=fts_mode,
+            )
+        except ValueError as exc:
+            return {"error": str(exc)}
     logging.info(
         "search_memory",
         extra={
@@ -241,6 +289,14 @@ async def search_memory(
     )
 
     # Compact response (clients can format)
+    def _trim_content(text: str) -> str:
+        if not include_content:
+            return ""
+        max_len = max(0, int(max_content_chars_per_result))
+        if max_len and len(text) > max_len:
+            return text[:max_len] + "…"
+        return text
+
     return {
         "query": query,
         "project_id": project_id,
@@ -251,11 +307,97 @@ async def search_memory(
                 "score": r.get("relevance_score"),
                 "token_count": r.get("token_count"),
                 "metadata": r.get("metadata"),
-                "content": r.get("content"),
+                **({"content": _trim_content(r.get("content") or "")} if include_content else {}),
             }
             for r in results
         ],
     }
+
+
+@mcp.tool
+async def get_chunk(project_id: str, chunk_id: str, include_content: bool = True) -> Dict[str, Any]:
+    """Fetch a single chunk by ID (full content by default)."""
+    await dbmod.init_db(cfg.db_path)
+    chunk = await dbmod.fetch_chunk_by_id(cfg.db_path, project_id=project_id, chunk_id=chunk_id)
+    if not chunk:
+        return {"error": f"Chunk not found: {chunk_id}"}
+    if not include_content:
+        chunk = {k: v for k, v in chunk.items() if k != "content"}
+    return chunk
+
+
+@mcp.tool
+async def project_health(project_id: str) -> Dict[str, Any]:
+    """Report index/DB health for a project."""
+    await dbmod.init_db(cfg.db_path)
+    proj = await dbmod.get_project(cfg.db_path, project_id)
+    if not proj:
+        return {"error": f"Project not found: {project_id}"}
+    rwlock = await get_project_rwlock(project_id)
+    async with rwlock.read_lock():
+        metadata = proj.get("metadata") or {}
+        shard_count = int(metadata.get("shard_count") or 1)
+        index_uuid = proj.get("faiss_index_uuid")
+        index_paths = []
+        if shard_count <= 1:
+            index_paths.append(os.path.join(cfg.index_dir, f"{project_id}.index.current"))
+        else:
+            index_paths.extend(
+                os.path.join(cfg.index_dir, f"{project_id}.shard{shard_id}.index.current")
+                for shard_id in range(shard_count)
+            )
+
+        faiss_totals = []
+        uuid_mismatches = []
+        missing_files = []
+        for path in index_paths:
+            if not index_path_context.exists(path):
+                missing_files.append(path)
+                continue
+            uuid_path = path + ".uuid"
+            if index_path_context.exists(uuid_path) and index_uuid:
+                try:
+                    with index_path_context.open_file(uuid_path, "r", encoding="utf-8") as uf:
+                        on_disk_uuid = uf.read().strip()
+                    if on_disk_uuid and on_disk_uuid != index_uuid:
+                        uuid_mismatches.append({"path": path, "on_disk": on_disk_uuid, "expected": index_uuid})
+                except Exception as exc:
+                    uuid_mismatches.append({"path": path, "error": str(exc)})
+            try:
+                import faiss
+
+                index = faiss.read_index(path, faiss.IO_FLAG_MMAP)
+                faiss_totals.append(int(getattr(index, "ntotal", 0)))
+            except Exception as exc:
+                missing_files.append(f"{path} ({exc})")
+                continue
+
+    return {
+        "project_id": project_id,
+        "index_dirty": bool(proj.get("index_dirty")),
+        "faiss_index_uuid": index_uuid,
+        "chunk_count_db": int(proj.get("chunk_count") or 0),
+        "faiss_ntotal": int(sum(faiss_totals)) if faiss_totals else 0,
+        "missing_or_unreadable_indexes": missing_files,
+        "uuid_mismatches": uuid_mismatches,
+        "updated_at": proj.get("updated_at"),
+    }
+
+
+@mcp.tool
+async def repair_project(project_id: str) -> str:
+    """Rebuild the FAISS index from DB state for a project."""
+    await dbmod.init_db(cfg.db_path)
+    proj = await dbmod.get_project(cfg.db_path, project_id)
+    if not proj:
+        return f"❌ Project not found: {project_id}"
+    metadata = proj.get("metadata") or {}
+    lock = await get_project_lock(project_id)
+    rwlock = await get_project_rwlock(project_id)
+    async with lock:
+        async with rwlock.write_lock():
+            await indexer._rebuild_index_from_db(project_id=project_id, metadata=metadata)
+    return f"✅ Rebuilt FAISS index for {project_id}"
 
 
 @mcp.tool
@@ -280,31 +422,28 @@ async def delete_project(project_id: str) -> str:
         return f"❌ Project not found: {project_id}"
 
     try:
-        safe_id = ProjectID(project_id)
+        ProjectID(project_id)
     except ValueError as e:
         return f"❌ {e}"
     lock = await get_project_lock(project_id)
     rwlock = await get_project_rwlock(project_id)
     async with lock:
         async with rwlock.write_lock():
-            await dbmod.delete_project(cfg.db_path, project_id)
-            index_paths = [
-                os.path.join(cfg.index_dir, str(safe_id) + ".index.current"),
-                os.path.join(cfg.index_dir, str(safe_id) + ".index.new"),
-            ]
-            shard_prefix = str(safe_id) + ".shard"
-            entries = index_path_context.list_dir(cfg.index_dir)
-            for entry in entries:
-                if entry.startswith(shard_prefix) and entry.endswith(".index.current"):
-                    index_paths.append(os.path.join(cfg.index_dir, entry))
-                if entry.startswith(shard_prefix) and entry.endswith(".index.new"):
-                    index_paths.append(os.path.join(cfg.index_dir, entry))
-                # Fix #12: clean up UUID companion files
-                if entry.startswith(str(safe_id)) and entry.endswith(".uuid"):
-                    index_paths.append(os.path.join(cfg.index_dir, entry))
-            for path in index_paths:
+            await dbmod.set_project_deleting(cfg.db_path, project_id, True)
+            artifacts = await dbmod.list_project_artifacts(cfg.db_path, project_id)
+            failures = []
+            for artifact in artifacts:
+                path = artifact.get("artifact_path")
+                if not path:
+                    continue
                 if index_path_context.exists(path):
-                    index_path_context.unlink(path)
+                    try:
+                        index_path_context.unlink(path)
+                    except Exception as exc:
+                        failures.append(f"{path} ({exc})")
+            if failures:
+                return "❌ Failed to delete index artifacts: " + ", ".join(failures)
+            await dbmod.delete_project(cfg.db_path, project_id)
     await remove_project_lock(project_id)
     await remove_project_rwlock(project_id)
     return f"✅ Deleted {project_id}"
