@@ -677,36 +677,48 @@ async def reserve_internal_ids(db_path: str, project_id: str, count: int) -> Lis
     """Reserve 'count' new internal IDs for a project.
 
     We store internal IDs explicitly so we can do stable add_with_ids() into FAISS.
+
+    The manual BEGIN IMMEDIATE / COMMIT pair is wrapped in try/except so that
+    any failure (timeout, constraint violation, etc.) triggers an explicit
+    rollback *before* the connection is returned to the pool.  Without this
+    guard a failed mid-transaction error would leave the connection in an
+    open-transaction state; because connections are pooled and reused the
+    zombie transaction causes spurious SQLITE_BUSY errors on unrelated
+    requests later.
     """
     if count <= 0:
         return []
 
     async with get_connection(db_path) as db:
         await db.execute("BEGIN IMMEDIATE")
-        row = await db.execute_fetchone(
-            "SELECT next_internal_id FROM internal_id_sequence WHERE project_id = ?",
-            (project_id,),
-        )
-        if row and row[0] is not None:
-            start = int(row[0])
-        else:
+        try:
             row = await db.execute_fetchone(
-                "SELECT COALESCE(MAX(internal_id), 0) FROM chunks WHERE project_id = ?",
+                "SELECT next_internal_id FROM internal_id_sequence WHERE project_id = ?",
                 (project_id,),
             )
-            start = int(row[0]) + 1
-        next_id = start + count
-        await db.execute(
-            """
-            INSERT INTO internal_id_sequence(project_id, next_internal_id)
-            VALUES(?,?)
-            ON CONFLICT(project_id) DO UPDATE SET
-              next_internal_id = excluded.next_internal_id
-            """,
-            (project_id, next_id),
-        )
-        await db.commit()
-        return list(range(start, next_id))
+            if row and row[0] is not None:
+                start = int(row[0])
+            else:
+                row = await db.execute_fetchone(
+                    "SELECT COALESCE(MAX(internal_id), 0) FROM chunks WHERE project_id = ?",
+                    (project_id,),
+                )
+                start = int(row[0]) + 1
+            next_id = start + count
+            await db.execute(
+                """
+                INSERT INTO internal_id_sequence(project_id, next_internal_id)
+                VALUES(?,?)
+                ON CONFLICT(project_id) DO UPDATE SET
+                  next_internal_id = excluded.next_internal_id
+                """,
+                (project_id, next_id),
+            )
+            await db.commit()
+            return list(range(start, next_id))
+        except BaseException:
+            await db.rollback()
+            raise
 
 
 async def upsert_chunks(
