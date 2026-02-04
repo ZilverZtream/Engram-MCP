@@ -7,9 +7,8 @@ sentence-transformers
 pypdf
 python-docx
 tokenizers
-numba
 httpx
-# Choose ONE:
-# faiss-cpu
-# faiss-gpu
+# Optional extras (recommended):
+# pip install "engram-mcp[cpu]"  # faiss-cpu + numba
+# pip install "engram-mcp[gpu]"  # faiss-gpu + numba
 # Torch is required by sentence-transformers; install the correct build for your platform.

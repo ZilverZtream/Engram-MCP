@@ -73,6 +73,25 @@ class PathContext:
             f"Path '{ap}' is outside allowed_roots. Allowed roots: {self._allowed_roots}"
         )
 
+    def ensure_allowed_nofollow(self, path: str | Path) -> str:
+        if not self._allowed_roots:
+            raise PathNotAllowed(
+                "No allowed_roots configured. Set allowed_roots in engram_mcp.yaml to enable indexing/searching."
+            )
+        ap = os.path.abspath(str(path))
+        norm_ap = self._normalize_case(ap)
+        for root in self._allowed_roots:
+            norm_root = self._normalize_case(root)
+            try:
+                common = os.path.commonpath([norm_ap, norm_root])
+            except ValueError:
+                continue
+            if common == norm_root:
+                return ap
+        raise PathNotAllowed(
+            f"Path '{ap}' is outside allowed_roots. Allowed roots: {self._allowed_roots}"
+        )
+
     def resolve_path(self, path: str | Path) -> Path:
         ap = self.ensure_allowed(str(path))
         return Path(ap)
@@ -115,6 +134,10 @@ class PathContext:
     def stat(self, path: str | Path) -> os.stat_result:
         resolved = self.resolve_path(path)
         return resolved.stat()
+
+    def lstat(self, path: str | Path) -> os.stat_result:
+        resolved = self.ensure_allowed_nofollow(path)
+        return os.lstat(resolved)
 
     def exists(self, path: str | Path) -> bool:
         try:

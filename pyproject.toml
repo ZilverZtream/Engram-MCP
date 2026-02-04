@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "engram-mcp"
+version = "3.0.0"
+description = "A local, sovereign, hybrid memory system for MCP-compatible agents."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+  { name = "Engram MCP Contributors" }
+]
+dependencies = [
+  "fastmcp",
+  "aiosqlite",
+  "PyYAML",
+  "pydantic",
+  "numpy",
+  "sentence-transformers",
+  "pypdf",
+  "python-docx",
+  "tokenizers",
+  "httpx",
+]
+
+[project.optional-dependencies]
+cpu = [
+  "faiss-cpu>=1.7.4",
+  "numba>=0.59.1",
+]
+gpu = [
+  "faiss-gpu>=1.7.4",
+  "numba>=0.59.1",
+]
+
+[project.scripts]
+engram-mcp = "server:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["engram_mcp*"]
