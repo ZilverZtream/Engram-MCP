@@ -1,15 +1,2 @@
-# This file is a pinned lockfile. Update via `pip-compile requirements.in`.
-fastmcp==3.0.0
-aiosqlite==0.20.0
-PyYAML==6.0.1
-pydantic==2.7.1
-numpy==1.26.4
-sentence-transformers==2.7.0
-pypdf==4.2.0
-python-docx==1.1.2
-tokenizers==0.15.2
-httpx==0.27.0
-# Optional extras (recommended):
-# pip install "engram-mcp[cpu]"  # faiss-cpu + numba
-# pip install "engram-mcp[gpu]"  # faiss-gpu + numba
-# Torch is required by sentence-transformers; install the correct build for your platform.
+# This file is intentionally minimal; pyproject.toml is the source of truth.
+-e .

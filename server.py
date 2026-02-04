@@ -429,7 +429,13 @@ async def get_chunk(project_id: str, chunk_id: str, include_content: bool = True
     chunk = await dbmod.fetch_chunk_by_id(cfg.db_path, project_id=project_id, chunk_id=chunk_id)
     if not chunk:
         return {"error": f"Chunk not found: {chunk_id}"}
-    if not include_content:
+    if include_content:
+        max_chars = 100_000
+        content = chunk.get("content")
+        if content and len(content) > max_chars:
+            chunk = dict(chunk)
+            chunk["content"] = content[:max_chars] + "…"
+    else:
         chunk = {k: v for k, v in chunk.items() if k != "content"}
     return chunk
 
@@ -560,6 +566,7 @@ async def delete_project(project_id: str) -> str:
     async with lock:
         async with rwlock.write_lock():
             await dbmod.set_project_deleting(cfg.db_path, project_id, True)
+            await search_engine.unload_project(project_id)
             artifacts = await dbmod.list_project_artifacts(cfg.db_path, project_id)
             failures = []
             for artifact in artifacts:
