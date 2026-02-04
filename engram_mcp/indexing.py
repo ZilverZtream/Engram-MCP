@@ -110,6 +110,14 @@ class Indexer:
     project_path_context: PathContext
     index_path_context: PathContext
 
+    async def _sync_project_artifacts(self, *, project_id: ProjectID, shard_count: int) -> None:
+        artifacts = _index_artifacts(self.cfg.index_dir, project_id, shard_count)
+        await dbmod.replace_project_artifacts(
+            self.cfg.db_path,
+            project_id=str(project_id),
+            artifacts=artifacts,
+        )
+
     async def _embed_chunks_cached(
         self,
         chunks: List[Any],
@@ -267,16 +275,35 @@ class Indexer:
                 await dbmod.delete_file_metadata(self.cfg.db_path, project_id, file_paths)
             raise
 
-    async def index_project(self, *, directory: str, project_name: str, project_type: str) -> str:
+    async def index_project(
+        self,
+        *,
+        directory: str,
+        project_name: str,
+        project_type: str,
+        dedupe_by_directory: bool = True,
+    ) -> str:
         await dbmod.init_db(self.cfg.db_path)
         directory = str(self.project_path_context.resolve_path(directory))
         project_name = validate_project_field(project_name, field_name="project_name")
         project_type = validate_project_field(project_type, field_name="project_type")
         directory_realpath = os.path.realpath(directory)
+        if dedupe_by_directory:
+            existing_by_dir = await dbmod.get_project_by_directory_realpath(
+                self.cfg.db_path,
+                directory_realpath=directory_realpath,
+            )
+            if existing_by_dir:
+                if existing_by_dir.get("project_name") != project_name:
+                    raise ValueError(
+                        f"Directory already indexed as project '{existing_by_dir.get('project_name')}'. "
+                        "Use that project_id or disable dedupe_by_directory."
+                    )
+                await self.update_project(project_id=str(existing_by_dir["project_id"]))
+                return str(existing_by_dir["project_id"])
         existing = await dbmod.get_project_by_name(self.cfg.db_path, project_name=project_name)
         if existing:
-            metadata = existing.get("metadata") or {}
-            stored_realpath = metadata.get("directory_realpath") or os.path.realpath(
+            stored_realpath = existing.get("directory_realpath") or os.path.realpath(
                 existing.get("directory") or ""
             )
             if stored_realpath and stored_realpath != directory_realpath:
@@ -411,6 +438,7 @@ class Indexer:
                             project_name=project_name,
                             project_type=project_type,
                             directory=directory,
+                            directory_realpath=directory_realpath,
                             embedding_dim=embedding_dim,
                             metadata={
                                 "chunk_size_tokens": self.cfg.chunk_size_tokens,
@@ -419,9 +447,8 @@ class Indexer:
                                 "device": device,
                                 "shard_count": 1,
                                 "shard_size": int(self.cfg.shard_size),
-                                "directory_realpath": directory_realpath,
-                                "faiss_index_uuid": index_uuid,
                             },
+                            faiss_index_uuid=index_uuid,
                         )
                         project_initialized = True
 
@@ -506,6 +533,7 @@ class Indexer:
                     project_name=project_name,
                     project_type=project_type,
                     directory=directory,
+                    directory_realpath=directory_realpath,
                     embedding_dim=embedding_dim,
                     metadata={
                         "chunk_size_tokens": self.cfg.chunk_size_tokens,
@@ -514,9 +542,8 @@ class Indexer:
                         "device": device,
                         "shard_count": 1,
                         "shard_size": int(self.cfg.shard_size),
-                        "directory_realpath": directory_realpath,
-                        "faiss_index_uuid": index_uuid,
                     },
+                    faiss_index_uuid=index_uuid,
                 )
 
             if index is None:
@@ -566,14 +593,17 @@ class Indexer:
                     )
 
             await self._maybe_shard_project(project_id=str(project_id))
+            proj = await dbmod.get_project(self.cfg.db_path, str(project_id))
+            shard_count = int((proj or {}).get("metadata", {}).get("shard_count") or 1)
+            await self._sync_project_artifacts(project_id=project_id, shard_count=shard_count)
             return str(project_id)
         except BaseException:
             if project_initialized:
-                await dbmod.delete_project(self.cfg.db_path, str(project_id))
                 if index_path and self.index_path_context.exists(index_path):
                     self.index_path_context.unlink(index_path)
                 if index_current and self.index_path_context.exists(index_current):
                     self.index_path_context.unlink(index_current)
+                await dbmod.delete_project(self.cfg.db_path, str(project_id))
             raise
 
     async def update_project(self, *, project_id: str) -> Dict[str, int]:
@@ -588,7 +618,7 @@ class Indexer:
             raise ValueError("Project has no stored directory; cannot update.")
         directory = str(self.project_path_context.resolve_path(directory))
         metadata = proj.get("metadata") or {}
-        stored_realpath = metadata.get("directory_realpath")
+        stored_realpath = proj.get("directory_realpath")
         current_realpath = os.path.realpath(directory)
         if stored_realpath and stored_realpath != current_realpath:
             raise ValueError(
@@ -614,7 +644,7 @@ class Indexer:
         # If a previous indexing run crashed after writing chunks to the
         # DB but before persisting the FAISS index, the dirty flag is set.
         # Rebuild the entire FAISS index from DB state before proceeding.
-        if metadata.get("index_dirty"):
+        if proj.get("index_dirty"):
             logging.warning(
                 "Project %s has index_dirty set (incomplete previous write). "
                 "Rebuilding FAISS index from database.",
@@ -678,15 +708,18 @@ class Indexer:
             if not to_delete_chunk_ids and not changed_files:
                 await dbmod.set_file_count(self.cfg.db_path, str(project), file_count)
                 if not stored_realpath:
-                    metadata["directory_realpath"] = current_realpath
                     await dbmod.upsert_project(
                         self.cfg.db_path,
                         project_id=str(project),
                         project_name=proj["project_name"],
                         project_type=project_type,
                         directory=directory,
+                        directory_realpath=current_realpath,
                         embedding_dim=int(proj.get("embedding_dim") or 0),
                         metadata=metadata,
+                        faiss_index_uuid=proj.get("faiss_index_uuid"),
+                        index_dirty=proj.get("index_dirty") or 0,
+                        deleting=proj.get("deleting") or 0,
                     )
                 return {"added": 0, "deleted": 0}
 
@@ -825,16 +858,18 @@ class Indexer:
                                 await asyncio.to_thread(
                                     _write_index_uuid, self.index_path_context, current_path, index_uuid
                                 )
-                        metadata["faiss_index_uuid"] = index_uuid
-                        metadata["directory_realpath"] = current_realpath
                         await dbmod.upsert_project(
                             self.cfg.db_path,
                             project_id=str(project),
                             project_name=proj["project_name"],
                             project_type=project_type,
                             directory=directory,
+                            directory_realpath=current_realpath,
                             embedding_dim=int(proj.get("embedding_dim") or 0),
                             metadata=metadata,
+                            faiss_index_uuid=index_uuid,
+                            index_dirty=proj.get("index_dirty") or 0,
+                            deleting=proj.get("deleting") or 0,
                         )
                 else:
                     index_current, index_new = _index_paths(self.cfg.index_dir, project)
@@ -889,16 +924,18 @@ class Indexer:
                         await asyncio.to_thread(
                             _write_index_uuid, self.index_path_context, index_current, index_uuid
                         )
-                        metadata["faiss_index_uuid"] = index_uuid
-                        metadata["directory_realpath"] = current_realpath
                         await dbmod.upsert_project(
                             self.cfg.db_path,
                             project_id=str(project),
                             project_name=proj["project_name"],
                             project_type=project_type,
                             directory=directory,
+                            directory_realpath=current_realpath,
                             embedding_dim=int(proj.get("embedding_dim") or 0),
                             metadata=metadata,
+                            faiss_index_uuid=index_uuid,
+                            index_dirty=proj.get("index_dirty") or 0,
+                            deleting=proj.get("deleting") or 0,
                         )
 
                 if to_delete_chunk_ids:
@@ -912,6 +949,9 @@ class Indexer:
                 await dbmod.refresh_project_stats(self.cfg.db_path, str(project))
                 await dbmod.set_file_count(self.cfg.db_path, str(project), file_count)
                 await self._maybe_shard_project(project_id=str(project))
+                proj = await dbmod.get_project(self.cfg.db_path, str(project))
+                shard_count = int((proj or {}).get("metadata", {}).get("shard_count") or 1)
+                await self._sync_project_artifacts(project_id=project, shard_count=shard_count)
                 return {"added": added_count, "deleted": len(to_delete_chunk_ids)}
             except BaseException:
                 if added_chunk_ids:
@@ -1187,17 +1227,21 @@ class Indexer:
                     _write_index_uuid, self.index_path_context, current_path, index_uuid
                 )
 
-        metadata["faiss_index_uuid"] = index_uuid
-        metadata["index_dirty"] = 0
         await dbmod.upsert_project(
             self.cfg.db_path,
             project_id=project_id,
             project_name=(proj or {}).get("project_name", ""),
             project_type=(proj or {}).get("project_type", ""),
             directory=(proj or {}).get("directory", ""),
+            directory_realpath=(proj or {}).get("directory_realpath"),
             embedding_dim=int((proj or {}).get("embedding_dim") or 0),
             metadata=metadata,
+            faiss_index_uuid=index_uuid,
+            index_dirty=0,
+            deleting=(proj or {}).get("deleting") or 0,
         )
+        shard_count = int(metadata.get("shard_count") or 1)
+        await self._sync_project_artifacts(project_id=ProjectID(project_id), shard_count=shard_count)
         logging.info("Rebuilt FAISS index for project %s; dirty flag cleared.", project_id)
 
     async def _maybe_shard_project(self, *, project_id: str) -> None:
@@ -1215,6 +1259,9 @@ class Indexer:
         device = metadata.get("device") or "cpu"
         rwlock = await get_project_rwlock(project_id)
         project = ProjectID(project_id)
+        index_uuid = proj.get("faiss_index_uuid") or uuid.uuid4().hex
+        if not proj.get("faiss_index_uuid"):
+            await dbmod.set_project_index_uuid(self.cfg.db_path, project_id, index_uuid)
         train_target = max(1000, int(self.cfg.faiss_nlist) * 20)
         shard_indexes: List[Optional[Any]] = [None] * shard_count
         shard_training: List[List[np.ndarray]] = [[] for _ in range(shard_count)]
@@ -1312,8 +1359,15 @@ class Indexer:
                     current_path, new_path = _index_paths(self.cfg.index_dir, project, shard_id)
                     await invalidate_faiss_cache(current_path)
                     await asyncio.to_thread(_save_faiss, index, self.index_path_context, new_path)
+                    await asyncio.to_thread(
+                        _write_index_uuid, self.index_path_context, new_path, index_uuid
+                    )
                     shard_replacements.append((new_path, current_path))
                 _swap_index_files(self.index_path_context, shard_replacements)
+                for _, current_path in shard_replacements:
+                    await asyncio.to_thread(
+                        _write_index_uuid, self.index_path_context, current_path, index_uuid
+                    )
             except Exception:
                 logging.error("Failed to swap shard indexes for project %s", project_id, exc_info=True)
                 for new_path, _ in shard_replacements:
@@ -1329,14 +1383,22 @@ class Indexer:
             project_name=proj["project_name"],
             project_type=proj["project_type"],
             directory=proj.get("directory"),
+            directory_realpath=proj.get("directory_realpath"),
             embedding_dim=int(proj.get("embedding_dim") or 0),
             metadata=metadata,
+            faiss_index_uuid=index_uuid,
+            index_dirty=proj.get("index_dirty") or 0,
+            deleting=proj.get("deleting") or 0,
         )
+        await self._sync_project_artifacts(project_id=project, shard_count=shard_count)
 
         single_index_path, _ = _index_paths(self.cfg.index_dir, project)
         if self.index_path_context.exists(single_index_path):
             await invalidate_faiss_cache(single_index_path)
             self.index_path_context.unlink(single_index_path)
+        single_uuid_path = single_index_path + ".uuid"
+        if self.index_path_context.exists(single_uuid_path):
+            self.index_path_context.unlink(single_uuid_path)
 
 
 def _cuda_available() -> bool:
@@ -1360,6 +1422,20 @@ def _index_paths(index_dir: str, project_id: ProjectID, shard_id: Optional[int] 
     else:
         base = os.path.join(index_dir, str(project_id) + ".shard" + str(shard_id) + ".index")
     return base + ".current", base + ".new"
+
+
+def _index_artifacts(index_dir: str, project_id: ProjectID, shard_count: int) -> List[Tuple[str, str]]:
+    artifacts: List[Tuple[str, str]] = []
+    if shard_count <= 1:
+        current_path, _ = _index_paths(index_dir, project_id)
+        artifacts.append((current_path, "faiss_index"))
+        artifacts.append((current_path + ".uuid", "faiss_uuid"))
+        return artifacts
+    for shard_id in range(shard_count):
+        current_path, _ = _index_paths(index_dir, project_id, shard_id)
+        artifacts.append((current_path, "faiss_index"))
+        artifacts.append((current_path + ".uuid", "faiss_uuid"))
+    return artifacts
 
 
 def _load_faiss(path: str) -> Any:
@@ -1459,7 +1535,7 @@ def _swap_index_files(path_context: PathContext, replacements: List[Tuple[str, s
         raise
 
 
-def ensure_index_permissions(path_context: PathContext, index_dir: str) -> None:
+def ensure_index_permissions(path_context: PathContext, index_dir: str, *, db_path: str) -> None:
     """Best-effort chmod of index artifacts to owner-only permissions."""
     try:
         path_context.makedirs(index_dir, exist_ok=True)
@@ -1467,19 +1543,18 @@ def ensure_index_permissions(path_context: PathContext, index_dir: str) -> None:
         logging.warning("Failed to create index directory %s", index_dir, exc_info=True)
         return
     try:
-        entries = path_context.list_dir(index_dir)
+        os.chmod(index_dir, 0o700)
+    except OSError:
+        logging.debug("Failed to chmod index directory %s", index_dir, exc_info=True)
+    try:
+        asyncio.run(dbmod.init_db(db_path))
+        artifacts = asyncio.run(dbmod.list_all_project_artifacts(db_path))
+    except RuntimeError:
+        artifacts = []
     except Exception:
-        logging.warning("Failed to list index directory %s", index_dir, exc_info=True)
-        return
-    for entry in entries:
-        if not (
-            entry.endswith(".index.current")
-            or entry.endswith(".index.new")
-            or entry.endswith(".uuid")
-            or entry.endswith(".index.tmp")
-        ):
-            continue
-        path = os.path.join(index_dir, entry)
+        logging.warning("Failed to load index artifacts from DB", exc_info=True)
+        artifacts = []
+    for path in artifacts:
         try:
             path_context.chmod(path, 0o600)
         except OSError:

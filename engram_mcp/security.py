@@ -85,9 +85,9 @@ class PathContext:
         encoding: Optional[str] = None,
         errors: Optional[str] = None,
     ):
+        if any(flag in mode for flag in ("w", "a", "+", "x")):
+            raise ValueError("PathContext.open_file only supports read modes. Use write_bytes_atomic/write_text_atomic.")
         resolved = self.resolve_path(path)
-        if "r" not in mode:
-            return open(resolved, mode, encoding=encoding, errors=errors)
 
         flags = os.O_RDONLY
         if hasattr(os, "O_NOFOLLOW"):
@@ -151,12 +151,16 @@ class PathContext:
         os.chmod(resolved, mode)
 
     def write_text_atomic(self, path: str | Path, text: str, *, encoding: str = "utf-8") -> None:
+        data = text.encode(encoding)
+        self.write_bytes_atomic(path, data)
+
+    def write_bytes_atomic(self, path: str | Path, data: bytes) -> None:
         resolved = self.resolve_path(path)
         dir_path = resolved.parent
         temp_path = self.create_temp_file(dir_path=dir_path, suffix=".tmp")
         try:
-            with open(temp_path, "w", encoding=encoding) as handle:
-                handle.write(text)
+            with open(temp_path, "wb") as handle:
+                handle.write(data)
             try:
                 os.chmod(temp_path, 0o600)
             except OSError:
