@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
-import re
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -14,16 +13,7 @@ from numba import jit
 
 from . import db as dbmod
 from .locks import get_project_rwlock
-
-
-def _sanitize_project_id(project_id: str) -> str:
-    """Sanitize project_id to prevent directory traversal attacks."""
-    # Use basename to strip any directory components
-    sanitized = os.path.basename(project_id)
-    # Additional validation: only allow alphanumeric, underscore, and hyphen
-    if not re.match(r"^[a-zA-Z0-9_-]+$", sanitized):
-        raise ValueError(f"Invalid project_id: {project_id}. Only alphanumeric characters, underscores, and hyphens are allowed.")
-    return sanitized
+from .security import PathContext, ProjectID
 
 
 @jit(nopython=True)
@@ -164,21 +154,21 @@ async def invalidate_faiss_cache(index_path: str) -> None:
 class SearchEngine:
     db_path: str
     index_dir: str
+    index_path_context: PathContext
 
     async def _load_faiss(self, project_id: str):
         import faiss
-
-        safe_id = _sanitize_project_id(project_id)
-        index_path = os.path.join(self.index_dir, f"{safe_id}.index")
+        project = ProjectID(project_id)
+        index_path = os.path.join(self.index_dir, str(project) + ".index.current")
         return await self._load_faiss_path(project_id, index_path)
 
     async def _load_faiss_path(self, project_id: str, index_path: str):
         import faiss
 
-        if not os.path.exists(index_path):
+        if not self.index_path_context.exists(index_path):
             raise FileNotFoundError(f"FAISS index not found: {index_path}")
 
-        index_mtime = os.path.getmtime(index_path)
+        index_mtime = self.index_path_context.stat(index_path).st_mtime
         async with _faiss_cache_lock:
             cached = _faiss_cache.get(index_path)
             if cached and cached[0] == index_mtime:
@@ -213,14 +203,17 @@ class SearchEngine:
         embeddings: Dict[int, np.ndarray] = {}
         rwlock = await get_project_rwlock(project_id)
         if shard_count > 1:
-            safe_id = _sanitize_project_id(project_id)
+            project = ProjectID(project_id)
             shard_map: Dict[int, List[int]] = {}
             for iid in internal_ids:
                 shard_map.setdefault(iid % shard_count, []).append(iid)
             async with rwlock.read_lock():
                 for shard_id, ids in shard_map.items():
-                    index_path = os.path.join(self.index_dir, f"{safe_id}.shard{shard_id}.index")
-                    if not os.path.exists(index_path):
+                    index_path = os.path.join(
+                        self.index_dir,
+                        str(project) + ".shard" + str(shard_id) + ".index.current",
+                    )
+                    if not self.index_path_context.exists(index_path):
                         continue
                     index = await self._load_faiss_path(project_id, index_path)
                     for iid in ids:
@@ -297,15 +290,18 @@ class SearchEngine:
         top_k: int,
         shard_count: int,
     ) -> List[Dict[str, Any]]:
-        safe_id = _sanitize_project_id(project_id)
+        project = ProjectID(project_id)
         shard_paths = [
-            os.path.join(self.index_dir, f"{safe_id}.shard{shard_id}.index")
+            os.path.join(
+                self.index_dir,
+                str(project) + ".shard" + str(shard_id) + ".index.current",
+            )
             for shard_id in range(shard_count)
         ]
         tasks = [
             self.vector_search(project_id=project_id, query_vec=query_vec, top_k=top_k, index_path=path)
             for path in shard_paths
-            if os.path.exists(path)
+            if self.index_path_context.exists(path)
         ]
         if not tasks:
             return await self.vector_search(project_id=project_id, query_vec=query_vec, top_k=top_k)

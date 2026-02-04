@@ -5,7 +5,7 @@ import json
 import logging
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import aiosqlite
 
@@ -99,6 +99,15 @@ CREATE TABLE IF NOT EXISTS internal_id_sequence (
     next_internal_id INTEGER NOT NULL,
     FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE
 );
+
+CREATE TABLE IF NOT EXISTS jobs (
+    job_id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    status TEXT NOT NULL,
+    created_at TEXT DEFAULT (datetime('now')),
+    updated_at TEXT DEFAULT (datetime('now')),
+    error TEXT
+);
 """
 
 
@@ -121,18 +130,38 @@ class FileMetadataRow:
     chunk_ids: List[str]
 
 
+@dataclass(frozen=True)
+class SQLQuery:
+    text: str
+    params: Tuple[Any, ...]
+
+
+def build_in_query(prefix_sql: str, values: Sequence[Any], suffix_sql: str = "") -> SQLQuery:
+    placeholders = ",".join(["?"] * len(values))
+    sql = prefix_sql + "(" + placeholders + ")" + suffix_sql
+    return SQLQuery(sql, tuple(values))
+
+
 class _ConnectionPool:
-    def __init__(self, db_path: str, maxsize: int = 10) -> None:
+    def __init__(self, db_path: str, maxsize: int = 10, timeout_s: float = 30.0) -> None:
         self.db_path = db_path
         self.maxsize = maxsize
-        self._queue: asyncio.LifoQueue[aiosqlite.Connection] = asyncio.LifoQueue(maxsize)
+        self.timeout_s = timeout_s
+        self._queue: asyncio.Queue[aiosqlite.Connection] = asyncio.Queue(maxsize)
         self._created = 0
         self._lock = asyncio.Lock()
         self._all: set[aiosqlite.Connection] = set()
+        self._semaphore = asyncio.Semaphore(maxsize)
 
     async def acquire(self) -> aiosqlite.Connection:
         try:
-            return self._queue.get_nowait()
+            await asyncio.wait_for(self._semaphore.acquire(), timeout=self.timeout_s)
+        except asyncio.TimeoutError as exc:
+            raise TimeoutError("Timed out waiting for database connection") from exc
+
+        try:
+            conn = self._queue.get_nowait()
+            return conn
         except asyncio.QueueEmpty:
             async with self._lock:
                 if self._created < self.maxsize:
@@ -142,16 +171,21 @@ class _ConnectionPool:
                     self._created += 1
                     self._all.add(conn)
                     return conn
-        return await self._queue.get()
+            conn = await self._queue.get()
+            return conn
 
     async def release(self, conn: aiosqlite.Connection) -> None:
         await self._queue.put(conn)
+        self._semaphore.release()
 
     async def close(self) -> None:
         conns = list(self._all)
         self._all.clear()
         while not self._queue.empty():
-            await self._queue.get()
+            try:
+                self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
         for conn in conns:
             await conn.close()
 
@@ -404,11 +438,11 @@ async def delete_chunks(db_path: str, project_id: str, chunk_ids: List[str]) -> 
         batch_size = 900
         for i in range(0, len(chunk_ids), batch_size):
             batch = chunk_ids[i:i + batch_size]
-            placeholders = ",".join(["?"] * len(batch))
-            await db.execute(
-                f"DELETE FROM chunks WHERE project_id = ? AND chunk_id IN ({placeholders})",
-                (project_id, *batch),
+            query = build_in_query(
+                "DELETE FROM chunks WHERE project_id = ? AND chunk_id IN ",
+                batch,
             )
+            await db.execute(query.text, (project_id, *query.params))
         await db.commit()
 
 
@@ -422,15 +456,15 @@ async def fetch_chunks_by_internal_ids(
     async with get_connection(db_path) as db:
         for i in range(0, len(internal_ids), batch_size):
             batch = internal_ids[i:i + batch_size]
-            placeholders = ",".join(["?"] * len(batch))
-            rows = await db.execute_fetchall(
-                f"""
+            query = build_in_query(
+                """
                 SELECT chunk_id, internal_id, content, token_count, metadata, access_count
                 FROM chunks
-                WHERE project_id = ? AND internal_id IN ({placeholders})
+                WHERE project_id = ? AND internal_id IN 
                 """,
-                (project_id, *batch),
+                batch,
             )
+            rows = await db.execute_fetchall(query.text, (project_id, *query.params))
             for r in rows:
                 meta = json.loads(r[4] or "{}")
                 row_map[int(r[1])] = ChunkRow(r[0], int(r[1]), r[2], int(r[3]), meta, int(r[5] or 0))
@@ -440,12 +474,12 @@ async def fetch_chunks_by_internal_ids(
 async def bump_access_counts(db_path: str, project_id: str, chunk_ids: List[str]) -> None:
     if not chunk_ids:
         return
-    placeholders = ",".join(["?"] * len(chunk_ids))
+    query = build_in_query(
+        "UPDATE chunks SET access_count = access_count + 1 WHERE project_id = ? AND chunk_id IN ",
+        chunk_ids,
+    )
     async with get_connection(db_path) as db:
-        await db.execute(
-            f"UPDATE chunks SET access_count = access_count + 1 WHERE project_id = ? AND chunk_id IN ({placeholders})",
-            (project_id, *chunk_ids),
-        )
+        await db.execute(query.text, (project_id, *query.params))
         await db.commit()
 
 
@@ -530,15 +564,15 @@ async def fetch_internal_ids_for_chunk_ids(
     async with get_connection(db_path) as db:
         for i in range(0, len(chunk_ids), batch_size):
             batch = chunk_ids[i:i + batch_size]
-            placeholders = ",".join(["?"] * len(batch))
-            rows = await db.execute_fetchall(
-                f"""
+            query = build_in_query(
+                """
                 SELECT internal_id
                 FROM chunks
-                WHERE project_id = ? AND chunk_id IN ({placeholders})
+                WHERE project_id = ? AND chunk_id IN 
                 """,
-                (project_id, *batch),
+                batch,
             )
+            rows = await db.execute_fetchall(query.text, (project_id, *query.params))
             out.extend(int(r[0]) for r in rows)
     return out
 
@@ -577,15 +611,15 @@ async def fetch_file_chunk_ids(
     async with get_connection(db_path) as db:
         for i in range(0, len(file_paths), batch_size):
             batch = file_paths[i:i + batch_size]
-            placeholders = ",".join(["?"] * len(batch))
-            rows = await db.execute_fetchall(
-                f"""
+            query = build_in_query(
+                """
                 SELECT file_path, chunk_id
                 FROM file_chunks
-                WHERE project_id = ? AND file_path IN ({placeholders})
+                WHERE project_id = ? AND file_path IN 
                 """,
-                (project_id, *batch),
+                batch,
             )
+            rows = await db.execute_fetchall(query.text, (project_id, *query.params))
             for file_path, chunk_id in rows:
                 out[str(file_path)].append(str(chunk_id))
     return out
@@ -649,11 +683,11 @@ async def upsert_file_metadata(
         batch_size = 900
         for i in range(0, len(file_paths), batch_size):
             batch = file_paths[i:i + batch_size]
-            placeholders = ",".join(["?"] * len(batch))
-            await db.execute(
-                f"DELETE FROM file_chunks WHERE project_id = ? AND file_path IN ({placeholders})",
-                (project_id, *batch),
+            query = build_in_query(
+                "DELETE FROM file_chunks WHERE project_id = ? AND file_path IN ",
+                batch,
             )
+            await db.execute(query.text, (project_id, *query.params))
         chunk_rows: List[Tuple[str, str, str]] = []
         for r in rows:
             for chunk_id in r.chunk_ids:
@@ -673,11 +707,11 @@ async def delete_file_metadata(db_path: str, project_id: str, file_paths: List[s
         batch_size = 900
         for i in range(0, len(file_paths), batch_size):
             batch = file_paths[i:i + batch_size]
-            placeholders = ",".join(["?"] * len(batch))
-            await db.execute(
-                f"DELETE FROM file_metadata WHERE project_id = ? AND file_path IN ({placeholders})",
-                (project_id, *batch),
+            query = build_in_query(
+                "DELETE FROM file_metadata WHERE project_id = ? AND file_path IN ",
+                batch,
             )
+            await db.execute(query.text, (project_id, *query.params))
         await db.commit()
 
 
@@ -689,16 +723,16 @@ async def fetch_embedding_cache(
 ) -> Dict[str, bytes]:
     if not content_hashes:
         return {}
-    placeholders = ",".join(["?"] * len(content_hashes))
-    async with get_connection(db_path) as db:
-        rows = await db.execute_fetchall(
-            f"""
+    query = build_in_query(
+        """
             SELECT content_hash, embedding
             FROM embedding_cache
-            WHERE model_name = ? AND content_hash IN ({placeholders})
-            """,
-            (model_name, *content_hashes),
-        )
+            WHERE model_name = ? AND content_hash IN 
+        """,
+        content_hashes,
+    )
+    async with get_connection(db_path) as db:
+        rows = await db.execute_fetchall(query.text, (model_name, *query.params))
     return {str(r[0]): bytes(r[1]) for r in rows}
 
 
@@ -730,6 +764,111 @@ async def upsert_embedding_cache(
                 WHERE model_name = ?
                   AND created_at < datetime('now', ?)
                 """,
-                (model_name, f"-{int(ttl_s)} seconds"),
+                (model_name, "-" + str(int(ttl_s)) + " seconds"),
             )
         await db.commit()
+
+
+async def create_job(
+    db_path: str,
+    *,
+    job_id: str,
+    kind: str,
+    status: str,
+) -> None:
+    async with get_connection(db_path) as db:
+        await db.execute(
+            """
+            INSERT INTO jobs(job_id, kind, status, created_at, updated_at)
+            VALUES(?,?,?, datetime('now'), datetime('now'))
+            """,
+            (job_id, kind, status),
+        )
+        await db.commit()
+
+
+async def update_job_status(
+    db_path: str,
+    *,
+    job_id: str,
+    status: str,
+    error: Optional[str] = None,
+) -> None:
+    async with get_connection(db_path) as db:
+        await db.execute(
+            """
+            UPDATE jobs
+            SET status = ?, error = ?, updated_at = datetime('now')
+            WHERE job_id = ?
+            """,
+            (status, error, job_id),
+        )
+        await db.commit()
+
+
+async def list_jobs(db_path: str) -> List[Dict[str, Any]]:
+    async with get_connection(db_path) as db:
+        db.row_factory = aiosqlite.Row
+        rows = await db.execute_fetchall(
+            """
+            SELECT job_id, kind, status, created_at, updated_at, error
+            FROM jobs
+            ORDER BY created_at DESC
+            """
+        )
+    return [dict(row) for row in rows]
+
+
+async def set_file_count(db_path: str, project_id: str, file_count: int) -> None:
+    async with get_connection(db_path) as db:
+        await db.execute(
+            "UPDATE projects SET file_count = ?, updated_at = datetime('now') WHERE project_id = ?",
+            (int(file_count), project_id),
+        )
+        await db.commit()
+
+
+async def fetch_existing_chunk_ids(db_path: str, project_id: str) -> set[str]:
+    async with get_connection(db_path) as db:
+        rows = await db.execute_fetchall(
+            "SELECT chunk_id FROM chunks WHERE project_id = ?",
+            (project_id,),
+        )
+    return {r[0] for r in rows}
+
+
+async def fetch_chunk_batch(
+    db_path: str,
+    project_id: str,
+    *,
+    last_internal_id: int,
+    batch_size: int,
+) -> List[Dict[str, Any]]:
+    from .chunking import Chunk
+
+    async with get_connection(db_path) as db:
+        rows = await db.execute_fetchall(
+            """
+            SELECT chunk_id, internal_id, content, token_count, metadata
+            FROM chunks
+            WHERE project_id = ? AND internal_id > ?
+            ORDER BY internal_id ASC
+            LIMIT ?
+            """,
+            (project_id, int(last_internal_id), int(batch_size)),
+        )
+
+    out: List[Dict[str, Any]] = []
+    for cid, iid, content, tcount, meta_json in rows:
+        meta = {}
+        try:
+            meta = json.loads(meta_json or "{}")
+        except Exception:
+            meta = {}
+        out.append(
+            {
+                "chunk": Chunk(chunk_id=cid, content=content, token_count=int(tcount), metadata=meta),
+                "internal_id": int(iid),
+            }
+        )
+    return out

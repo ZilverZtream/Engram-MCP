@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Dict, Optional
+from typing import Any, Awaitable, Dict
+
+from . import db as dbmod
 
 
 @dataclass
@@ -15,19 +17,37 @@ class Job:
 
 
 class JobManager:
-    def __init__(self, max_concurrent_jobs: int = 5) -> None:
+    def __init__(self, db_path: str, max_concurrent_jobs: int = 5) -> None:
         self._jobs: Dict[str, Job] = {}
         self._lock = asyncio.Lock()
         # Semaphore to limit concurrent jobs and prevent DoS
         self._semaphore = asyncio.Semaphore(max_concurrent_jobs)
+        self._db_path = db_path
 
     async def create(self, kind: str, coro: Awaitable[Any]) -> Job:
         job_id = f"{kind}_{int(time.time()*1000)}"
+        await dbmod.init_db(self._db_path)
+        await dbmod.create_job(self._db_path, job_id=job_id, kind=kind, status="QUEUED")
 
         # Wrap coroutine with semaphore to limit concurrency
         async def _wrapped_coro():
             async with self._semaphore:
-                return await coro
+                await dbmod.update_job_status(self._db_path, job_id=job_id, status="PROCESSING")
+                try:
+                    result = await coro
+                except asyncio.CancelledError:
+                    await dbmod.update_job_status(self._db_path, job_id=job_id, status="CANCELLED")
+                    raise
+                except Exception as exc:
+                    await dbmod.update_job_status(
+                        self._db_path,
+                        job_id=job_id,
+                        status="FAILED",
+                        error=str(exc),
+                    )
+                    raise
+                await dbmod.update_job_status(self._db_path, job_id=job_id, status="COMPLETED")
+                return result
 
         task = asyncio.create_task(_wrapped_coro())
         job = Job(job_id=job_id, kind=kind, created_at=time.time(), task=task)
@@ -50,14 +70,16 @@ class JobManager:
         return True
 
     async def list(self) -> Dict[str, Dict[str, Any]]:
-        async with self._lock:
-            jobs = list(self._jobs.values())
+        await dbmod.init_db(self._db_path)
+        rows = await dbmod.list_jobs(self._db_path)
         out: Dict[str, Dict[str, Any]] = {}
-        for j in jobs:
-            out[j.job_id] = {
-                "kind": j.kind,
-                "age_s": round(time.time() - j.created_at, 1),
-                "done": j.task.done(),
-                "cancelled": j.task.cancelled(),
+        for row in rows:
+            created_at = row.get("created_at") or ""
+            out[str(row.get("job_id"))] = {
+                "kind": row.get("kind"),
+                "status": row.get("status"),
+                "created_at": created_at,
+                "updated_at": row.get("updated_at"),
+                "error": row.get("error"),
             }
         return out

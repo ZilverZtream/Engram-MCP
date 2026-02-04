@@ -2,18 +2,17 @@ from __future__ import annotations
 
 import asyncio
 import os
-import re
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict
 
 from fastmcp import FastMCP
 
 from engram_mcp.config import load_config
-from engram_mcp.embeddings import Embedder
+from engram_mcp.embeddings import EmbeddingService
 from engram_mcp.indexing import Indexer
 from engram_mcp.locks import get_project_lock, remove_project_lock, remove_project_rwlock
 from engram_mcp.jobs import JobManager
 from engram_mcp.search import SearchEngine
-from engram_mcp.security import PathNotAllowed, enforce_allowed_roots
+from engram_mcp.security import PathContext, PathNotAllowed, ProjectID
 from engram_mcp import db as dbmod
 
 
@@ -21,11 +20,19 @@ cfg = load_config()
 
 mcp = FastMCP(name="Engram MCP")
 
-jobs = JobManager()
-indexer = Indexer(cfg)
-search_engine = SearchEngine(db_path=cfg.db_path, index_dir=cfg.index_dir)
-_embedder_cache: Dict[str, Tuple[str, str, Embedder]] = {}
-_embedder_lock = asyncio.Lock()
+project_path_context = PathContext(cfg.allowed_roots)
+index_path_context = PathContext([cfg.index_dir])
+embedding_service = EmbeddingService(
+    prefer_thread_for_cuda=cfg.prefer_thread_for_cuda,
+    worker_count=max(1, min(4, os.cpu_count() or 4)),
+)
+jobs = JobManager(cfg.db_path)
+indexer = Indexer(cfg, embedding_service, project_path_context, index_path_context)
+search_engine = SearchEngine(
+    db_path=cfg.db_path,
+    index_dir=cfg.index_dir,
+    index_path_context=index_path_context,
+)
 
 
 def _device() -> str:
@@ -37,36 +44,6 @@ def _device() -> str:
         return "cpu"
 
 
-def _sanitize_project_id(project_id: str) -> str:
-    sanitized = os.path.basename(project_id)
-    if not re.match(r"^[a-zA-Z0-9_-]+$", sanitized):
-        raise ValueError(f"Invalid project_id: {project_id}. Only alphanumeric characters, underscores, and hyphens are allowed.")
-    return sanitized
-
-
-async def _get_embedder_for_project(project_id: str) -> Embedder:
-    proj = await dbmod.get_project(cfg.db_path, project_id)
-    if not proj:
-        raise ValueError(f"Project not found: {project_id}")
-
-    md = proj.get("metadata") or {}
-    model_name = md.get("model_name") or cfg.model_name_text
-    device = md.get("device") or _device()
-    async with _embedder_lock:
-        cached = _embedder_cache.get(project_id)
-        if cached and cached[0] == model_name and cached[1] == device:
-            return cached[2]
-        if cached:
-            cached[2].close()
-        embedder = Embedder(
-            model_name=model_name,
-            device=device,
-            prefer_thread_for_cuda=cfg.prefer_thread_for_cuda,
-        )
-        _embedder_cache[project_id] = (model_name, device, embedder)
-        return embedder
-
-
 @mcp.tool
 async def index_project(
     directory: str,
@@ -75,7 +52,7 @@ async def index_project(
 ) -> str:
     """Index a directory (within allowed_roots) for hybrid search."""
     try:
-        directory = enforce_allowed_roots(directory, cfg.allowed_roots)
+        directory = str(project_path_context.resolve_path(directory))
     except PathNotAllowed as e:
         return f"❌ {e}"
 
@@ -136,8 +113,10 @@ async def search_memory(
     if not proj:
         return {"error": f"Project not found: {project_id}"}
 
-    embedder = await _get_embedder_for_project(project_id)
-    qv = await embedder.embed_one(query)
+    md = proj.get("metadata") or {}
+    model_name = md.get("model_name") or cfg.model_name_text
+    device = md.get("device") or _device()
+    qv = await embedding_service.embed_one(query, model_name=model_name, device=device)
 
     results = await search_engine.search(
         project_id=project_id,
@@ -190,30 +169,28 @@ async def delete_project(project_id: str) -> str:
         return f"❌ Project not found: {project_id}"
 
     try:
-        safe_id = _sanitize_project_id(project_id)
+        safe_id = ProjectID(project_id)
     except ValueError as e:
         return f"❌ {e}"
     lock = await get_project_lock(project_id)
     async with lock:
         await dbmod.delete_project(cfg.db_path, project_id)
-        index_paths = [os.path.join(cfg.index_dir, f"{safe_id}.index")]
-        shard_prefix = os.path.join(cfg.index_dir, f"{safe_id}.shard")
-        entries = await asyncio.to_thread(os.listdir, cfg.index_dir)
+        index_paths = [
+            os.path.join(cfg.index_dir, str(safe_id) + ".index.current"),
+            os.path.join(cfg.index_dir, str(safe_id) + ".index.new"),
+        ]
+        shard_prefix = str(safe_id) + ".shard"
+        entries = index_path_context.list_dir(cfg.index_dir)
         for entry in entries:
-            if entry.startswith(os.path.basename(shard_prefix)) and entry.endswith(".index"):
+            if entry.startswith(shard_prefix) and entry.endswith(".index.current"):
+                index_paths.append(os.path.join(cfg.index_dir, entry))
+            if entry.startswith(shard_prefix) and entry.endswith(".index.new"):
                 index_paths.append(os.path.join(cfg.index_dir, entry))
         for path in index_paths:
-            try:
-                await asyncio.to_thread(os.unlink, path)
-            except FileNotFoundError:
-                continue
+            if index_path_context.exists(path):
+                index_path_context.unlink(path)
         await remove_project_lock(project_id)
         await remove_project_rwlock(project_id)
-
-    async with _embedder_lock:
-        cached = _embedder_cache.pop(project_id, None)
-        if cached:
-            cached[2].close()
     return f"✅ Deleted {project_id}"
 
 
