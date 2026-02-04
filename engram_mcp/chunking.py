@@ -20,25 +20,14 @@ class Chunk:
 @lru_cache(maxsize=1)
 def _load_tokenizer() -> Tokenizer:
     tokenizer_path = os.getenv("ENGRAM_TOKENIZER_PATH")
-    if tokenizer_path:
-        return Tokenizer.from_file(tokenizer_path)
-    os.environ.setdefault("HF_HUB_OFFLINE", "1")
-    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
-    try:
-        return Tokenizer.from_pretrained("bert-base-uncased", local_files_only=True)
-    except TypeError:
-        try:
-            return Tokenizer.from_pretrained("bert-base-uncased")
-        except Exception as exc:
-            raise RuntimeError(
-                "Tokenizer not available locally. Set ENGRAM_TOKENIZER_PATH to a tokenizer.json "
-                "or pre-cache bert-base-uncased during installation."
-            ) from exc
-    except Exception as exc:
+    if not tokenizer_path:
         raise RuntimeError(
-            "Tokenizer not available locally. Set ENGRAM_TOKENIZER_PATH to a tokenizer.json "
-            "or pre-cache bert-base-uncased during installation."
-        ) from exc
+            "ENGRAM_TOKENIZER_PATH must be set to a local tokenizer.json; "
+            "network downloads are disabled for safety."
+        )
+    if not os.path.exists(tokenizer_path):
+        raise RuntimeError(f"Tokenizer not found at ENGRAM_TOKENIZER_PATH: {tokenizer_path}")
+    return Tokenizer.from_file(tokenizer_path)
 
 
 def token_count(text: str) -> int:
@@ -49,7 +38,7 @@ def token_count(text: str) -> int:
 
 
 def make_chunk_id(*parts: str) -> str:
-    h = hashlib.sha1()
+    h = hashlib.sha256()
     for p in parts:
         h.update(p.encode("utf-8", errors="ignore"))
         h.update(b"\0")
@@ -88,7 +77,7 @@ def chunk_text(
         end_offset = offsets[end - 1][1] if end > start else offsets[start][1]
         content = text[start_offset:end_offset].strip()
         if content:
-            cid = make_chunk_id(base_id, str(idx))
+            cid = make_chunk_id(base_id, str(idx), content)
             chunks.append(
                 Chunk(
                     chunk_id=cid,

@@ -10,7 +10,7 @@ from fastmcp import FastMCP
 from engram_mcp.config import load_config
 from engram_mcp.embeddings import Embedder
 from engram_mcp.indexing import Indexer
-from engram_mcp.locks import get_project_lock
+from engram_mcp.locks import get_project_lock, remove_project_lock, remove_project_rwlock
 from engram_mcp.jobs import JobManager
 from engram_mcp.search import SearchEngine
 from engram_mcp.security import PathNotAllowed, enforce_allowed_roots
@@ -196,16 +196,19 @@ async def delete_project(project_id: str) -> str:
     lock = await get_project_lock(project_id)
     async with lock:
         await dbmod.delete_project(cfg.db_path, project_id)
-        index_paths = [
-            os.path.join(cfg.index_dir, f"{safe_id}.index"),
-        ]
+        index_paths = [os.path.join(cfg.index_dir, f"{safe_id}.index")]
         shard_prefix = os.path.join(cfg.index_dir, f"{safe_id}.shard")
-        for entry in os.listdir(cfg.index_dir):
+        entries = await asyncio.to_thread(os.listdir, cfg.index_dir)
+        for entry in entries:
             if entry.startswith(os.path.basename(shard_prefix)) and entry.endswith(".index"):
                 index_paths.append(os.path.join(cfg.index_dir, entry))
         for path in index_paths:
-            if os.path.exists(path):
-                os.unlink(path)
+            try:
+                await asyncio.to_thread(os.unlink, path)
+            except FileNotFoundError:
+                continue
+        await remove_project_lock(project_id)
+        await remove_project_rwlock(project_id)
 
     async with _embedder_lock:
         cached = _embedder_cache.pop(project_id, None)
