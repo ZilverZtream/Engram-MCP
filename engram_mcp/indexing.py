@@ -6,6 +6,7 @@ import math
 import os
 import re
 import time
+import uuid
 import logging
 from dataclasses import dataclass
 from pathlib import Path
@@ -50,7 +51,8 @@ def _content_hash(text: str) -> str:
 
 
 async def _bounded_gather(items: Iterable[Any], worker, concurrency: int):
-    output: asyncio.Queue[Any] = asyncio.Queue()
+    queue_maxsize = max(1, int(concurrency) * 2)
+    output: asyncio.Queue[Any] = asyncio.Queue(maxsize=queue_maxsize)
     sentinel = object()
     sem = asyncio.Semaphore(max(1, int(concurrency)))
 
@@ -60,19 +62,27 @@ async def _bounded_gather(items: Iterable[Any], worker, concurrency: int):
             await output.put(res)
 
     async def _producer() -> None:
-        async with asyncio.TaskGroup() as tg:
-            for item in items:
-                tg.create_task(_run(item))
-        await output.put(sentinel)
+        try:
+            async with asyncio.TaskGroup() as tg:
+                for item in items:
+                    tg.create_task(_run(item))
+        except BaseException as exc:
+            await output.put(exc)
+        finally:
+            await output.put(sentinel)
 
     producer = asyncio.create_task(_producer())
     try:
         while True:
             res = await output.get()
+            if isinstance(res, BaseException):
+                raise res
             if res is sentinel:
                 break
             yield res
     finally:
+        if not producer.done():
+            producer.cancel()
         await producer
 
 
@@ -207,7 +217,7 @@ class Indexer:
     async def index_project(self, *, directory: str, project_name: str, project_type: str) -> str:
         await dbmod.init_db(self.cfg.db_path)
 
-        project_id = ProjectID(f"{_slug(project_name)}_{int(time.time())}")
+        project_id = ProjectID(f"{_slug(project_name)}_{time.time_ns()}_{uuid.uuid4().hex[:8]}")
         directory = str(self.project_path_context.resolve_path(directory))
         directory_realpath = os.path.realpath(directory)
 
@@ -228,22 +238,36 @@ class Indexer:
                         yield p
 
             sem = asyncio.Semaphore(os.cpu_count() or 4)
+            pdf_sem = asyncio.Semaphore(1)
             max_bytes = int(self.cfg.max_file_size_mb) * 1024 * 1024
 
             async def parse_one(path: Any) -> Optional[ParsedFile]:
                 rel = str(path.relative_to(directory))
                 async with sem:
                     try:
-                        chunks = await asyncio.to_thread(
-                            parse_file_to_chunks,
-                            path_context=self.project_path_context,
-                            path=path,
-                            root=directory,
-                            project_type=project_type,
-                            chunk_size_tokens=self.cfg.chunk_size_tokens,
-                            overlap_tokens=self.cfg.overlap_tokens,
-                            max_file_size_mb=self.cfg.max_file_size_mb,
-                        )
+                        if str(path.suffix).lower() == ".pdf":
+                            async with pdf_sem:
+                                chunks = await asyncio.to_thread(
+                                    parse_file_to_chunks,
+                                    path_context=self.project_path_context,
+                                    path=path,
+                                    root=directory,
+                                    project_type=project_type,
+                                    chunk_size_tokens=self.cfg.chunk_size_tokens,
+                                    overlap_tokens=self.cfg.overlap_tokens,
+                                    max_file_size_mb=self.cfg.max_file_size_mb,
+                                )
+                        else:
+                            chunks = await asyncio.to_thread(
+                                parse_file_to_chunks,
+                                path_context=self.project_path_context,
+                                path=path,
+                                root=directory,
+                                project_type=project_type,
+                                chunk_size_tokens=self.cfg.chunk_size_tokens,
+                                overlap_tokens=self.cfg.overlap_tokens,
+                                max_file_size_mb=self.cfg.max_file_size_mb,
+                            )
                         content_hash = await asyncio.to_thread(
                             hash_file,
                             self.project_path_context,
@@ -425,7 +449,7 @@ class Indexer:
             await dbmod.set_file_count(self.cfg.db_path, str(project_id), file_count)
 
             if index_path and index_current and self.index_path_context.exists(index_path):
-                self.index_path_context.replace(index_path, index_current)
+                _replace_with_retries(self.index_path_context, index_path, index_current)
                 await invalidate_faiss_cache(index_current)
 
             await self._maybe_shard_project(project_id=str(project_id))
@@ -550,21 +574,35 @@ class Indexer:
                 added_count = 0
                 updated_file_rows: List[dbmod.FileMetadataRow] = []
                 sem = asyncio.Semaphore(os.cpu_count() or 4)
+                pdf_sem = asyncio.Semaphore(1)
 
                 async def parse_one(rel_path: str) -> Optional[ParsedFile]:
                     mtime_ns, size_bytes, content_hash, path = current_files[rel_path]
                     async with sem:
                         try:
-                            chunks = await asyncio.to_thread(
-                                parse_file_to_chunks,
-                                path_context=self.project_path_context,
-                                path=path,
-                                root=directory,
-                                project_type=project_type,
-                                chunk_size_tokens=self.cfg.chunk_size_tokens,
-                                overlap_tokens=self.cfg.overlap_tokens,
-                                max_file_size_mb=self.cfg.max_file_size_mb,
-                            )
+                            if str(path.suffix).lower() == ".pdf":
+                                async with pdf_sem:
+                                    chunks = await asyncio.to_thread(
+                                        parse_file_to_chunks,
+                                        path_context=self.project_path_context,
+                                        path=path,
+                                        root=directory,
+                                        project_type=project_type,
+                                        chunk_size_tokens=self.cfg.chunk_size_tokens,
+                                        overlap_tokens=self.cfg.overlap_tokens,
+                                        max_file_size_mb=self.cfg.max_file_size_mb,
+                                    )
+                            else:
+                                chunks = await asyncio.to_thread(
+                                    parse_file_to_chunks,
+                                    path_context=self.project_path_context,
+                                    path=path,
+                                    root=directory,
+                                    project_type=project_type,
+                                    chunk_size_tokens=self.cfg.chunk_size_tokens,
+                                    overlap_tokens=self.cfg.overlap_tokens,
+                                    max_file_size_mb=self.cfg.max_file_size_mb,
+                                )
                         except Exception:
                             logging.warning("Failed to parse %s", rel_path, exc_info=True)
                             return None
@@ -641,6 +679,7 @@ class Indexer:
                                 await self._add_vectors(shard_indexes[shard_id], shard_vectors, shard_ids)
                             added_count += len(parsed.chunks)
 
+                        replacements: List[Tuple[str, str]] = []
                         for shard_id, index in enumerate(shard_indexes):
                             if index is None:
                                 continue
@@ -652,7 +691,9 @@ class Indexer:
                                 self.index_path_context,
                                 new_path,
                             )
-                            self.index_path_context.replace(new_path, current_path)
+                            replacements.append((new_path, current_path))
+                        if replacements:
+                            _swap_index_files(self.index_path_context, replacements)
                 else:
                     index_current, index_new = _index_paths(self.cfg.index_dir, project)
                     index_path = index_current
@@ -696,7 +737,7 @@ class Indexer:
 
                         await invalidate_faiss_cache(index_path)
                         await asyncio.to_thread(_save_faiss, index, self.index_path_context, index_new)
-                        self.index_path_context.replace(index_new, index_current)
+                        _replace_with_retries(self.index_path_context, index_new, index_current)
 
                 if to_delete_chunk_ids:
                     await dbmod.delete_chunks(self.cfg.db_path, str(project), to_delete_chunk_ids)
@@ -738,6 +779,7 @@ class Indexer:
     ) -> None:
         rwlock = await get_project_rwlock(project_id)
         project = ProjectID(project_id)
+        added_chunk_ids: List[str] = []
         shard_paths = [
             _index_paths(self.cfg.index_dir, project, shard_id)
             for shard_id in range(shard_count)
@@ -750,44 +792,53 @@ class Indexer:
                 shard_indexes.append(None)
 
         async with rwlock.write_lock():
-            if internal_ids_to_delete:
+            try:
+                if internal_ids_to_delete:
+                    for shard_id, index in enumerate(shard_indexes):
+                        if index is None:
+                            continue
+                        ids_for_shard = [iid for iid in internal_ids_to_delete if iid % shard_count == shard_id]
+                        if ids_for_shard:
+                            index.remove_ids(np.asarray(ids_for_shard, dtype=np.int64))
+
+                if to_add_chunks:
+                    vectors = await self._embed_chunks_cached(
+                        to_add_chunks,
+                        model_name=model_name,
+                        device=device,
+                    )
+                    internal_ids = await dbmod.reserve_internal_ids(self.cfg.db_path, project_id, len(to_add_chunks))
+                    rows = [
+                        (c.chunk_id, int(iid), c.content, int(c.token_count), c.metadata)
+                        for c, iid in zip(to_add_chunks, internal_ids)
+                    ]
+                    await dbmod.upsert_chunks(self.cfg.db_path, project_id=project_id, rows=rows)
+                    added_chunk_ids = [c.chunk_id for c in to_add_chunks]
+
+                    for shard_id in range(shard_count):
+                        shard_mask = [i for i, iid in enumerate(internal_ids) if iid % shard_count == shard_id]
+                        if not shard_mask:
+                            continue
+                        shard_vectors = vectors[shard_mask]
+                        shard_ids = np.asarray([internal_ids[i] for i in shard_mask], dtype=np.int64)
+                        if shard_indexes[shard_id] is None:
+                            shard_indexes[shard_id] = await self._build_faiss_index(shard_vectors)
+                        await self._add_vectors(shard_indexes[shard_id], shard_vectors, shard_ids)
+
+                new_paths: List[Tuple[str, str]] = []
                 for shard_id, index in enumerate(shard_indexes):
                     if index is None:
                         continue
-                    ids_for_shard = [iid for iid in internal_ids_to_delete if iid % shard_count == shard_id]
-                    if ids_for_shard:
-                        index.remove_ids(np.asarray(ids_for_shard, dtype=np.int64))
-
-            if to_add_chunks:
-                vectors = await self._embed_chunks_cached(
-                    to_add_chunks,
-                    model_name=model_name,
-                    device=device,
-                )
-                internal_ids = await dbmod.reserve_internal_ids(self.cfg.db_path, project_id, len(to_add_chunks))
-                rows = [
-                    (c.chunk_id, int(iid), c.content, int(c.token_count), c.metadata)
-                    for c, iid in zip(to_add_chunks, internal_ids)
-                ]
-                await dbmod.upsert_chunks(self.cfg.db_path, project_id=project_id, rows=rows)
-
-                for shard_id in range(shard_count):
-                    shard_mask = [i for i, iid in enumerate(internal_ids) if iid % shard_count == shard_id]
-                    if not shard_mask:
-                        continue
-                    shard_vectors = vectors[shard_mask]
-                    shard_ids = np.asarray([internal_ids[i] for i in shard_mask], dtype=np.int64)
-                    if shard_indexes[shard_id] is None:
-                        shard_indexes[shard_id] = await self._build_faiss_index(shard_vectors)
-                    await self._add_vectors(shard_indexes[shard_id], shard_vectors, shard_ids)
-
-            for shard_id, index in enumerate(shard_indexes):
-                if index is None:
-                    continue
-                current_path, new_path = shard_paths[shard_id]
-                await invalidate_faiss_cache(current_path)
-                await asyncio.to_thread(_save_faiss, index, self.index_path_context, new_path)
-                self.index_path_context.replace(new_path, current_path)
+                    current_path, new_path = shard_paths[shard_id]
+                    await invalidate_faiss_cache(current_path)
+                    await asyncio.to_thread(_save_faiss, index, self.index_path_context, new_path)
+                    new_paths.append((new_path, current_path))
+                if new_paths:
+                    _swap_index_files(self.index_path_context, new_paths)
+            except Exception:
+                if added_chunk_ids:
+                    await dbmod.delete_chunks(self.cfg.db_path, project_id, added_chunk_ids)
+                raise
 
     async def _maybe_shard_project(self, *, project_id: str) -> None:
         proj = await dbmod.get_project(self.cfg.db_path, project_id)
@@ -822,9 +873,9 @@ class Indexer:
             shard_pending_ids[shard_id].clear()
 
         while True:
-                batch = await dbmod.fetch_chunk_batch(
-                    self.cfg.db_path,
-                    project_id,
+            batch = await dbmod.fetch_chunk_batch(
+                self.cfg.db_path,
+                project_id,
                 last_internal_id=last_internal_id,
                 batch_size=batch_size,
             )
@@ -872,13 +923,21 @@ class Indexer:
             await _flush_pending(shard_id)
 
         async with rwlock.write_lock():
-            for shard_id, index in enumerate(shard_indexes):
-                if index is None:
-                    continue
-                current_path, new_path = _index_paths(self.cfg.index_dir, project, shard_id)
-                await invalidate_faiss_cache(current_path)
-                await asyncio.to_thread(_save_faiss, index, self.index_path_context, new_path)
-                self.index_path_context.replace(new_path, current_path)
+            shard_replacements: List[Tuple[str, str]] = []
+            try:
+                for shard_id, index in enumerate(shard_indexes):
+                    if index is None:
+                        continue
+                    current_path, new_path = _index_paths(self.cfg.index_dir, project, shard_id)
+                    await invalidate_faiss_cache(current_path)
+                    await asyncio.to_thread(_save_faiss, index, self.index_path_context, new_path)
+                    shard_replacements.append((new_path, current_path))
+                _swap_index_files(self.index_path_context, shard_replacements)
+            except Exception:
+                for new_path, _ in shard_replacements:
+                    if self.index_path_context.exists(new_path):
+                        self.index_path_context.unlink(new_path)
+                raise
 
         metadata["shard_count"] = shard_count
         metadata["shard_size"] = int(self.cfg.shard_size)
@@ -943,8 +1002,55 @@ def _save_faiss(index: Any, path_context: PathContext, path: str) -> None:
     tmp_path = path_context.create_temp_file(dir_path=dir_path, suffix=".index.tmp")
     try:
         faiss.write_index(index, tmp_path)
-        path_context.replace(tmp_path, path)
+        _replace_with_retries(path_context, tmp_path, path)
     except Exception:
         if path_context.exists(tmp_path):
             path_context.unlink(tmp_path)
+        raise
+
+
+def _replace_with_retries(
+    path_context: PathContext,
+    src: str,
+    dest: str,
+    *,
+    retries: int = 5,
+    delay_s: float = 0.1,
+) -> None:
+    last_exc: Optional[BaseException] = None
+    for attempt in range(max(1, retries)):
+        try:
+            path_context.replace(src, dest)
+            return
+        except PermissionError as exc:
+            last_exc = exc
+            if os.name != "nt" or attempt >= retries - 1:
+                raise
+            time.sleep(delay_s * (attempt + 1))
+    if last_exc:
+        raise last_exc
+
+
+def _swap_index_files(path_context: PathContext, replacements: List[Tuple[str, str]]) -> None:
+    backups: List[Tuple[str, str]] = []
+    try:
+        for _, current_path in replacements:
+            if path_context.exists(current_path):
+                backup_path = current_path + ".bak"
+                if path_context.exists(backup_path):
+                    path_context.unlink(backup_path)
+                _replace_with_retries(path_context, current_path, backup_path)
+                backups.append((backup_path, current_path))
+        for new_path, current_path in replacements:
+            _replace_with_retries(path_context, new_path, current_path)
+        for backup_path, _ in backups:
+            if path_context.exists(backup_path):
+                path_context.unlink(backup_path)
+    except Exception:
+        for backup_path, current_path in backups:
+            if path_context.exists(backup_path):
+                _replace_with_retries(path_context, backup_path, current_path)
+        for new_path, _ in replacements:
+            if path_context.exists(new_path):
+                path_context.unlink(new_path)
         raise

@@ -108,6 +108,11 @@ CREATE TABLE IF NOT EXISTS jobs (
     updated_at TEXT DEFAULT (datetime('now')),
     error TEXT
 );
+
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    name TEXT PRIMARY KEY,
+    applied_at TEXT DEFAULT (datetime('now'))
+);
 """
 
 
@@ -152,8 +157,11 @@ class _ConnectionPool:
         self._lock = asyncio.Lock()
         self._all: set[aiosqlite.Connection] = set()
         self._semaphore = asyncio.Semaphore(maxsize)
+        self._closing = False
 
     async def acquire(self) -> aiosqlite.Connection:
+        if self._closing:
+            raise RuntimeError("Connection pool is closing")
         try:
             await asyncio.wait_for(self._semaphore.acquire(), timeout=self.timeout_s)
         except asyncio.TimeoutError as exc:
@@ -179,6 +187,9 @@ class _ConnectionPool:
         self._semaphore.release()
 
     async def close(self) -> None:
+        self._closing = True
+        for _ in range(self.maxsize):
+            await self._semaphore.acquire()
         conns = list(self._all)
         self._all.clear()
         while not self._queue.empty():
@@ -251,6 +262,12 @@ async def _ensure_file_chunks_schema(db: aiosqlite.Connection) -> None:
 
 
 async def _migrate_file_chunks_from_metadata(db: aiosqlite.Connection) -> None:
+    row = await db.execute_fetchone(
+        "SELECT 1 FROM schema_migrations WHERE name = ?",
+        ("file_chunks_backfill",),
+    )
+    if row:
+        return
     rows = await db.execute_fetchall("PRAGMA table_info(file_metadata)")
     columns = {r[1] for r in rows}
     if "chunk_ids" not in columns:
@@ -275,6 +292,14 @@ async def _migrate_file_chunks_from_metadata(db: aiosqlite.Connection) -> None:
             "INSERT OR IGNORE INTO file_chunks(project_id, file_path, chunk_id) VALUES(?,?,?)",
             batch,
         )
+    await db.execute(
+        "INSERT OR IGNORE INTO schema_migrations(name) VALUES(?)",
+        ("file_chunks_backfill",),
+    )
+    try:
+        await db.execute("ALTER TABLE file_metadata DROP COLUMN chunk_ids")
+    except aiosqlite.OperationalError:
+        logging.info("SQLite does not support DROP COLUMN; leaving file_metadata.chunk_ids in place.")
 
 
 async def _ensure_fts_tokenizer(db: aiosqlite.Connection) -> None:
@@ -723,17 +748,37 @@ async def fetch_embedding_cache(
 ) -> Dict[str, bytes]:
     if not content_hashes:
         return {}
-    query = build_in_query(
-        """
-            SELECT content_hash, embedding
-            FROM embedding_cache
-            WHERE model_name = ? AND content_hash IN 
-        """,
-        content_hashes,
-    )
+    out: Dict[str, bytes] = {}
+    batch_size = 900
     async with get_connection(db_path) as db:
-        rows = await db.execute_fetchall(query.text, (model_name, *query.params))
-    return {str(r[0]): bytes(r[1]) for r in rows}
+        for i in range(0, len(content_hashes), batch_size):
+            batch = content_hashes[i:i + batch_size]
+            query = build_in_query(
+                """
+                    SELECT content_hash, embedding
+                    FROM embedding_cache
+                    WHERE model_name = ? AND content_hash IN 
+                """,
+                batch,
+            )
+            rows = await db.execute_fetchall(query.text, (model_name, *query.params))
+            out.update({str(r[0]): bytes(r[1]) for r in rows})
+    return out
+
+
+async def mark_stale_jobs_failed(db_path: str, *, error: str) -> None:
+    async with get_connection(db_path) as db:
+        await db.execute(
+            """
+            UPDATE jobs
+            SET status = 'FAILED',
+                error = ?,
+                updated_at = datetime('now')
+            WHERE status IN ('QUEUED', 'PROCESSING')
+            """,
+            (error,),
+        )
+        await db.commit()
 
 
 async def upsert_embedding_cache(

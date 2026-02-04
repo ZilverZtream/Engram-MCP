@@ -28,11 +28,12 @@ class RWLock:
     def __init__(self) -> None:
         self._readers = 0
         self._writer = False
+        self._writers_waiting = 0
         self._cond = asyncio.Condition()
 
     async def acquire_read(self) -> None:
         async with self._cond:
-            while self._writer:
+            while self._writer or self._writers_waiting > 0:
                 await self._cond.wait()
             self._readers += 1
 
@@ -44,9 +45,13 @@ class RWLock:
 
     async def acquire_write(self) -> None:
         async with self._cond:
-            while self._writer or self._readers > 0:
-                await self._cond.wait()
-            self._writer = True
+            self._writers_waiting += 1
+            try:
+                while self._writer or self._readers > 0:
+                    await self._cond.wait()
+                self._writer = True
+            finally:
+                self._writers_waiting = max(0, self._writers_waiting - 1)
 
     async def release_write(self) -> None:
         async with self._cond:
