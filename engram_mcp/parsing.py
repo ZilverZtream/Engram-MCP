@@ -8,9 +8,9 @@ import os
 from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional
+from typing import Dict, Iterable, Iterator, List, Optional
 
-from .chunking import Chunk, chunk_text, make_chunk_id, token_count
+from .chunking import Chunk, chunk_lines, chunk_text, make_chunk_id, token_count
 from .security import PathContext
 
 
@@ -39,7 +39,14 @@ def iter_files(path_context: PathContext, root: str, ignore_patterns: List[str])
         yield p
 
 
-def read_text_streaming(path_context: PathContext, path: Path, root: Path, max_bytes: int) -> str:
+def read_text_streaming(
+    path_context: PathContext,
+    path: Path,
+    root: Path,
+    max_bytes: int,
+    *,
+    chunk_size: int = 1024 * 1024,
+) -> Iterable[str]:
     # Avoid reading enormous files at once.
     size = path_context.stat(path).st_size
     if size > max_bytes:
@@ -48,7 +55,11 @@ def read_text_streaming(path_context: PathContext, path: Path, root: Path, max_b
         handle = stack.enter_context(
             path_context.open_file(path, "r", encoding="utf-8", errors="ignore")
         )
-        return handle.read()
+        while True:
+            chunk = handle.read(chunk_size)
+            if not chunk:
+                break
+            yield chunk
 
 
 def hash_file(path_context: PathContext, path: Path, root: Path, max_bytes: int) -> str:
@@ -92,10 +103,9 @@ def parse_file_to_chunks(
     max_bytes = int(max_file_size_mb) * 1024 * 1024
 
     if ext in SUPPORTED_TEXT_EXTS:
-        text = read_text_streaming(path_context, path, root=Path(root), max_bytes=max_bytes)
         base_id = make_chunk_id(str(path))
-        return chunk_text(
-            text=text,
+        return chunk_lines(
+            lines=read_text_streaming(path_context, path, root=Path(root), max_bytes=max_bytes),
             base_id=base_id,
             meta=base_meta,
             target_tokens=chunk_size_tokens,
@@ -240,15 +250,18 @@ async def parse_directory(
 
         async with sem:
             try:
-                file_chunks = await asyncio.to_thread(
-                    parse_file_to_chunks,
-                    path_context=path_context,
-                    path=path,
-                    root=root,
-                    project_type=project_type,
-                    chunk_size_tokens=chunk_size_tokens,
-                    overlap_tokens=overlap_tokens,
-                    max_file_size_mb=max_file_size_mb,
+                file_chunks = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        parse_file_to_chunks,
+                        path_context=path_context,
+                        path=path,
+                        root=root,
+                        project_type=project_type,
+                        chunk_size_tokens=chunk_size_tokens,
+                        overlap_tokens=overlap_tokens,
+                        max_file_size_mb=max_file_size_mb,
+                    ),
+                    timeout=30,
                 )
             except Exception:
                 logging.warning("Failed to parse %s", rel, exc_info=True)

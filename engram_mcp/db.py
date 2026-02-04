@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -183,6 +184,19 @@ class _ConnectionPool:
             return conn
 
     async def release(self, conn: aiosqlite.Connection) -> None:
+        try:
+            if conn.in_transaction:
+                await conn.rollback()
+        except Exception:
+            logging.warning("Failed to rollback pooled connection; closing.", exc_info=True)
+            try:
+                await conn.close()
+            finally:
+                self._all.discard(conn)
+                if self._created > 0:
+                    self._created -= 1
+                self._semaphore.release()
+                return
         await self._queue.put(conn)
         self._semaphore.release()
 
@@ -391,6 +405,28 @@ async def get_project(db_path: str, project_id: str) -> Optional[Dict[str, Any]]
         return d
 
 
+async def get_project_by_name(
+    db_path: str,
+    *,
+    project_name: str,
+) -> Optional[Dict[str, Any]]:
+    async with get_connection(db_path) as db:
+        db.row_factory = aiosqlite.Row
+        row = await db.execute_fetchone(
+            """
+            SELECT project_id, project_name, project_type, directory, embedding_dim, metadata, chunk_count, file_count, total_tokens, updated_at
+            FROM projects
+            WHERE project_name = ?
+            """,
+            (project_name,),
+        )
+        if not row:
+            return None
+        d = dict(row)
+        d["metadata"] = json.loads(d.get("metadata") or "{}")
+        return d
+
+
 async def reserve_internal_ids(db_path: str, project_id: str, count: int) -> List[int]:
     """Reserve 'count' new internal IDs for a project.
 
@@ -530,8 +566,11 @@ async def refresh_project_stats(db_path: str, project_id: str) -> None:
 def _sanitize_fts_query(query: str) -> str:
     if not query or not query.strip():
         return '""'
-    escaped = query.replace('"', '""')
-    return escaped
+    tokens = re.findall(r"[A-Za-z0-9_]+", query)
+    if not tokens:
+        return '""'
+    tokens = [t[:64] for t in tokens[:50]]
+    return " AND ".join(f'"{t}"' for t in tokens)
 
 
 async def fts_search(

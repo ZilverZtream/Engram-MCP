@@ -110,11 +110,57 @@ def chunk_lines(
     target_tokens: int,
     overlap_tokens: int,
 ) -> List[Chunk]:
-    text = "\n".join(lines)
-    return chunk_text(
-        text=text,
-        base_id=base_id,
-        meta=meta,
-        target_tokens=target_tokens,
-        overlap_tokens=overlap_tokens,
-    )
+    target_tokens = max(50, int(target_tokens))
+    overlap_tokens = max(0, int(overlap_tokens))
+    if overlap_tokens >= target_tokens:
+        overlap_tokens = max(0, target_tokens - 1)
+
+    tokenizer = _load_tokenizer()
+    max_chars = max(200_000, target_tokens * 20)
+    buffer = ""
+    chunks: List[Chunk] = []
+    idx_offset = 0
+
+    def _tail_text(text: str) -> str:
+        if overlap_tokens <= 0 or not text:
+            return ""
+        encoding = tokenizer.encode(text)
+        offsets = encoding.offsets
+        if not offsets:
+            return ""
+        if len(offsets) <= overlap_tokens:
+            return text
+        start = offsets[-overlap_tokens][0]
+        return text[start:]
+
+    def _flush(text: str) -> None:
+        nonlocal idx_offset
+        if not text.strip():
+            return
+        batch = chunk_text(
+            text=text,
+            base_id=base_id,
+            meta=meta,
+            target_tokens=target_tokens,
+            overlap_tokens=overlap_tokens,
+        )
+        if batch:
+            for c in batch:
+                c.metadata["chunk_index"] = int(c.metadata.get("chunk_index", 0)) + idx_offset
+            idx_offset += len(batch)
+            chunks.extend(batch)
+
+    for part in lines:
+        if part is None:
+            continue
+        buffer += part
+        if not buffer.endswith("\n"):
+            buffer += "\n"
+        if len(buffer) >= max_chars:
+            _flush(buffer)
+            buffer = _tail_text(buffer)
+
+    if buffer:
+        _flush(buffer)
+
+    return chunks

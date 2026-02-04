@@ -151,20 +151,24 @@ class Indexer:
             raise RuntimeError("Embedding cache did not resolve all vectors.")
         return np.vstack([v for v in vectors]).astype(np.float32)
 
-    async def _build_faiss_index(self, vectors: np.ndarray) -> Any:
+    async def _build_faiss_index(self, vectors: np.ndarray, *, total_vectors: Optional[int] = None) -> Any:
         import faiss
 
         d = int(vectors.shape[1])
+        n_vectors = int(total_vectors or vectors.shape[0])
+
+        if n_vectors < 10_000:
+            index = faiss.IndexFlatIP(d)
+            index = _ensure_id_map(index)
+            return index
+
         nlist = max(1, int(self.cfg.faiss_nlist))
-        m = max(1, int(self.cfg.faiss_m))
-        nbits = max(1, int(self.cfg.faiss_nbits))
+        nlist = min(nlist, max(1, n_vectors // 10))
         quantizer = faiss.IndexFlatIP(d)
-        index = faiss.IndexIVFPQ(
+        index = faiss.IndexIVFFlat(
             quantizer,
             d,
             nlist,
-            m,
-            nbits,
             faiss.METRIC_INNER_PRODUCT,
         )
         index.nprobe = max(1, int(self.cfg.faiss_nprobe))
@@ -174,6 +178,7 @@ class Indexer:
             faiss.normalize_L2(vectors)
             if not index.is_trained:
                 index.train(vectors)
+            _enable_direct_map(index)
             return index
 
         return await asyncio.to_thread(_train)
@@ -184,6 +189,7 @@ class Indexer:
         def _add() -> None:
             faiss.normalize_L2(vectors)
             index.add_with_ids(vectors, ids)
+            _enable_direct_map(index)
 
         await asyncio.to_thread(_add)
 
@@ -216,10 +222,22 @@ class Indexer:
 
     async def index_project(self, *, directory: str, project_name: str, project_type: str) -> str:
         await dbmod.init_db(self.cfg.db_path)
-
-        project_id = ProjectID(f"{_slug(project_name)}_{time.time_ns()}_{uuid.uuid4().hex[:8]}")
         directory = str(self.project_path_context.resolve_path(directory))
         directory_realpath = os.path.realpath(directory)
+        existing = await dbmod.get_project_by_name(self.cfg.db_path, project_name=project_name)
+        if existing:
+            metadata = existing.get("metadata") or {}
+            stored_realpath = metadata.get("directory_realpath") or os.path.realpath(
+                existing.get("directory") or ""
+            )
+            if stored_realpath and stored_realpath != directory_realpath:
+                raise ValueError(
+                    f"Project name '{project_name}' already exists for a different directory."
+                )
+            await self.update_project(project_id=str(existing["project_id"]))
+            return str(existing["project_id"])
+
+        project_id = ProjectID(f"{_slug(project_name)}_{time.time_ns()}_{uuid.uuid4().hex[:8]}")
 
         model_name = _pick_model_name(project_type, self.cfg)
         device = "cuda" if _cuda_available() else "cpu"
@@ -245,20 +263,8 @@ class Indexer:
                 rel = str(path.relative_to(directory))
                 async with sem:
                     try:
-                        if str(path.suffix).lower() == ".pdf":
-                            async with pdf_sem:
-                                chunks = await asyncio.to_thread(
-                                    parse_file_to_chunks,
-                                    path_context=self.project_path_context,
-                                    path=path,
-                                    root=directory,
-                                    project_type=project_type,
-                                    chunk_size_tokens=self.cfg.chunk_size_tokens,
-                                    overlap_tokens=self.cfg.overlap_tokens,
-                                    max_file_size_mb=self.cfg.max_file_size_mb,
-                                )
-                        else:
-                            chunks = await asyncio.to_thread(
+                        async def _parse() -> List[Any]:
+                            return await asyncio.to_thread(
                                 parse_file_to_chunks,
                                 path_context=self.project_path_context,
                                 path=path,
@@ -268,6 +274,12 @@ class Indexer:
                                 overlap_tokens=self.cfg.overlap_tokens,
                                 max_file_size_mb=self.cfg.max_file_size_mb,
                             )
+
+                        if str(path.suffix).lower() == ".pdf":
+                            async with pdf_sem:
+                                chunks = await asyncio.wait_for(_parse(), timeout=30)
+                        else:
+                            chunks = await asyncio.wait_for(_parse(), timeout=30)
                         content_hash = await asyncio.to_thread(
                             hash_file,
                             self.project_path_context,
@@ -365,7 +377,11 @@ class Indexer:
                     pending_file_rows.append(file_rows)
                     if sum(v.shape[0] for v in training_vectors) >= train_target:
                         train_vecs = np.vstack(training_vectors)
-                        index = await self._build_faiss_index(train_vecs)
+                        pending_total = sum(v.shape[0] for v in pending_vectors)
+                        index = await self._build_faiss_index(
+                            train_vecs,
+                            total_vectors=sum(v.shape[0] for v in training_vectors) + pending_total,
+                        )
                         for vec_batch, id_batch, row_batch, file_row_batch in zip(
                             pending_vectors, pending_ids, pending_rows, pending_file_rows
                         ):
@@ -428,7 +444,7 @@ class Indexer:
 
             if index is None:
                 train_vecs = np.vstack(training_vectors) if training_vectors else np.vstack(pending_vectors)
-                index = await self._build_faiss_index(train_vecs)
+                index = await self._build_faiss_index(train_vecs, total_vectors=total_chunks)
                 for vec_batch, id_batch, row_batch, file_row_batch in zip(
                     pending_vectors, pending_ids, pending_rows, pending_file_rows
                 ):
@@ -580,20 +596,8 @@ class Indexer:
                     mtime_ns, size_bytes, content_hash, path = current_files[rel_path]
                     async with sem:
                         try:
-                            if str(path.suffix).lower() == ".pdf":
-                                async with pdf_sem:
-                                    chunks = await asyncio.to_thread(
-                                        parse_file_to_chunks,
-                                        path_context=self.project_path_context,
-                                        path=path,
-                                        root=directory,
-                                        project_type=project_type,
-                                        chunk_size_tokens=self.cfg.chunk_size_tokens,
-                                        overlap_tokens=self.cfg.overlap_tokens,
-                                        max_file_size_mb=self.cfg.max_file_size_mb,
-                                    )
-                            else:
-                                chunks = await asyncio.to_thread(
+                            async def _parse() -> List[Any]:
+                                return await asyncio.to_thread(
                                     parse_file_to_chunks,
                                     path_context=self.project_path_context,
                                     path=path,
@@ -603,6 +607,12 @@ class Indexer:
                                     overlap_tokens=self.cfg.overlap_tokens,
                                     max_file_size_mb=self.cfg.max_file_size_mb,
                                 )
+
+                            if str(path.suffix).lower() == ".pdf":
+                                async with pdf_sem:
+                                    chunks = await asyncio.wait_for(_parse(), timeout=30)
+                            else:
+                                chunks = await asyncio.wait_for(_parse(), timeout=30)
                         except Exception:
                             logging.warning("Failed to parse %s", rel_path, exc_info=True)
                             return None
@@ -858,6 +868,7 @@ class Indexer:
         train_target = max(1000, int(self.cfg.faiss_nlist) * 20)
         shard_indexes: List[Optional[Any]] = [None] * shard_count
         shard_training: List[List[np.ndarray]] = [[] for _ in range(shard_count)]
+        shard_training_count: List[int] = [0 for _ in range(shard_count)]
         shard_pending_vecs: List[List[np.ndarray]] = [[] for _ in range(shard_count)]
         shard_pending_ids: List[List[np.ndarray]] = [[] for _ in range(shard_count)]
         batch_size = max(1, int(self.cfg.embedding_batch_size))
@@ -871,6 +882,17 @@ class Indexer:
             await self._add_vectors(shard_indexes[shard_id], vecs, ids)
             shard_pending_vecs[shard_id].clear()
             shard_pending_ids[shard_id].clear()
+
+        def _add_training(shard_id: int, vecs: np.ndarray) -> None:
+            if shard_training_count[shard_id] >= train_target:
+                return
+            remaining = train_target - shard_training_count[shard_id]
+            if remaining <= 0:
+                return
+            if vecs.shape[0] > remaining:
+                vecs = vecs[:remaining]
+            shard_training[shard_id].append(vecs)
+            shard_training_count[shard_id] += int(vecs.shape[0])
 
         while True:
             batch = await dbmod.fetch_chunk_batch(
@@ -901,14 +923,19 @@ class Indexer:
                 shard_vecs = vectors[positions]
                 shard_ids = np.asarray([ids[i] for i in positions], dtype=np.int64)
                 if shard_indexes[shard_id] is None:
-                    shard_training[shard_id].append(shard_vecs)
+                    _add_training(shard_id, shard_vecs)
                     shard_pending_vecs[shard_id].append(shard_vecs)
                     shard_pending_ids[shard_id].append(shard_ids)
-                    if sum(v.shape[0] for v in shard_training[shard_id]) >= train_target:
+                    if shard_training_count[shard_id] >= train_target:
                         train_vecs = np.vstack(shard_training[shard_id])
-                        shard_indexes[shard_id] = await self._build_faiss_index(train_vecs)
+                        estimated_total = int(math.ceil(chunk_count / shard_count))
+                        shard_indexes[shard_id] = await self._build_faiss_index(
+                            train_vecs,
+                            total_vectors=estimated_total,
+                        )
                         await _flush_pending(shard_id)
                         shard_training[shard_id].clear()
+                        shard_training_count[shard_id] = 0
                 else:
                     shard_pending_vecs[shard_id].append(shard_vecs)
                     shard_pending_ids[shard_id].append(shard_ids)
@@ -919,7 +946,11 @@ class Indexer:
                 if not shard_pending_vecs[shard_id]:
                     continue
                 train_vecs = np.vstack(shard_training[shard_id] or shard_pending_vecs[shard_id])
-                shard_indexes[shard_id] = await self._build_faiss_index(train_vecs)
+                estimated_total = int(math.ceil(chunk_count / shard_count))
+                shard_indexes[shard_id] = await self._build_faiss_index(
+                    train_vecs,
+                    total_vectors=estimated_total,
+                )
             await _flush_pending(shard_id)
 
         async with rwlock.write_lock():
@@ -984,7 +1015,9 @@ def _load_faiss(path: str) -> Any:
     import faiss
 
     index = faiss.read_index(path)
-    return _ensure_id_map(index)
+    index = _ensure_id_map(index)
+    _enable_direct_map(index)
+    return index
 
 
 def _ensure_id_map(index: Any) -> Any:
@@ -993,6 +1026,21 @@ def _ensure_id_map(index: Any) -> Any:
     if isinstance(index, faiss.IndexIDMap2):
         return index
     return faiss.IndexIDMap2(index)
+
+
+def _enable_direct_map(index: Any) -> None:
+    if hasattr(index, "make_direct_map"):
+        try:
+            index.make_direct_map()
+        except Exception:
+            pass
+        return
+    inner = getattr(index, "index", None)
+    if inner is not None and hasattr(inner, "make_direct_map"):
+        try:
+            inner.make_direct_map()
+        except Exception:
+            pass
 
 
 def _save_faiss(index: Any, path_context: PathContext, path: str) -> None:
