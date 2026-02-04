@@ -154,17 +154,25 @@ def load_config(path: Optional[str] = None) -> EngramConfig:
     """
 
     if path is None:
-        # 1) Honour an explicit environment variable.
+        # 1) Honour an explicit environment variable *only* if it lives
+        #    under the user-scoped config directory.
         # 2) Fall back to the user-scoped config directory so that an
         #    attacker who drops a crafted engram_mcp.yaml into a shared
         #    /tmp or a cloned repo cannot silently alter allowed_roots.
         env_path = os.environ.get("ENGRAM_CONFIG_PATH")
+        user_config_dir = os.path.realpath(os.path.join(os.path.expanduser("~"), ".config", "engram"))
         if env_path:
-            path = env_path
-        else:
-            path = os.path.join(
-                os.path.expanduser("~"), ".config", "engram", "engram_mcp.yaml"
-            )
+            env_real = os.path.realpath(env_path)
+            if env_real == user_config_dir or env_real.startswith(user_config_dir + os.sep):
+                path = env_path
+            else:
+                logging.warning(
+                    "Ignoring ENGRAM_CONFIG_PATH outside %s; using default user config path.",
+                    user_config_dir,
+                )
+                env_path = None
+        if not env_path:
+            path = os.path.join(user_config_dir, "engram_mcp.yaml")
 
     cfg = EngramConfig()
     config_root = os.path.dirname(os.path.abspath(path)) or os.getcwd()
