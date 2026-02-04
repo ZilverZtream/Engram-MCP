@@ -1111,6 +1111,20 @@ async def mark_stale_jobs_failed(db_path: str, *, error: str) -> None:
         await db.commit()
 
 
+async def mark_jobs_shutdown(db_path: str, *, error: str) -> None:
+    async with get_connection(db_path) as db:
+        await db.execute(
+            """
+            UPDATE jobs
+            SET error = ?,
+                updated_at = datetime('now')
+            WHERE status IN ('QUEUED', 'PROCESSING')
+            """,
+            (error,),
+        )
+        await db.commit()
+
+
 async def upsert_embedding_cache(
     db_path: str,
     *,

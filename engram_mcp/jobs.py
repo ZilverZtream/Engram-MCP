@@ -135,6 +135,7 @@ class JobManager:
         return out
 
     async def shutdown(self, *, timeout_s: float = 5.0) -> None:
+        await self.mark_shutdown(reason="Shutdown in progress.")
         self._shutting_down = True
         async with self._lock:
             tasks = [job.task for job in self._jobs.values()]
@@ -146,3 +147,8 @@ class JobManager:
             await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=timeout_s)
         except asyncio.TimeoutError:
             pass
+
+    async def mark_shutdown(self, *, reason: str) -> None:
+        self._shutting_down = True
+        await dbmod.init_db(self._db_path)
+        await dbmod.mark_jobs_shutdown(self._db_path, error=reason)

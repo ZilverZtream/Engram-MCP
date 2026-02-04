@@ -5,6 +5,7 @@ import hashlib
 import importlib.util
 import logging
 import os
+import stat
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -170,6 +171,7 @@ def apply_mmr(results: List[Dict[str, Any]], query_vec: np.ndarray, k: int, mmr_
 _search_cache: OrderedDict[str, Tuple[float, List[Dict[str, Any]]]] = OrderedDict()
 _cache_ttl = 300.0
 _cache_max_items = 512
+_cache_enabled = True
 _cache_lock = asyncio.Lock()
 _faiss_cache: OrderedDict[str, Tuple[float, Any]] = OrderedDict()
 _faiss_cache_max_items = 8
@@ -179,6 +181,20 @@ _faiss_cache_lock = asyncio.Lock()
 async def invalidate_faiss_cache(index_path: str) -> None:
     async with _faiss_cache_lock:
         _faiss_cache.pop(index_path, None)
+
+
+async def invalidate_search_cache_project(project_id: str) -> None:
+    prefix = f"{project_id}:"
+    async with _cache_lock:
+        for key in [k for k in _search_cache if k.startswith(prefix)]:
+            _search_cache.pop(key, None)
+
+
+def configure_search_cache(*, ttl_s: float, max_items: int) -> None:
+    global _cache_ttl, _cache_max_items, _cache_enabled
+    _cache_ttl = max(0.0, float(ttl_s))
+    _cache_max_items = max(0, int(max_items))
+    _cache_enabled = _cache_ttl > 0 and _cache_max_items > 0
 
 
 _rrf_scores_impl = _rrf_scores_numpy
@@ -191,6 +207,8 @@ class SearchEngine:
     index_dir: str
     index_path_context: PathContext
     faiss_available: bool = field(default_factory=is_faiss_available)
+    vector_backend: str = "auto"
+    _gpu_resources: Any = field(default=None, init=False, repr=False)
 
     async def _load_faiss(self, project_id: str):
         if not self.faiss_available:
@@ -204,34 +222,40 @@ class SearchEngine:
         if not self.faiss_available:
             raise RuntimeError("Vector search unavailable (faiss not installed).")
         import faiss
+        safe_path = self.index_path_context.ensure_allowed_nofollow(index_path)
+        try:
+            st = self.index_path_context.lstat(safe_path)
+        except FileNotFoundError as exc:
+            raise FileNotFoundError(f"FAISS index not found: {safe_path}") from exc
+        if stat.S_ISLNK(st.st_mode):
+            raise RuntimeError(f"Refusing to load FAISS index symlink: {safe_path}")
 
-        if not self.index_path_context.exists(index_path):
-            raise FileNotFoundError(f"FAISS index not found: {index_path}")
-
-        index_mtime = self.index_path_context.stat(index_path).st_mtime
+        index_mtime = st.st_mtime
         async with _faiss_cache_lock:
-            cached = _faiss_cache.get(index_path)
+            cached = _faiss_cache.get(safe_path)
             if cached and cached[0] == index_mtime:
-                _faiss_cache.move_to_end(index_path)
+                _faiss_cache.move_to_end(safe_path)
                 return cached[1]
-            _faiss_cache.pop(index_path, None)
+            _faiss_cache.pop(safe_path, None)
 
         # --- Fix #7: memory-mapped load ---
         # IO_FLAG_MMAP tells FAISS to mmap the file; the OS pages in only
         # the regions actually touched during search.  For large IVF
         # indices this avoids loading the entire file into resident RAM.
         def _load():
-            return faiss.read_index(index_path, faiss.IO_FLAG_MMAP)
+            return faiss.read_index(safe_path, faiss.IO_FLAG_MMAP)
 
         loop = asyncio.get_running_loop()
         index = await loop.run_in_executor(None, _load)
+        if self.vector_backend == "faiss_gpu":
+            index = self._maybe_to_gpu(index)
 
         # --- Fix #12: UUID integrity check ---
         # A companion .uuid file is written beside every FAISS index file
         # when it is saved.  If the file and the project metadata disagree
         # the index and DB have diverged (e.g. one was deleted manually);
         # refuse to serve stale / ghost results.
-        uuid_path = index_path + ".uuid"
+        uuid_path = safe_path + ".uuid"
         if self.index_path_context.exists(uuid_path):
             try:
                 with self.index_path_context.open_file(uuid_path, "r", encoding="utf-8") as uf:
@@ -250,11 +274,27 @@ class SearchEngine:
                 logging.warning("UUID verification skipped for %s", index_path, exc_info=True)
 
         async with _faiss_cache_lock:
-            _faiss_cache[index_path] = (index_mtime, index)
-            _faiss_cache.move_to_end(index_path)
+            _faiss_cache[safe_path] = (index_mtime, index)
+            _faiss_cache.move_to_end(safe_path)
             while len(_faiss_cache) > _faiss_cache_max_items:
                 _faiss_cache.popitem(last=False)
         return index
+
+    def _maybe_to_gpu(self, index: Any) -> Any:
+        import faiss
+
+        if hasattr(faiss, "GpuIndex") and isinstance(index, faiss.GpuIndex):
+            return index
+        if not hasattr(faiss, "index_cpu_to_gpu") or not hasattr(faiss, "StandardGpuResources"):
+            logging.warning("FAISS GPU backend requested but GPU APIs are unavailable.")
+            return index
+        if self._gpu_resources is None:
+            self._gpu_resources = faiss.StandardGpuResources()
+        try:
+            return faiss.index_cpu_to_gpu(self._gpu_resources, 0, index)
+        except Exception:
+            logging.warning("Failed to move FAISS index to GPU; using CPU index.", exc_info=True)
+            return index
 
     async def _reconstruct_embeddings(
         self,
@@ -406,13 +446,14 @@ class SearchEngine:
             f"{fts_top_k}:{vector_top_k}:{return_k}:{enable_mmr}:{mmr_lambda}:{mode}:{vector_enabled}".encode("utf-8")
         ).hexdigest()
         cache_key = f"{project_id}:{hashlib.sha256(query.encode('utf-8')).hexdigest()}:{params_hash}"
-        async with _cache_lock:
-            cached = _search_cache.get(cache_key)
-            if cached and (time.time() - cached[0]) < _cache_ttl:
-                _search_cache.move_to_end(cache_key)
-                return cached[1]
-            if cached:
-                _search_cache.pop(cache_key, None)
+        if _cache_enabled:
+            async with _cache_lock:
+                cached = _search_cache.get(cache_key)
+                if cached and (time.time() - cached[0]) < _cache_ttl:
+                    _search_cache.move_to_end(cache_key)
+                    return cached[1]
+                if cached:
+                    _search_cache.pop(cache_key, None)
 
         rwlock = await get_project_rwlock(project_id)
         async with rwlock.read_lock():
@@ -470,9 +511,10 @@ class SearchEngine:
 
         # bump access counts best-effort
         await dbmod.bump_access_counts(self.db_path, project_id, [r["id"] for r in combined])
-        async with _cache_lock:
-            _search_cache[cache_key] = (time.time(), combined)
-            _search_cache.move_to_end(cache_key)
-            while len(_search_cache) > _cache_max_items:
-                _search_cache.popitem(last=False)
+        if _cache_enabled:
+            async with _cache_lock:
+                _search_cache[cache_key] = (time.time(), combined)
+                _search_cache.move_to_end(cache_key)
+                while len(_search_cache) > _cache_max_items:
+                    _search_cache.popitem(last=False)
         return combined

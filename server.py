@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import atexit
 import asyncio
+import importlib.util
 import logging
 import os
 import signal
+import stat
 import time
 from typing import Any, Dict, Optional
 
@@ -15,7 +17,13 @@ from engram_mcp.embeddings import EmbeddingService
 from engram_mcp.indexing import Indexer, ensure_index_permissions
 from engram_mcp.locks import get_project_lock, get_project_rwlock, remove_project_lock, remove_project_rwlock
 from engram_mcp.jobs import JobManager
-from engram_mcp.search import SearchEngine, configure_numba
+from engram_mcp.search import (
+    SearchEngine,
+    configure_numba,
+    configure_search_cache,
+    invalidate_search_cache_project,
+    is_faiss_available,
+)
 from engram_mcp.security import PathContext, PathNotAllowed, ProjectID, validate_project_field
 from engram_mcp import db as dbmod
 from engram_mcp import chunking
@@ -23,7 +31,10 @@ from engram_mcp import chunking
 
 cfg = load_config()
 dbmod.ensure_db_permissions(cfg.db_path)
+if cfg.enable_numba:
+    logging.info("Numba enabled; compiling optimization kernels...")
 configure_numba(bool(cfg.enable_numba), warmup=bool(cfg.enable_numba))
+configure_search_cache(ttl_s=float(cfg.search_cache_ttl_s), max_items=int(cfg.search_cache_max_items))
 
 mcp = FastMCP(name="Engram MCP")
 
@@ -41,10 +52,42 @@ embedding_service = EmbeddingService(
 )
 jobs = JobManager(cfg.db_path)
 indexer = Indexer(cfg, embedding_service, project_path_context, index_path_context)
+
+
+def _faiss_gpu_available() -> bool:
+    if not is_faiss_available():
+        return False
+    import faiss
+
+    if hasattr(faiss, "get_num_gpus"):
+        return faiss.get_num_gpus() > 0
+    return False
+
+
+def _resolve_vector_backend() -> tuple[str, bool, str]:
+    requested = str(cfg.vector_backend or "auto").lower()
+    if requested == "fts":
+        return "fts", False, "disabled by config"
+    if not is_faiss_available():
+        return "fts", False, "faiss not installed"
+    if requested == "faiss_gpu":
+        if _faiss_gpu_available():
+            return "faiss_gpu", True, "GPU enabled"
+        return "faiss_cpu", True, "GPU unavailable; using CPU"
+    if requested == "faiss_cpu":
+        return "faiss_cpu", True, "CPU enabled"
+    if _faiss_gpu_available():
+        return "faiss_gpu", True, "auto (GPU available)"
+    return "faiss_cpu", True, "auto (CPU)"
+
+
+_vector_backend, _vector_enabled, _vector_reason = _resolve_vector_backend()
 search_engine = SearchEngine(
     db_path=cfg.db_path,
     index_dir=cfg.index_dir,
     index_path_context=index_path_context,
+    faiss_available=_vector_enabled,
+    vector_backend=_vector_backend,
 )
 
 
@@ -56,6 +99,30 @@ async def _startup_tasks() -> None:
         ttl_s=int(cfg.embedding_cache_ttl_s),
         max_rows=int(cfg.embedding_cache_max_rows),
     )
+    _log_startup_status()
+
+
+def _log_startup_status() -> None:
+    logging.info("Storage: db=%s index_dir=%s", cfg.db_path, cfg.index_dir)
+    if _vector_enabled:
+        logging.info("Vector search: enabled (%s).", _vector_backend)
+    else:
+        logging.info(
+            "Vector search: disabled (%s). Install: pipx install \"engram-mcp[cpu]\"",
+            _vector_reason,
+        )
+    if cfg.enable_numba:
+        logging.info("Numba optimizations: enabled.")
+    else:
+        logging.info("Numba optimizations: disabled (set enable_numba: true to enable).")
+    if cfg.search_cache_ttl_s and cfg.search_cache_max_items:
+        logging.info(
+            "Search cache: enabled (ttl=%ss max_items=%s).",
+            cfg.search_cache_ttl_s,
+            cfg.search_cache_max_items,
+        )
+    else:
+        logging.info("Search cache: disabled.")
 
 
 def _schedule_startup_tasks() -> None:
@@ -162,12 +229,11 @@ if not _uses_asyncio_signals:
 
 
 def _device() -> str:
-    try:
-        import torch
-
-        return "cuda" if torch.cuda.is_available() else "cpu"
-    except Exception:
+    if importlib.util.find_spec("torch") is None:
         return "cpu"
+    import torch
+
+    return "cuda" if torch.cuda.is_available() else "cpu"
 
 
 @mcp.tool
@@ -404,11 +470,19 @@ async def project_health(project_id: str) -> Dict[str, Any]:
         faiss_totals = []
         uuid_mismatches = []
         missing_files = []
+        import faiss
+
         for path in index_paths:
-            if not index_path_context.exists(path):
-                missing_files.append(path)
+            try:
+                safe_path = index_path_context.ensure_allowed_nofollow(path)
+                st = index_path_context.lstat(safe_path)
+            except Exception as exc:
+                missing_files.append(f"{path} ({exc})")
                 continue
-            uuid_path = path + ".uuid"
+            if stat.S_ISLNK(st.st_mode):
+                missing_files.append(f"{safe_path} (symlink not allowed)")
+                continue
+            uuid_path = safe_path + ".uuid"
             if index_path_context.exists(uuid_path) and index_uuid:
                 try:
                     with index_path_context.open_file(uuid_path, "r", encoding="utf-8") as uf:
@@ -418,12 +492,10 @@ async def project_health(project_id: str) -> Dict[str, Any]:
                 except Exception as exc:
                     uuid_mismatches.append({"path": path, "error": str(exc)})
             try:
-                import faiss
-
-                index = faiss.read_index(path, faiss.IO_FLAG_MMAP)
+                index = faiss.read_index(safe_path, faiss.IO_FLAG_MMAP)
                 faiss_totals.append(int(getattr(index, "ntotal", 0)))
             except Exception as exc:
-                missing_files.append(f"{path} ({exc})")
+                missing_files.append(f"{safe_path} ({exc})")
                 continue
 
     return {
@@ -454,6 +526,7 @@ async def repair_project(project_id: str) -> str:
     async with lock:
         async with rwlock.write_lock():
             await indexer._rebuild_index_from_db(project_id=project_id, metadata=metadata)
+    await invalidate_search_cache_project(project_id)
     return f"✅ Rebuilt FAISS index for {project_id}"
 
 
@@ -499,9 +572,9 @@ async def delete_project(project_id: str) -> str:
                     except Exception as exc:
                         failures.append(f"{path} ({exc})")
             try:
-                for path in index_path_context.iter_files(cfg.index_dir):
-                    name = path.name
+                for name in index_path_context.list_dir(cfg.index_dir):
                     if name.startswith(f"{project_id}.") and ".index.current" in name:
+                        path = os.path.join(cfg.index_dir, name)
                         try:
                             index_path_context.unlink(path)
                         except Exception as exc:
@@ -511,11 +584,16 @@ async def delete_project(project_id: str) -> str:
             if failures:
                 return "❌ Failed to delete index artifacts: " + ", ".join(failures)
             await dbmod.delete_project(cfg.db_path, project_id)
+            await invalidate_search_cache_project(project_id)
     await remove_project_lock(project_id)
     await remove_project_rwlock(project_id)
     return f"✅ Deleted {project_id}"
 
 
+def main() -> None:
+    mcp.run()
+
+
 if __name__ == "__main__":
     # Stdio transport by default
-    mcp.run()
+    main()

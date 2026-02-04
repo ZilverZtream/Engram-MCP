@@ -58,9 +58,12 @@ class EngramConfig:
     return_k: int = 10
     enable_mmr: bool = True
     mmr_lambda: float = 0.7
-    enable_numba: bool = True
+    enable_numba: bool = False
     max_query_chars: int = 4096
     max_query_tokens: int = 256
+    search_cache_ttl_s: int = 300
+    search_cache_max_items: int = 512
+    vector_backend: str = "auto"
 
     # Embeddings
     model_name_text: str = "paraphrase-multilingual-MiniLM-L12-v2"
@@ -116,9 +119,12 @@ class AllowedConfig(BaseModel):
     return_k: int = 10
     enable_mmr: bool = True
     mmr_lambda: float = 0.7
-    enable_numba: bool = True
+    enable_numba: bool = False
     max_query_chars: int = 4096
     max_query_tokens: int = 256
+    search_cache_ttl_s: int = 300
+    search_cache_max_items: int = 512
+    vector_backend: str = "auto"
 
     # Embeddings
     model_name_text: str = "paraphrase-multilingual-MiniLM-L12-v2"
@@ -149,6 +155,15 @@ class AllowedConfig(BaseModel):
         if int(value) >= int(chunk_size):
             raise ValueError("overlap_tokens must be less than chunk_size_tokens")
         return value
+
+    @field_validator("vector_backend")
+    @classmethod
+    def validate_vector_backend(cls, value: str) -> str:
+        allowed = {"auto", "fts", "faiss_cpu", "faiss_gpu"}
+        normalized = str(value or "").lower()
+        if normalized not in allowed:
+            raise ValueError(f"vector_backend must be one of {sorted(allowed)}")
+        return normalized
 
 
 def load_config(path: Optional[str] = None) -> EngramConfig:

@@ -8,6 +8,7 @@ import re
 import time
 import uuid
 import logging
+import stat
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -31,7 +32,7 @@ from .parsing import (
 # of vectors regardless of file size.
 _PERSIST_BATCH_SIZE = 100
 from .locks import get_project_lock, get_project_rwlock
-from .search import invalidate_faiss_cache, is_faiss_available
+from .search import invalidate_faiss_cache, invalidate_search_cache_project, is_faiss_available
 from .security import PathContext, ProjectID, validate_project_field
 from . import db as dbmod
 
@@ -234,6 +235,7 @@ class Indexer:
 
                 await dbmod.refresh_project_stats(self.cfg.db_path, str(project_id))
                 await dbmod.set_file_count(self.cfg.db_path, str(project_id), file_count)
+                await invalidate_search_cache_project(str(project_id))
                 return str(project_id)
             except BaseException:
                 if project_initialized:
@@ -383,6 +385,7 @@ class Indexer:
                 index_dirty=1,
                 deleting=proj.get("deleting") or 0,
             )
+            await invalidate_search_cache_project(str(project))
             return {"added": added_count, "deleted": len(to_delete_chunk_ids)}
         except BaseException:
             if added_chunk_ids:
@@ -888,6 +891,7 @@ class Indexer:
             proj = await dbmod.get_project(self.cfg.db_path, str(project_id))
             shard_count = int((proj or {}).get("metadata", {}).get("shard_count") or 1)
             await self._sync_project_artifacts(project_id=project_id, shard_count=shard_count)
+            await invalidate_search_cache_project(str(project_id))
             return str(project_id)
         except BaseException:
             if project_initialized:
@@ -943,6 +947,7 @@ class Indexer:
                 project_id,
             )
             await self._rebuild_index_from_db(project_id=str(project), metadata=metadata)
+            await invalidate_search_cache_project(str(project))
             # Re-fetch metadata in case UUID was regenerated
             proj = await dbmod.get_project(self.cfg.db_path, str(project))
             metadata = proj.get("metadata") or {}
@@ -1084,7 +1089,11 @@ class Indexer:
                     shard_indexes: List[Any] = []
                     for current_path, _ in shard_paths:
                         if self.index_path_context.exists(current_path):
-                            shard_indexes.append(await asyncio.to_thread(_load_faiss, current_path))
+                            shard_indexes.append(
+                                await asyncio.to_thread(
+                                    _load_faiss, current_path, path_context=self.index_path_context
+                                )
+                            )
                         else:
                             shard_indexes.append(None)
 
@@ -1184,7 +1193,9 @@ class Indexer:
                     index_current, index_new = _index_paths(self.cfg.index_dir, project)
                     index_path = index_current
                     async with rwlock.write_lock():
-                        index = await asyncio.to_thread(_load_faiss, index_path)
+                        index = await asyncio.to_thread(
+                            _load_faiss, index_path, path_context=self.index_path_context
+                        )
                         if internal_ids_to_delete:
                             index.remove_ids(np.asarray(internal_ids_to_delete, dtype=np.int64))
                         async for parsed in _bounded_gather(
@@ -1261,6 +1272,7 @@ class Indexer:
                 proj = await dbmod.get_project(self.cfg.db_path, str(project))
                 shard_count = int((proj or {}).get("metadata", {}).get("shard_count") or 1)
                 await self._sync_project_artifacts(project_id=project, shard_count=shard_count)
+                await invalidate_search_cache_project(str(project))
                 return {"added": added_count, "deleted": len(to_delete_chunk_ids)}
             except BaseException:
                 if added_chunk_ids:
@@ -1287,7 +1299,11 @@ class Indexer:
         shard_indexes: List[Any] = []
         for current_path, _ in shard_paths:
             if self.index_path_context.exists(current_path):
-                shard_indexes.append(await asyncio.to_thread(_load_faiss, current_path))
+                shard_indexes.append(
+                    await asyncio.to_thread(
+                        _load_faiss, current_path, path_context=self.index_path_context
+                    )
+                )
             else:
                 shard_indexes.append(None)
 
@@ -1751,9 +1767,15 @@ def _index_artifacts(index_dir: str, project_id: ProjectID, shard_count: int) ->
     return artifacts
 
 
-def _load_faiss(path: str) -> Any:
+def _load_faiss(path: str, *, path_context: Optional[PathContext] = None) -> Any:
     import faiss
 
+    if path_context is not None:
+        safe_path = path_context.ensure_allowed_nofollow(path)
+        st = path_context.lstat(safe_path)
+        if stat.S_ISLNK(st.st_mode):
+            raise RuntimeError(f"Refusing to load FAISS index symlink: {safe_path}")
+        path = safe_path
     index = faiss.read_index(path, faiss.IO_FLAG_MMAP)
     index = _ensure_id_map(index)
     _enable_direct_map(index)
@@ -1870,3 +1892,21 @@ async def ensure_index_permissions(path_context: PathContext, index_dir: str, *,
             path_context.chmod(path, 0o600)
         except OSError:
             logging.debug("Failed to chmod index artifact %s", path, exc_info=True)
+    try:
+        index_pattern = re.compile(r".+\\.index\\.(current|new|tmp|backup)(\\.uuid)?$")
+        for name in path_context.list_dir(index_dir):
+            if not index_pattern.match(name):
+                continue
+            candidate = os.path.join(index_dir, name)
+            try:
+                st = path_context.lstat(candidate)
+            except Exception:
+                continue
+            if stat.S_ISLNK(st.st_mode):
+                continue
+            try:
+                path_context.chmod(candidate, 0o600)
+            except OSError:
+                logging.debug("Failed to chmod index artifact %s", candidate, exc_info=True)
+    except Exception:
+        logging.debug("Failed to chmod stray index artifacts in %s", index_dir, exc_info=True)

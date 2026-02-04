@@ -84,11 +84,32 @@ engram_mcp/
 
 ## 🚀 Quick Start
 
-### 1️⃣ Clone the repository
+### 1️⃣ Install Engram MCP (pipx or uv)
+
+**pipx (recommended for CLI usage)**
 ```bash
-git clone https://github.com/yourname/engram-mcp.git
-cd engram-mcp
+pipx install engram-mcp
+engram-mcp
 ```
+
+Enable vector search with FAISS CPU (optional):
+```bash
+pipx install "engram-mcp[cpu]"
+```
+
+Enable FAISS GPU builds (optional, Linux-first support):
+```bash
+pipx install "engram-mcp[gpu]"
+```
+
+**uv (fast, reproducible dev install)**
+```bash
+uv venv
+uv pip install -e ".[cpu]"
+uv run engram-mcp
+```
+
+> Base installs are **FTS-only** (no FAISS, no Numba JIT). CPU/GPU extras enable vector search.
 
 ---
 
@@ -121,23 +142,35 @@ allowed_roots:
 
 ---
 
-### 3️⃣ Install dependencies
+### 3️⃣ Run the server
 ```bash
-pip install -r requirements.txt
+engram-mcp
 ```
 
-Dependencies are resolved **at install time**.  
 SentenceTransformers models are downloaded on first use unless you pre-download them (for air‑gapped setups, cache the models or point `model_name_*` to a local path).  
 No surprises once the model cache is in place.
 
+Engram MCP is now available to MCP‑compatible clients.
+
 ---
 
-### 4️⃣ Run the server
-```bash
-python server.py
+## ⚙️ Runtime Modes & Dependencies
+
+Engram MCP starts in **FTS-only** mode by default (no FAISS, no Numba). Vector search is enabled when FAISS is installed.
+
+Optional config flags in `engram_mcp.yaml`:
+```yaml
+vector_backend: auto   # auto | fts | faiss_cpu | faiss_gpu
+enable_numba: false    # opt-in JIT kernels
+search_cache_ttl_s: 300
+search_cache_max_items: 512
 ```
 
-Engram MCP is now available to MCP‑compatible clients.
+On startup, Engram logs:
+- storage paths (DB/index)
+- vector search mode (and how to enable)
+- numba status
+- search cache status
 
 ---
 
