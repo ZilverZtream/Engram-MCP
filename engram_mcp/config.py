@@ -41,7 +41,7 @@ class EngramConfig:
 
     # Indexing behavior
     ignore_patterns: List[str] = field(default_factory=lambda: list(DEFAULT_IGNORE_PATTERNS))
-    max_file_size_mb: int = 200
+    max_file_size_mb: int = 50
     chunk_size_tokens: int = 200
     overlap_tokens: int = 30
 
@@ -102,7 +102,7 @@ class AllowedConfig(BaseModel):
 
     # Indexing behavior
     ignore_patterns: List[str] = list(DEFAULT_IGNORE_PATTERNS)
-    max_file_size_mb: int = 200
+    max_file_size_mb: int = 50
     chunk_size_tokens: int = 200
     overlap_tokens: int = 30
 
@@ -241,7 +241,7 @@ def load_config(path: Optional[str] = None) -> EngramConfig:
 
 def _default_data_dir() -> str:
     if os.name == "nt":
-        base = os.environ.get("APPDATA") or os.path.expanduser("~")
+        base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA") or os.path.expanduser("~")
         return os.path.join(base, "engram")
     if sys.platform == "darwin":
         return os.path.join(os.path.expanduser("~"), "Library", "Application Support", "engram")

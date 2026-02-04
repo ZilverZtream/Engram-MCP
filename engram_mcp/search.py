@@ -218,6 +218,15 @@ class SearchEngine:
         index_path = os.path.join(self.index_dir, str(project) + ".index.current")
         return await self._load_faiss_path(project_id, index_path)
 
+    async def unload_project(self, project_id: str) -> None:
+        project = ProjectID(project_id)
+        prefix = f"{project}."
+        async with _faiss_cache_lock:
+            for path in list(_faiss_cache.keys()):
+                name = os.path.basename(path)
+                if name.startswith(prefix) and name.endswith(".index.current"):
+                    _faiss_cache.pop(path, None)
+
     async def _load_faiss_path(self, project_id: str, index_path: str):
         if not self.faiss_available:
             raise RuntimeError("Vector search unavailable (faiss not installed).")
