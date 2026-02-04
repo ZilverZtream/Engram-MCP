@@ -1117,6 +1117,7 @@ async def upsert_embedding_cache(
     model_name: str,
     rows: List[Tuple[str, bytes]],
     ttl_s: int = 0,
+    max_rows: int = 0,
 ) -> None:
     if not rows:
         return
@@ -1132,16 +1133,81 @@ async def upsert_embedding_cache(
             """,
             [(content_hash, embedding, model_name) for content_hash, embedding in rows],
         )
-        if int(ttl_s) > 0:
-            await db.execute(
-                """
-                DELETE FROM embedding_cache
-                WHERE model_name = ?
-                  AND created_at < datetime('now', ?)
-                """,
-                (model_name, "-" + str(int(ttl_s)) + " seconds"),
-            )
         await db.commit()
+    await prune_embedding_cache(db_path, ttl_s=ttl_s, max_rows=max_rows)
+
+
+async def prune_embedding_cache(
+    db_path: str,
+    *,
+    ttl_s: int = 0,
+    max_rows: int = 0,
+    model_name: Optional[str] = None,
+) -> int:
+    ttl_s = int(ttl_s)
+    max_rows = int(max_rows)
+    if ttl_s <= 0 and max_rows <= 0:
+        return 0
+    deleted = 0
+    async with get_connection(db_path) as db:
+        if ttl_s > 0:
+            if model_name:
+                result = await db.execute(
+                    """
+                    DELETE FROM embedding_cache
+                    WHERE model_name = ?
+                      AND created_at < datetime('now', ?)
+                    """,
+                    (model_name, "-" + str(ttl_s) + " seconds"),
+                )
+            else:
+                result = await db.execute(
+                    """
+                    DELETE FROM embedding_cache
+                    WHERE created_at < datetime('now', ?)
+                    """,
+                    ("-" + str(ttl_s) + " seconds",),
+                )
+            deleted += result.rowcount if result.rowcount is not None else 0
+        if max_rows > 0:
+            if model_name:
+                row = await db.execute_fetchone(
+                    "SELECT COUNT(*) FROM embedding_cache WHERE model_name = ?",
+                    (model_name,),
+                )
+            else:
+                row = await db.execute_fetchone("SELECT COUNT(*) FROM embedding_cache")
+            count = int(row[0]) if row else 0
+            if count > max_rows:
+                to_delete = count - max_rows
+                if model_name:
+                    result = await db.execute(
+                        """
+                        DELETE FROM embedding_cache
+                        WHERE content_hash IN (
+                            SELECT content_hash FROM embedding_cache
+                            WHERE model_name = ?
+                            ORDER BY created_at ASC
+                            LIMIT ?
+                        )
+                        """,
+                        (model_name, to_delete),
+                    )
+                else:
+                    result = await db.execute(
+                        """
+                        DELETE FROM embedding_cache
+                        WHERE content_hash IN (
+                            SELECT content_hash FROM embedding_cache
+                            ORDER BY created_at ASC
+                            LIMIT ?
+                        )
+                        """,
+                        (to_delete,),
+                    )
+                deleted += result.rowcount if result.rowcount is not None else 0
+        await db.commit()
+    return deleted
 
 
 async def create_job(

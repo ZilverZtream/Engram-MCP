@@ -12,3 +12,6 @@ allowed_roots:
 # overlap_tokens: 30
 # max_file_size_mb: 200
 # embedding_batch_size: 128
+# embedding_cache_ttl_s: 0
+# embedding_cache_max_rows: 0
+# enable_numba: true

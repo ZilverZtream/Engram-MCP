@@ -1,3 +1,4 @@
+import asyncio
 import os
 import pytest
 
@@ -24,7 +25,8 @@ def test_index_permissions(tmp_path):
     index_path = tmp_path / "proj.index.current"
     indexing._save_faiss(index, path_context, str(index_path))
     indexing._write_index_uuid(path_context, str(index_path), "abc123")
-    indexing.ensure_index_permissions(path_context, str(tmp_path))
+    db_path = tmp_path / "memory.db"
+    asyncio.run(indexing.ensure_index_permissions(path_context, str(tmp_path), db_path=str(db_path)))
     index_mode = index_path.stat().st_mode & 0o777
     uuid_mode = (tmp_path / "proj.index.current.uuid").stat().st_mode & 0o777
     assert index_mode == 0o600

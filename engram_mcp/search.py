@@ -2,23 +2,54 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import importlib.util
 import logging
 import os
 import time
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
-from numba import jit
+
+_NUMBA_AVAILABLE = importlib.util.find_spec("numba") is not None
+if _NUMBA_AVAILABLE:
+    from numba import jit as _numba_jit
+else:
+    _numba_jit = None
 
 from . import db as dbmod
 from .locks import get_project_rwlock
 from .security import PathContext, ProjectID
 
+_NUMBA_ENABLED = False
+_FAISS_AVAILABLE: Optional[bool] = None
 
-@jit(nopython=True)
-def _rrf_scores(bm25_indices: np.ndarray, vec_indices: np.ndarray, k: int = 60) -> np.ndarray:
+
+def is_faiss_available() -> bool:
+    global _FAISS_AVAILABLE
+    if _FAISS_AVAILABLE is not None:
+        return _FAISS_AVAILABLE
+    _FAISS_AVAILABLE = importlib.util.find_spec("faiss") is not None
+    return _FAISS_AVAILABLE
+
+
+def configure_numba(enabled: bool, *, warmup: bool = False) -> None:
+    global _rrf_scores_impl, _mmr_select_impl, _NUMBA_ENABLED
+    enable = bool(enabled) and _NUMBA_AVAILABLE
+    _NUMBA_ENABLED = enable
+    if enable and _numba_jit is not None:
+        _rrf_scores_impl = _numba_jit(nopython=True)(_rrf_scores_numpy)
+        _mmr_select_impl = _numba_jit(nopython=True)(_mmr_select_numpy)
+        if warmup:
+            _rrf_scores_impl(np.asarray([], dtype=np.int64), np.asarray([], dtype=np.int64), 60)
+            _mmr_select_impl(np.zeros((0, 1), dtype=np.float32), np.zeros(1, dtype=np.float32), 1, 0.7)
+    else:
+        _rrf_scores_impl = _rrf_scores_numpy
+        _mmr_select_impl = _mmr_select_numpy
+
+
+def _rrf_scores_numpy(bm25_indices: np.ndarray, vec_indices: np.ndarray, k: int = 60) -> np.ndarray:
     size = 0
     if bm25_indices.size:
         size = max(size, int(np.max(bm25_indices)) + 1)
@@ -34,8 +65,7 @@ def _rrf_scores(bm25_indices: np.ndarray, vec_indices: np.ndarray, k: int = 60) 
     return scores
 
 
-@jit(nopython=True)
-def _mmr_select(E: np.ndarray, q: np.ndarray, k: int, mmr_lambda: float) -> np.ndarray:
+def _mmr_select_numpy(E: np.ndarray, q: np.ndarray, k: int, mmr_lambda: float) -> np.ndarray:
     n = E.shape[0]
     if n == 0:
         return np.empty(0, dtype=np.int64)
@@ -94,7 +124,7 @@ def rrf_combine(bm25_results: List[Dict[str, Any]], vec_results: List[Dict[str, 
     id_to_index = {cid: i for i, cid in enumerate(all_ids)}
     bm25_idx = np.asarray([id_to_index[r["id"]] for r in bm25_results], dtype=np.int64)
     vec_idx = np.asarray([id_to_index[r["id"]] for r in vec_results], dtype=np.int64)
-    scores = _rrf_scores(bm25_idx, vec_idx, k)
+    scores = _rrf_scores_impl(bm25_idx, vec_idx, k)
     order = np.argsort(-scores)
 
     combined = []
@@ -133,7 +163,7 @@ def apply_mmr(results: List[Dict[str, Any]], query_vec: np.ndarray, k: int, mmr_
 
     rel = E @ q
 
-    selected = _mmr_select(E, q, k, float(mmr_lambda))
+    selected = _mmr_select_impl(E, q, k, float(mmr_lambda))
     return [valid[int(i)] for i in selected]
 
 
@@ -151,19 +181,28 @@ async def invalidate_faiss_cache(index_path: str) -> None:
         _faiss_cache.pop(index_path, None)
 
 
+_rrf_scores_impl = _rrf_scores_numpy
+_mmr_select_impl = _mmr_select_numpy
+
+
 @dataclass
 class SearchEngine:
     db_path: str
     index_dir: str
     index_path_context: PathContext
+    faiss_available: bool = field(default_factory=is_faiss_available)
 
     async def _load_faiss(self, project_id: str):
+        if not self.faiss_available:
+            raise RuntimeError("Vector search unavailable (faiss not installed).")
         import faiss
         project = ProjectID(project_id)
         index_path = os.path.join(self.index_dir, str(project) + ".index.current")
         return await self._load_faiss_path(project_id, index_path)
 
     async def _load_faiss_path(self, project_id: str, index_path: str):
+        if not self.faiss_available:
+            raise RuntimeError("Vector search unavailable (faiss not installed).")
         import faiss
 
         if not self.index_path_context.exists(index_path):
@@ -269,6 +308,8 @@ class SearchEngine:
         index_path: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Vector search against FAISS index (runs in a thread to keep event loop responsive)."""
+        if not self.faiss_available:
+            return []
         import faiss
 
         loop = asyncio.get_running_loop()
@@ -344,7 +385,7 @@ class SearchEngine:
         *,
         project_id: str,
         query: str,
-        query_vec: np.ndarray,
+        query_vec: Optional[np.ndarray],
         fts_top_k: int,
         vector_top_k: int,
         return_k: int,
@@ -356,8 +397,13 @@ class SearchEngine:
         mode = str(fts_mode).lower()
         if mode not in allowed_modes:
             raise ValueError(f"Invalid fts_mode '{fts_mode}'. Allowed: {sorted(allowed_modes)}")
+        vector_enabled = bool(self.faiss_available)
+        if vector_enabled and query_vec is None:
+            raise ValueError("Query vector required for vector search.")
+        if not vector_enabled:
+            enable_mmr = False
         params_hash = hashlib.sha256(
-            f"{fts_top_k}:{vector_top_k}:{return_k}:{enable_mmr}:{mmr_lambda}:{mode}".encode("utf-8")
+            f"{fts_top_k}:{vector_top_k}:{return_k}:{enable_mmr}:{mmr_lambda}:{mode}:{vector_enabled}".encode("utf-8")
         ).hexdigest()
         cache_key = f"{project_id}:{hashlib.sha256(query.encode('utf-8')).hexdigest()}:{params_hash}"
         async with _cache_lock:
@@ -375,12 +421,22 @@ class SearchEngine:
             )
             proj = await dbmod.get_project(self.db_path, project_id)
             shard_count = int((proj.get("metadata") or {}).get("shard_count") or 1) if proj else 1
-            if shard_count > 1:
-                vec = await self._vector_search_sharded(
-                    project_id=project_id, query_vec=query_vec, top_k=vector_top_k, shard_count=shard_count
-                )
+            if vector_enabled:
+                if shard_count > 1:
+                    vec = await self._vector_search_sharded(
+                        project_id=project_id,
+                        query_vec=query_vec,
+                        top_k=vector_top_k,
+                        shard_count=shard_count,
+                    )
+                else:
+                    vec = await self.vector_search(
+                        project_id=project_id,
+                        query_vec=query_vec,
+                        top_k=vector_top_k,
+                    )
             else:
-                vec = await self.vector_search(project_id=project_id, query_vec=query_vec, top_k=vector_top_k)
+                vec = []
 
         # Offload RRF calculation to thread to prevent event loop blocking
         combined = await asyncio.to_thread(rrf_combine, lex, vec, 60)

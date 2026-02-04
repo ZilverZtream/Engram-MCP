@@ -15,7 +15,7 @@ from engram_mcp.embeddings import EmbeddingService
 from engram_mcp.indexing import Indexer, ensure_index_permissions
 from engram_mcp.locks import get_project_lock, get_project_rwlock, remove_project_lock, remove_project_rwlock
 from engram_mcp.jobs import JobManager
-from engram_mcp.search import SearchEngine
+from engram_mcp.search import SearchEngine, configure_numba
 from engram_mcp.security import PathContext, PathNotAllowed, ProjectID, validate_project_field
 from engram_mcp import db as dbmod
 from engram_mcp import chunking
@@ -23,6 +23,7 @@ from engram_mcp import chunking
 
 cfg = load_config()
 dbmod.ensure_db_permissions(cfg.db_path)
+configure_numba(bool(cfg.enable_numba), warmup=bool(cfg.enable_numba))
 
 mcp = FastMCP(name="Engram MCP")
 
@@ -46,7 +47,27 @@ search_engine = SearchEngine(
     index_path_context=index_path_context,
 )
 
-ensure_index_permissions(index_path_context, cfg.index_dir, db_path=cfg.db_path)
+
+async def _startup_tasks() -> None:
+    await dbmod.init_db(cfg.db_path)
+    await ensure_index_permissions(index_path_context, cfg.index_dir, db_path=cfg.db_path)
+    await dbmod.prune_embedding_cache(
+        cfg.db_path,
+        ttl_s=int(cfg.embedding_cache_ttl_s),
+        max_rows=int(cfg.embedding_cache_max_rows),
+    )
+
+
+def _schedule_startup_tasks() -> None:
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        asyncio.run(_startup_tasks())
+        return
+    loop.create_task(_startup_tasks())
+
+
+_schedule_startup_tasks()
 
 
 # ---------------------------------------------------------------------------
@@ -68,6 +89,19 @@ async def _shutdown(reason: str, *, loop: Optional[asyncio.AbstractEventLoop] = 
         await asyncio.wait_for(jobs.shutdown(timeout_s=5.0), timeout=6.0)
         await asyncio.wait_for(embedding_service.close(graceful=True), timeout=10.0)
         await asyncio.wait_for(dbmod.close_db_pool(), timeout=5.0)
+        loop = loop or asyncio.get_running_loop()
+        if loop.is_running():
+            pending = [
+                task
+                for task in asyncio.all_tasks(loop)
+                if task is not asyncio.current_task(loop)
+            ]
+            for task in pending:
+                task.cancel()
+            try:
+                await asyncio.wait_for(asyncio.gather(*pending, return_exceptions=True), timeout=10.0)
+            except asyncio.TimeoutError:
+                logging.warning("Shutdown timed out waiting for pending tasks.")
     except Exception:
         logging.warning("Shutdown cleanup failed", exc_info=True)
     finally:
@@ -83,7 +117,11 @@ def _sync_cleanup() -> None:
         except RuntimeError:
             loop = None
         if loop and loop.is_running():
-            loop.call_soon_threadsafe(lambda: asyncio.create_task(_shutdown("atexit", loop=loop)))
+            fut = asyncio.run_coroutine_threadsafe(_shutdown("atexit", loop=loop), loop)
+            try:
+                fut.result(timeout=15.0)
+            except Exception:
+                logging.warning("Shutdown cleanup timed out", exc_info=True)
         else:
             asyncio.run(_shutdown("atexit"))
     except Exception:
@@ -261,8 +299,11 @@ async def search_memory(
     device = md.get("device") or _device()
     rwlock = await get_project_rwlock(project_id)
     start = time.time()
+    vector_enabled = bool(search_engine.faiss_available)
     async with rwlock.read_lock():
-        qv = await embedding_service.embed_one(query, model_name=model_name, device=device)
+        qv = None
+        if vector_enabled:
+            qv = await embedding_service.embed_one(query, model_name=model_name, device=device)
 
         try:
             results = await search_engine.search(
@@ -272,7 +313,7 @@ async def search_memory(
                 fts_top_k=cfg.fts_top_k,
                 vector_top_k=cfg.vector_top_k,
                 return_k=max(1, min(50, int(max_results))),
-                enable_mmr=bool(use_mmr and cfg.enable_mmr),
+                enable_mmr=bool(use_mmr and cfg.enable_mmr and vector_enabled),
                 mmr_lambda=float(cfg.mmr_lambda),
                 fts_mode=fts_mode,
             )
@@ -300,6 +341,7 @@ async def search_memory(
     return {
         "query": query,
         "project_id": project_id,
+        "vector_enabled": vector_enabled,
         "count": len(results),
         "results": [
             {
@@ -333,6 +375,18 @@ async def project_health(project_id: str) -> Dict[str, Any]:
     proj = await dbmod.get_project(cfg.db_path, project_id)
     if not proj:
         return {"error": f"Project not found: {project_id}"}
+    if not search_engine.faiss_available:
+        return {
+            "project_id": project_id,
+            "index_dirty": bool(proj.get("index_dirty")),
+            "faiss_index_uuid": proj.get("faiss_index_uuid"),
+            "chunk_count_db": int(proj.get("chunk_count") or 0),
+            "faiss_ntotal": 0,
+            "missing_or_unreadable_indexes": [],
+            "uuid_mismatches": [],
+            "vector_status": "vector search unavailable (faiss not installed)",
+            "updated_at": proj.get("updated_at"),
+        }
     rwlock = await get_project_rwlock(project_id)
     async with rwlock.read_lock():
         metadata = proj.get("metadata") or {}
@@ -380,6 +434,7 @@ async def project_health(project_id: str) -> Dict[str, Any]:
         "faiss_ntotal": int(sum(faiss_totals)) if faiss_totals else 0,
         "missing_or_unreadable_indexes": missing_files,
         "uuid_mismatches": uuid_mismatches,
+        "vector_status": "ok",
         "updated_at": proj.get("updated_at"),
     }
 
@@ -387,6 +442,8 @@ async def project_health(project_id: str) -> Dict[str, Any]:
 @mcp.tool
 async def repair_project(project_id: str) -> str:
     """Rebuild the FAISS index from DB state for a project."""
+    if not search_engine.faiss_available:
+        return "❌ Vector search unavailable (faiss not installed). Install faiss and retry."
     await dbmod.init_db(cfg.db_path)
     proj = await dbmod.get_project(cfg.db_path, project_id)
     if not proj:
@@ -441,6 +498,16 @@ async def delete_project(project_id: str) -> str:
                         index_path_context.unlink(path)
                     except Exception as exc:
                         failures.append(f"{path} ({exc})")
+            try:
+                for path in index_path_context.iter_files(cfg.index_dir):
+                    name = path.name
+                    if name.startswith(f"{project_id}.") and ".index.current" in name:
+                        try:
+                            index_path_context.unlink(path)
+                        except Exception as exc:
+                            failures.append(f"{path} ({exc})")
+            except Exception as exc:
+                failures.append(f"fallback cleanup ({exc})")
             if failures:
                 return "❌ Failed to delete index artifacts: " + ", ".join(failures)
             await dbmod.delete_project(cfg.db_path, project_id)
