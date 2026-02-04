@@ -164,6 +164,7 @@ class Indexer:
             faiss.METRIC_INNER_PRODUCT,
         )
         index.nprobe = max(1, int(self.cfg.faiss_nprobe))
+        index = _ensure_id_map(index)
 
         def _train():
             faiss.normalize_L2(vectors)
@@ -190,10 +191,13 @@ class Indexer:
         vectors: np.ndarray,
         ids: np.ndarray,
         rows: List[Tuple[str, int, str, int, Dict[str, Any]]],
+        file_rows: List[dbmod.FileMetadataRow],
         index_path: str,
         rwlock: Any,
     ) -> None:
         chunk_ids = [row[0] for row in rows]
+        file_paths = [row.file_path for row in file_rows]
+        await dbmod.upsert_file_metadata(self.cfg.db_path, project_id, file_rows)
         await dbmod.upsert_chunks(self.cfg.db_path, project_id=project_id, rows=rows)
         try:
             await self._add_vectors(index, vectors, ids)
@@ -202,6 +206,8 @@ class Indexer:
                 await asyncio.to_thread(_save_faiss, index, index_path)
         except Exception:
             await dbmod.delete_chunks(self.cfg.db_path, project_id, chunk_ids)
+            if file_paths:
+                await dbmod.delete_file_metadata(self.cfg.db_path, project_id, file_paths)
             raise
 
     async def index_project(self, *, directory: str, project_name: str, project_type: str) -> str:
@@ -266,31 +272,36 @@ class Indexer:
             pending_vectors: List[np.ndarray] = []
             pending_ids: List[np.ndarray] = []
             pending_rows: List[List[Tuple[str, int, str, int, Dict[str, Any]]]] = []
+            pending_file_rows: List[List[dbmod.FileMetadataRow]] = []
             training_vectors: List[np.ndarray] = []
             total_chunks = 0
-            file_metadata_rows: List[dbmod.FileMetadataRow] = []
             train_target = max(1000, int(self.cfg.faiss_nlist) * 20)
             safe_id = _sanitize_project_id(project_id)
             index_path = os.path.join(self.cfg.index_dir, f"{safe_id}.index")
             rwlock = await get_project_rwlock(project_id)
+            parse_failures = 0
+            parse_attempts = 0
 
             async for parsed in _bounded_gather(iter_indexable_files(), parse_one, max(1, int(os.cpu_count() or 4))):
+                parse_attempts += 1
                 if parsed is None:
+                    parse_failures += 1
+                    if parse_failures >= max(5, int(math.ceil(parse_attempts * 0.1))):
+                        raise RuntimeError("Too many files failed to parse; aborting indexing.")
                     continue
 
                 chunk_ids = [c.chunk_id for c in parsed.chunks]
-                file_metadata_rows.append(
-                    dbmod.FileMetadataRow(
-                        file_path=parsed.file_path,
-                        mtime_ns=parsed.mtime_ns,
-                        size_bytes=parsed.size_bytes,
-                        content_hash=parsed.content_hash,
-                        chunk_ids=chunk_ids,
-                    )
+                file_row = dbmod.FileMetadataRow(
+                    file_path=parsed.file_path,
+                    mtime_ns=parsed.mtime_ns,
+                    size_bytes=parsed.size_bytes,
+                    content_hash=parsed.content_hash,
+                    chunk_ids=chunk_ids,
                 )
-
                 if not parsed.chunks:
+                    await dbmod.upsert_file_metadata(self.cfg.db_path, project_id, [file_row])
                     continue
+                file_rows = [file_row]
 
                 vectors = await self._embed_chunks_cached(embedder, parsed.chunks, model_name=model_name)
                 if vectors.size == 0:
@@ -331,16 +342,20 @@ class Indexer:
                     pending_vectors.append(vectors)
                     pending_ids.append(ids)
                     pending_rows.append(rows)
+                    pending_file_rows.append(file_rows)
                     if sum(v.shape[0] for v in training_vectors) >= train_target:
                         train_vecs = np.vstack(training_vectors)
                         index = await self._build_faiss_index(train_vecs)
-                        for vec_batch, id_batch, row_batch in zip(pending_vectors, pending_ids, pending_rows):
+                        for vec_batch, id_batch, row_batch, file_row_batch in zip(
+                            pending_vectors, pending_ids, pending_rows, pending_file_rows
+                        ):
                             await self._persist_index_batch(
                                 project_id=project_id,
                                 index=index,
                                 vectors=vec_batch,
                                 ids=id_batch,
                                 rows=row_batch,
+                                file_rows=file_row_batch,
                                 index_path=index_path,
                                 rwlock=rwlock,
                             )
@@ -348,6 +363,7 @@ class Indexer:
                         pending_vectors.clear()
                         pending_ids.clear()
                         pending_rows.clear()
+                        pending_file_rows.clear()
                 else:
                     await self._persist_index_batch(
                         project_id=project_id,
@@ -355,6 +371,7 @@ class Indexer:
                         vectors=vectors,
                         ids=ids,
                         rows=rows,
+                        file_rows=file_rows,
                         index_path=index_path,
                         rwlock=rwlock,
                     )
@@ -392,19 +409,21 @@ class Indexer:
             if index is None:
                 train_vecs = np.vstack(training_vectors) if training_vectors else np.vstack(pending_vectors)
                 index = await self._build_faiss_index(train_vecs)
-                for vec_batch, id_batch, row_batch in zip(pending_vectors, pending_ids, pending_rows):
+                for vec_batch, id_batch, row_batch, file_row_batch in zip(
+                    pending_vectors, pending_ids, pending_rows, pending_file_rows
+                ):
                     await self._persist_index_batch(
                         project_id=project_id,
                         index=index,
                         vectors=vec_batch,
                         ids=id_batch,
                         rows=row_batch,
+                        file_rows=file_row_batch,
                         index_path=index_path,
                         rwlock=rwlock,
                     )
                 pending_rows.clear()
-
-            await dbmod.upsert_file_metadata(self.cfg.db_path, project_id, file_metadata_rows)
+                pending_file_rows.clear()
 
             await dbmod.refresh_project_stats(self.cfg.db_path, project_id)
             await _set_file_count(self.cfg.db_path, project_id, file_count)
@@ -774,25 +793,78 @@ class Indexer:
 
         try:
             rwlock = await get_project_rwlock(project_id)
-            all_rows = await _fetch_all_chunks_for_rebuild(self.cfg.db_path, project_id)
-            vectors = await self._embed_chunks_cached(embedder, [r["chunk"] for r in all_rows], model_name=model_name)
-            ids = [r["internal_id"] for r in all_rows]
-
-            shards: List[List[int]] = [[] for _ in range(shard_count)]
-            shard_vectors: List[List[int]] = [[] for _ in range(shard_count)]
-            for i, iid in enumerate(ids):
-                shard_id = iid % shard_count
-                shards[shard_id].append(iid)
-                shard_vectors[shard_id].append(i)
-
             safe_id = _sanitize_project_id(project_id)
-            async with rwlock.write_lock():
-                for shard_id in range(shard_count):
-                    if not shard_vectors[shard_id]:
+            train_target = max(1000, int(self.cfg.faiss_nlist) * 20)
+            shard_indexes: List[Optional[Any]] = [None] * shard_count
+            shard_training: List[List[np.ndarray]] = [[] for _ in range(shard_count)]
+            shard_pending_vecs: List[List[np.ndarray]] = [[] for _ in range(shard_count)]
+            shard_pending_ids: List[List[np.ndarray]] = [[] for _ in range(shard_count)]
+            batch_size = max(1, int(self.cfg.embedding_batch_size))
+            last_internal_id = -1
+
+            async def _flush_pending(shard_id: int) -> None:
+                if not shard_pending_vecs[shard_id]:
+                    return
+                vecs = np.vstack(shard_pending_vecs[shard_id])
+                ids = np.concatenate(shard_pending_ids[shard_id])
+                await self._add_vectors(shard_indexes[shard_id], vecs, ids)
+                shard_pending_vecs[shard_id].clear()
+                shard_pending_ids[shard_id].clear()
+
+            while True:
+                batch = await _fetch_chunk_batch(
+                    self.cfg.db_path,
+                    project_id,
+                    last_internal_id=last_internal_id,
+                    batch_size=batch_size,
+                )
+                if not batch:
+                    break
+                last_internal_id = batch[-1]["internal_id"]
+
+                vectors = await self._embed_chunks_cached(
+                    embedder,
+                    [r["chunk"] for r in batch],
+                    model_name=model_name,
+                )
+                ids = [r["internal_id"] for r in batch]
+
+                shard_indices: List[List[int]] = [[] for _ in range(shard_count)]
+                for i, iid in enumerate(ids):
+                    shard_id = iid % shard_count
+                    shard_indices[shard_id].append(i)
+
+                for shard_id, positions in enumerate(shard_indices):
+                    if not positions:
                         continue
-                    vecs = vectors[shard_vectors[shard_id]]
-                    index = await self._build_faiss_index(vecs)
-                    await self._add_vectors(index, vecs, np.asarray(shards[shard_id], dtype=np.int64))
+                    shard_vecs = vectors[positions]
+                    shard_ids = np.asarray([ids[i] for i in positions], dtype=np.int64)
+                    if shard_indexes[shard_id] is None:
+                        shard_training[shard_id].append(shard_vecs)
+                        shard_pending_vecs[shard_id].append(shard_vecs)
+                        shard_pending_ids[shard_id].append(shard_ids)
+                        if sum(v.shape[0] for v in shard_training[shard_id]) >= train_target:
+                            train_vecs = np.vstack(shard_training[shard_id])
+                            shard_indexes[shard_id] = await self._build_faiss_index(train_vecs)
+                            await _flush_pending(shard_id)
+                            shard_training[shard_id].clear()
+                    else:
+                        shard_pending_vecs[shard_id].append(shard_vecs)
+                        shard_pending_ids[shard_id].append(shard_ids)
+                        await _flush_pending(shard_id)
+
+            for shard_id in range(shard_count):
+                if shard_indexes[shard_id] is None:
+                    if not shard_pending_vecs[shard_id]:
+                        continue
+                    train_vecs = np.vstack(shard_training[shard_id] or shard_pending_vecs[shard_id])
+                    shard_indexes[shard_id] = await self._build_faiss_index(train_vecs)
+                await _flush_pending(shard_id)
+
+            async with rwlock.write_lock():
+                for shard_id, index in enumerate(shard_indexes):
+                    if index is None:
+                        continue
                     path = os.path.join(self.cfg.index_dir, f"{safe_id}.shard{shard_id}.index")
                     await invalidate_faiss_cache(path)
                     await asyncio.to_thread(_save_faiss, index, path)
@@ -835,7 +907,16 @@ def _compute_shard_count(chunk_count: int, cfg: EngramConfig) -> int:
 def _load_faiss(path: str) -> Any:
     import faiss
 
-    return faiss.read_index(path)
+    index = faiss.read_index(path)
+    return _ensure_id_map(index)
+
+
+def _ensure_id_map(index: Any) -> Any:
+    import faiss
+
+    if isinstance(index, faiss.IndexIDMap2):
+        return index
+    return faiss.IndexIDMap2(index)
 
 
 def _save_faiss(index: Any, path: str) -> None:
@@ -851,10 +932,16 @@ def _save_faiss(index: Any, path: str) -> None:
 
     try:
         faiss.write_index(index, tmp_path)
-        # Atomic rename (POSIX guarantees atomicity)
-        os.replace(tmp_path, path)
+        max_attempts = 5
+        for attempt in range(max_attempts):
+            try:
+                os.replace(tmp_path, path)
+                break
+            except PermissionError:
+                if os.name != "nt" or attempt == max_attempts - 1:
+                    raise
+                time.sleep(0.1 * (2**attempt))
     except Exception:
-        # Clean up temp file on failure
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)
         raise
@@ -878,18 +965,30 @@ async def _fetch_existing_chunk_ids(db_path: str, project_id: str) -> set[str]:
     return {r[0] for r in rows}
 
 
-async def _fetch_all_chunks_for_rebuild(db_path: str, project_id: str) -> List[Dict[str, Any]]:
+async def _fetch_chunk_batch(
+    db_path: str,
+    project_id: str,
+    *,
+    last_internal_id: int,
+    batch_size: int,
+) -> List[Dict[str, Any]]:
     from .chunking import Chunk
 
     async with dbmod.get_connection(db_path) as db:
         rows = await db.execute_fetchall(
-            "SELECT chunk_id, internal_id, content, token_count, metadata FROM chunks WHERE project_id = ? ORDER BY internal_id ASC",
-            (project_id,),
+            """
+            SELECT chunk_id, internal_id, content, token_count, metadata
+            FROM chunks
+            WHERE project_id = ? AND internal_id > ?
+            ORDER BY internal_id ASC
+            LIMIT ?
+            """,
+            (project_id, int(last_internal_id), int(batch_size)),
         )
 
     out: List[Dict[str, Any]] = []
     for cid, iid, content, tcount, meta_json in rows:
-        meta = {}  # already json in db
+        meta = {}
         try:
             import json
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 from dataclasses import dataclass
 from functools import lru_cache
@@ -21,12 +22,14 @@ class Chunk:
 def _load_tokenizer() -> Tokenizer:
     tokenizer_path = os.getenv("ENGRAM_TOKENIZER_PATH")
     if not tokenizer_path:
-        raise RuntimeError(
-            "ENGRAM_TOKENIZER_PATH must be set to a local tokenizer.json; "
-            "network downloads are disabled for safety."
-        )
+        logging.warning("ENGRAM_TOKENIZER_PATH not set; falling back to bert-base-uncased tokenizer.")
+        return Tokenizer.from_pretrained("bert-base-uncased")
     if not os.path.exists(tokenizer_path):
-        raise RuntimeError(f"Tokenizer not found at ENGRAM_TOKENIZER_PATH: {tokenizer_path}")
+        logging.warning(
+            "Tokenizer not found at ENGRAM_TOKENIZER_PATH=%s; falling back to bert-base-uncased tokenizer.",
+            tokenizer_path,
+        )
+        return Tokenizer.from_pretrained("bert-base-uncased")
     return Tokenizer.from_file(tokenizer_path)
 
 
@@ -60,6 +63,8 @@ def chunk_text(
 
     target_tokens = max(50, int(target_tokens))
     overlap_tokens = max(0, int(overlap_tokens))
+    if overlap_tokens >= target_tokens:
+        overlap_tokens = max(0, target_tokens - 1)
     tokenizer = _load_tokenizer()
     encoding = tokenizer.encode(text)
     offsets = encoding.offsets
@@ -89,7 +94,10 @@ def chunk_text(
             idx += 1
         if end == total_tokens:
             break
-        start = max(0, end - overlap_tokens)
+        new_start = max(0, end - overlap_tokens)
+        if new_start <= start:
+            break
+        start = new_start
 
     return chunks
 
