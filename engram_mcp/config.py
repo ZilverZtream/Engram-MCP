@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from typing import List, Optional
 
 import yaml
+from .security import PathContext
+from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
 
 
 DEFAULT_IGNORE_PATTERNS: List[str] = [
@@ -71,6 +73,59 @@ class EngramConfig:
     shard_size: int = 250_000
 
 
+class AllowedConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # Storage
+    db_path: str = "memory.db"
+    index_dir: str = "."
+
+    # Security
+    allowed_roots: List[str] = []
+
+    # Indexing behavior
+    ignore_patterns: List[str] = list(DEFAULT_IGNORE_PATTERNS)
+    max_file_size_mb: int = 200
+    chunk_size_tokens: int = 200
+    overlap_tokens: int = 30
+
+    # Performance
+    query_timeout_s: int = 60
+    index_timeout_s: int = 3600
+    embedding_batch_size: int = 128
+    embedding_cache_ttl_s: int = 0
+
+    # Search
+    fts_top_k: int = 200
+    vector_top_k: int = 200
+    return_k: int = 10
+    enable_mmr: bool = True
+    mmr_lambda: float = 0.7
+
+    # Embeddings
+    model_name_text: str = "paraphrase-multilingual-MiniLM-L12-v2"
+    model_name_code: str = "all-MiniLM-L6-v2"
+    prefer_thread_for_cuda: bool = True
+
+    # FAISS IVF+PQ settings
+    faiss_nlist: int = 100
+    faiss_m: int = 8
+    faiss_nbits: int = 8
+    faiss_nprobe: int = 16
+
+    # Sharding settings
+    shard_chunk_threshold: int = 1_000_000
+    shard_size: int = 250_000
+
+    @field_validator("overlap_tokens")
+    @classmethod
+    def validate_overlap(cls, value: int, info):  # type: ignore[override]
+        chunk_size = info.data.get("chunk_size_tokens", 200)
+        if int(value) >= int(chunk_size):
+            raise ValueError("overlap_tokens must be less than chunk_size_tokens")
+        return value
+
+
 def load_config(path: Optional[str] = None) -> EngramConfig:
     """Load config from YAML.
 
@@ -88,21 +143,25 @@ def load_config(path: Optional[str] = None) -> EngramConfig:
         path = os.path.join(os.getcwd(), "engram_mcp.yaml")
 
     cfg = EngramConfig()
-    if not os.path.exists(path):
+    config_root = os.path.dirname(os.path.abspath(path)) or os.getcwd()
+    path_context = PathContext([config_root])
+    if not path_context.exists(path):
         return cfg
-
-    with open(path, "r", encoding="utf-8") as f:
+    with path_context.open_file(path, "r", encoding="utf-8") as f:
         data = yaml.safe_load(f) or {}
 
-    # Merge known fields only (avoid surprises)
-    for k, v in data.items():
-        if hasattr(cfg, k):
-            # Special handling for ignore_patterns: merge with defaults instead of replacing
-            if k == "ignore_patterns" and isinstance(v, list):
-                # Combine user patterns with defaults (user patterns first for priority)
-                cfg.ignore_patterns = list(v) + [p for p in DEFAULT_IGNORE_PATTERNS if p not in v]
-            else:
-                setattr(cfg, k, v)
+    if isinstance(data, dict) and isinstance(data.get("ignore_patterns"), list):
+        ignore_patterns = list(data["ignore_patterns"])
+        data["ignore_patterns"] = ignore_patterns + [
+            p for p in DEFAULT_IGNORE_PATTERNS if p not in ignore_patterns
+        ]
+
+    try:
+        validated = AllowedConfig.model_validate(data or {})
+    except ValidationError as exc:
+        raise ValueError(f"Invalid configuration: {exc}") from exc
+
+    cfg = EngramConfig(**validated.model_dump())
 
     # Normalize allowed roots (resolve symlinks for security)
     cfg.allowed_roots = [os.path.realpath(p) for p in (cfg.allowed_roots or [])]

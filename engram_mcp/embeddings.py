@@ -198,3 +198,87 @@ class Embedder:
                     else:
                         self._shared_proc_pools[key] = (pool, ref - 1)
                 self._shared_key = None
+
+
+@dataclass
+class _EmbeddingRequest:
+    texts: List[str]
+    model_name: str
+    device: str
+    future: asyncio.Future
+
+
+class EmbeddingService:
+    def __init__(
+        self,
+        *,
+        prefer_thread_for_cuda: bool,
+        worker_count: int = 2,
+        max_workers_per_model: int = 2,
+    ) -> None:
+        self._prefer_thread_for_cuda = prefer_thread_for_cuda
+        self._worker_count = max(1, int(worker_count))
+        self._max_workers_per_model = max(1, int(max_workers_per_model))
+        self._queue: asyncio.Queue[_EmbeddingRequest] = asyncio.Queue()
+        self._workers: List[asyncio.Task] = []
+        self._started = asyncio.Event()
+        self._start_lock = asyncio.Lock()
+
+    async def start(self) -> None:
+        async with self._start_lock:
+            if self._workers:
+                return
+            for _ in range(self._worker_count):
+                self._workers.append(asyncio.create_task(self._worker_loop()))
+            self._started.set()
+
+    async def _worker_loop(self) -> None:
+        embedder_cache: Dict[Tuple[str, str], Embedder] = {}
+        try:
+            while True:
+                req = await self._queue.get()
+                key = (req.model_name, req.device)
+                embedder = embedder_cache.get(key)
+                if embedder is None:
+                    embedder = Embedder(
+                        model_name=req.model_name,
+                        device=req.device,
+                        prefer_thread_for_cuda=self._prefer_thread_for_cuda,
+                        max_workers=self._max_workers_per_model,
+                    )
+                    embedder_cache[key] = embedder
+                try:
+                    vectors = await embedder.embed_texts(req.texts)
+                except Exception as exc:
+                    if not req.future.done():
+                        req.future.set_exception(exc)
+                else:
+                    if not req.future.done():
+                        req.future.set_result(vectors)
+        except asyncio.CancelledError:
+            for embedder in embedder_cache.values():
+                embedder.close()
+            raise
+
+    async def embed_texts(self, texts: Sequence[str], *, model_name: str, device: str) -> np.ndarray:
+        await self.start()
+        text_list = list(texts)
+        if not text_list:
+            return np.zeros((0, 0), dtype=np.float32)
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future = loop.create_future()
+        await self._queue.put(
+            _EmbeddingRequest(texts=text_list, model_name=model_name, device=device, future=future)
+        )
+        return await future
+
+    async def embed_one(self, text: str, *, model_name: str, device: str) -> np.ndarray:
+        vecs = await self.embed_texts([text], model_name=model_name, device=device)
+        return vecs[0]
+
+    async def close(self) -> None:
+        for task in self._workers:
+            task.cancel()
+        if self._workers:
+            await asyncio.gather(*self._workers, return_exceptions=True)
+        self._workers.clear()

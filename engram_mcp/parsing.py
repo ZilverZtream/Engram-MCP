@@ -5,11 +5,13 @@ import fnmatch
 import hashlib
 import logging
 import os
-from pathlib import Path
+from contextlib import ExitStack
 from dataclasses import dataclass
-from typing import Dict, Iterable, Iterator, List, Optional
+from pathlib import Path
+from typing import Dict, Iterator, List, Optional
 
 from .chunking import Chunk, chunk_text, make_chunk_id, token_count
+from .security import PathContext
 
 
 SUPPORTED_TEXT_EXTS = {
@@ -26,60 +28,38 @@ def _is_ignored(path: str, ignore_patterns: List[str]) -> bool:
     return False
 
 
-def _is_within_root(path: Path, root: Path) -> bool:
-    try:
-        path.resolve().relative_to(root.resolve())
-    except ValueError:
-        return False
-    return True
-
-
-def iter_files(root: str, ignore_patterns: List[str]) -> Iterator[Path]:
-    root_p = Path(root)
-    for p in root_p.rglob("*"):
+def iter_files(path_context: PathContext, root: str, ignore_patterns: List[str]) -> Iterator[Path]:
+    root_path = path_context.resolve_path(root)
+    for p in path_context.iter_files(root_path):
         if not p.is_file():
             continue
-        if not _is_within_root(p, root_p):
-            continue
-        rel = str(p.relative_to(root_p))
+        rel = str(p.relative_to(root_path))
         if _is_ignored(rel, ignore_patterns):
             continue
         yield p
 
 
-def _open_relative(root: Path, path: Path, mode: str, *, encoding: Optional[str] = None):
-    rel = path.relative_to(root)
-    if os.name == "nt":
-        resolved = (root / rel).resolve()
-        if not _is_within_root(resolved, root):
-            raise ValueError(f"Path escapes root: {resolved}")
-        return open(resolved, mode, encoding=encoding, errors="ignore" if "b" not in mode else None)
-    root_fd = os.open(root, os.O_RDONLY)
-    try:
-        flags = os.O_RDONLY
-        fd = os.open(str(rel), flags, dir_fd=root_fd, follow_symlinks=False)
-        return os.fdopen(fd, mode, encoding=encoding, errors="ignore" if "b" not in mode else None)
-    finally:
-        os.close(root_fd)
-
-
-def read_text_streaming(path: Path, root: Path, max_bytes: int) -> str:
+def read_text_streaming(path_context: PathContext, path: Path, root: Path, max_bytes: int) -> str:
     # Avoid reading enormous files at once.
-    size = path.stat().st_size
+    size = path_context.stat(path).st_size
     if size > max_bytes:
         raise ValueError(f"File too large: {path} ({size} bytes)")
-    with _open_relative(root, path, "r", encoding="utf-8") as f:
-        return f.read()
+    with ExitStack() as stack:
+        handle = stack.enter_context(
+            path_context.open_file(path, "r", encoding="utf-8", errors="ignore")
+        )
+        return handle.read()
 
 
-def hash_file(path: Path, root: Path, max_bytes: int) -> str:
-    size = path.stat().st_size
+def hash_file(path_context: PathContext, path: Path, root: Path, max_bytes: int) -> str:
+    size = path_context.stat(path).st_size
     if size > max_bytes:
         raise ValueError(f"File too large: {path} ({size} bytes)")
     h = hashlib.sha256()
-    with _open_relative(root, path, "rb") as f:
+    with ExitStack() as stack:
+        handle = stack.enter_context(path_context.open_file(path, "rb"))
         while True:
-            chunk = f.read(1024 * 1024)
+            chunk = handle.read(1024 * 1024)
             if not chunk:
                 break
             h.update(chunk)
@@ -88,6 +68,7 @@ def hash_file(path: Path, root: Path, max_bytes: int) -> str:
 
 def parse_file_to_chunks(
     *,
+    path_context: PathContext,
     path: Path,
     root: str,
     project_type: str,
@@ -95,7 +76,8 @@ def parse_file_to_chunks(
     overlap_tokens: int,
     max_file_size_mb: int,
 ) -> List[Chunk]:
-    if not _is_within_root(path, Path(root)):
+    root_path = path_context.resolve_path(root)
+    if root_path not in path.parents and path != root_path:
         raise ValueError(f"Path escapes root: {path}")
     ext = path.suffix.lower()
     rel = str(path.relative_to(root))
@@ -110,7 +92,7 @@ def parse_file_to_chunks(
     max_bytes = int(max_file_size_mb) * 1024 * 1024
 
     if ext in SUPPORTED_TEXT_EXTS:
-        text = read_text_streaming(path, root=Path(root), max_bytes=max_bytes)
+        text = read_text_streaming(path_context, path, root=Path(root), max_bytes=max_bytes)
         base_id = make_chunk_id(str(path))
         return chunk_text(
             text=text,
@@ -125,13 +107,14 @@ def parse_file_to_chunks(
         from pypdf import PdfReader
 
         # Check PDF file size before loading (prevent OOM/DoS)
-        size = path.stat().st_size
+        size = path_context.stat(path).st_size
         if size > max_bytes:
             raise ValueError(f"PDF file too large: {path} ({size} bytes)")
 
         max_text_chars = max_bytes * 4
-        with _open_relative(Path(root), path, "rb") as f:
-            reader = PdfReader(f)
+        with ExitStack() as stack:
+            handle = stack.enter_context(path_context.open_file(path, "rb"))
+            reader = PdfReader(handle)
         chunks: List[Chunk] = []
         base_id = make_chunk_id(str(path))
         total_chars = 0
@@ -163,8 +146,9 @@ def parse_file_to_chunks(
     if ext == ".docx":
         from docx import Document
 
-        with _open_relative(Path(root), path, "rb") as f:
-            doc = Document(f)
+        with ExitStack() as stack:
+            handle = stack.enter_context(path_context.open_file(path, "rb"))
+            doc = Document(handle)
         paras = [p.text for p in doc.paragraphs if p.text and p.text.strip()]
         text = "\n".join(paras)
         base_id = make_chunk_id(str(path))
@@ -198,6 +182,7 @@ class ParseDirectoryResult:
 
 async def parse_directory(
     *,
+    path_context: PathContext,
     root: str,
     project_type: str,
     ignore_patterns: List[str],
@@ -212,7 +197,7 @@ async def parse_directory(
     existing_metadata = existing_metadata or {}
 
     files: List[Path] = []
-    for p in iter_files(root, ignore_patterns):
+    for p in iter_files(path_context, root, ignore_patterns):
         ext = p.suffix.lower()
         if ext in SUPPORTED_TEXT_EXTS or ext in SUPPORTED_DOC_EXTS:
             files.append(p)
@@ -222,12 +207,18 @@ async def parse_directory(
 
     async def parse_one(path: Path) -> Optional[ParsedFile]:
         rel = str(path.relative_to(root))
-        stat = path.stat()
+        stat = path_context.stat(path)
         existing = existing_metadata.get(rel)
         file_hash: Optional[str] = None
         if existing and existing.mtime_ns == stat.st_mtime_ns and existing.size_bytes == stat.st_size:
             try:
-                file_hash = await asyncio.to_thread(hash_file, path, Path(root), max_file_size_mb * 1024 * 1024)
+                file_hash = await asyncio.to_thread(
+                    hash_file,
+                    path_context,
+                    path,
+                    Path(root),
+                    max_file_size_mb * 1024 * 1024,
+                )
             except Exception:
                 logging.warning("Failed to hash %s", rel, exc_info=True)
             if file_hash and existing.content_hash == file_hash:
@@ -236,7 +227,13 @@ async def parse_directory(
 
         if file_hash is None:
             try:
-                file_hash = await asyncio.to_thread(hash_file, path, Path(root), max_file_size_mb * 1024 * 1024)
+                file_hash = await asyncio.to_thread(
+                    hash_file,
+                    path_context,
+                    path,
+                    Path(root),
+                    max_file_size_mb * 1024 * 1024,
+                )
             except Exception:
                 logging.warning("Failed to hash %s", rel, exc_info=True)
                 return None
@@ -245,6 +242,7 @@ async def parse_directory(
             try:
                 file_chunks = await asyncio.to_thread(
                     parse_file_to_chunks,
+                    path_context=path_context,
                     path=path,
                     root=root,
                     project_type=project_type,
@@ -267,7 +265,20 @@ async def parse_directory(
         file_metadata[rel] = parsed
         return parsed
 
-    async for res in _bounded_gather(files, parse_one, max(1, int(os.cpu_count() or 4))):
+    results: List[Optional[ParsedFile]] = []
+    concurrency = max(1, int(os.cpu_count() or 4))
+    worker_sem = asyncio.Semaphore(concurrency)
+
+    async def _run(path: Path) -> None:
+        async with worker_sem:
+            res = await parse_one(path)
+            results.append(res)
+
+    async with asyncio.TaskGroup() as tg:
+        for path in files:
+            tg.create_task(_run(path))
+
+    for res in results:
         if isinstance(res, ParsedFile) and res.chunks:
             chunks.extend(res.chunks)
 
@@ -277,25 +288,3 @@ async def parse_directory(
         file_metadata=file_metadata,
         changed_files=changed_files,
     )
-
-
-async def _bounded_gather(items: List[Path], worker, concurrency: int):
-    iterator = iter(items)
-    pending: set[asyncio.Task] = set()
-
-    for _ in range(concurrency):
-        try:
-            item = next(iterator)
-        except StopIteration:
-            break
-        pending.add(asyncio.create_task(worker(item)))
-
-    while pending:
-        done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-        for task in done:
-            yield task.result()
-            try:
-                item = next(iterator)
-            except StopIteration:
-                continue
-            pending.add(asyncio.create_task(worker(item)))
