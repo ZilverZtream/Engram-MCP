@@ -244,15 +244,20 @@ class Embedder:
                 self._thread_pool = ThreadPoolExecutor(max_workers=_thread_workers)
             return "thread", self._thread_pool
 
+        # Process-pool workers each load a full copy of the model into RAM.
+        # Cap at 2 regardless of max_workers to prevent OOM on machines
+        # where cpu_count is large but available memory is limited.
+        _proc_workers = min(self.max_workers, 2)
+
         if self.shared:
-            key = (self.model_name, self.device, int(self.max_workers))
+            key = (self.model_name, self.device, _proc_workers)
             with self._shared_lock:
                 if self._shared_key is None:
                     pool, ref = self._shared_proc_pools.get(key, (None, 0))
                     if pool is None:
                         mp_context = multiprocessing.get_context("spawn")
                         pool = ProcessPoolExecutor(
-                            max_workers=self.max_workers,
+                            max_workers=_proc_workers,
                             mp_context=mp_context,
                             initializer=_worker_init,
                             initargs=(self.model_name, self.device),
@@ -265,7 +270,7 @@ class Embedder:
         if self._proc_pool is None:
             mp_context = multiprocessing.get_context("spawn")
             self._proc_pool = ProcessPoolExecutor(
-                max_workers=self.max_workers,
+                max_workers=_proc_workers,
                 mp_context=mp_context,
                 initializer=_worker_init,
                 initargs=(self.model_name, self.device),

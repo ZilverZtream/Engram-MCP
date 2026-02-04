@@ -14,6 +14,12 @@ class PathNotAllowed(Exception):
 
 
 PROJECT_ID_PATTERN = re.compile(r"^[a-zA-Z0-9_-]+$")
+# Windows reserves these names (with or without an extension) as device
+# handles.  Creating a file like "CON.index" on Windows interacts with
+# the console driver instead of the filesystem.
+_WINDOWS_RESERVED = re.compile(
+    r"^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(\.|$)", re.IGNORECASE
+)
 _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
 
 
@@ -26,6 +32,11 @@ class ProjectID:
         if sanitized != self.value or not PROJECT_ID_PATTERN.match(self.value):
             raise ValueError(
                 f"Invalid project_id: {self.value}. Only alphanumeric characters, underscores, and hyphens are allowed."
+            )
+        if _WINDOWS_RESERVED.match(self.value):
+            raise ValueError(
+                f"Invalid project_id: {self.value}. "
+                "Names that are reserved device identifiers on Windows (CON, PRN, AUX, NUL, COM1-9, LPT1-9) are not allowed."
             )
 
     def __str__(self) -> str:
