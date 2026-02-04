@@ -263,16 +263,16 @@ class Embedder:
 
     def close(self) -> None:
         if self._thread_pool is not None:
-            self._thread_pool.shutdown(wait=False, cancel_futures=True)
+            self._thread_pool.shutdown(wait=True, cancel_futures=True)
         if self._proc_pool is not None:
-            self._proc_pool.shutdown(wait=False, cancel_futures=True)
+            self._proc_pool.shutdown(wait=True, cancel_futures=True)
         if self.shared and self._shared_key is not None:
             pool_type, key = self._shared_key
             with self._shared_lock:
                 if pool_type == "thread":
                     pool, ref = self._shared_thread_pools.get(key, (None, 0))
                     if pool and ref <= 1:
-                        pool.shutdown(wait=False, cancel_futures=True)
+                        pool.shutdown(wait=True, cancel_futures=True)
                         self._shared_thread_pools.pop(key, None)
                         self._shared_models.pop((key[0], key[1]), None)
                     else:
@@ -280,7 +280,7 @@ class Embedder:
                 else:
                     pool, ref = self._shared_proc_pools.get(key, (None, 0))
                     if pool and ref <= 1:
-                        pool.shutdown(wait=False, cancel_futures=True)
+                        pool.shutdown(wait=True, cancel_futures=True)
                         self._shared_proc_pools.pop(key, None)
                     else:
                         self._shared_proc_pools[key] = (pool, ref - 1)

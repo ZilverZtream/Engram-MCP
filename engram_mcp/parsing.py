@@ -183,16 +183,14 @@ def hash_and_parse_file(
     overlap_tokens: int,
     max_file_size_mb: int,
 ) -> "tuple[List[Chunk], str]":
-    """Read a file exactly once, returning both its chunks and its SHA-256 hash.
+    """Stream a file to return both its chunks and SHA-256 hash.
 
-    ``parse_file_to_chunks`` and ``hash_file`` each perform an independent
-    full read.  For large repositories the second read doubles I/O and
-    latency unnecessarily.  This function loads the raw bytes once into a
-    bounded buffer (capped at ``max_file_size_mb``), computes the hash from
-    those bytes, and then parses the same buffer without touching the disk
-    again.
+    Text files are parsed line-by-line while hashing the raw bytes to avoid
+    large in-memory buffers. Binary formats (PDF/DOCX) fall back to a second
+    read via their parsers after hashing, prioritizing memory safety over
+    single-read I/O.
     """
-    import io
+    import codecs
 
     max_bytes = int(max_file_size_mb) * 1024 * 1024
     root_path = path_context.resolve_path(root)
@@ -202,12 +200,6 @@ def hash_and_parse_file(
     size = path_context.stat(path).st_size
     if size > max_bytes:
         raise ValueError(f"File too large: {path} ({size} bytes)")
-
-    # Single disk read
-    with path_context.open_file(path, "rb") as fh:
-        raw_data = fh.read()
-
-    content_hash = hashlib.sha256(raw_data).hexdigest()
 
     ext = path.suffix.lower()
     rel = str(path.relative_to(root))
@@ -220,22 +212,52 @@ def hash_and_parse_file(
     }
 
     if ext in SUPPORTED_TEXT_EXTS:
-        text = raw_data.decode("utf-8", errors="ignore")
+        hasher = hashlib.sha256()
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="ignore")
+        buffer = ""
+
+        def _iter_lines() -> Iterator[str]:
+            nonlocal buffer
+            with path_context.open_file(path, "rb") as fh:
+                while True:
+                    chunk = fh.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    hasher.update(chunk)
+                    text_chunk = decoder.decode(chunk)
+                    if not text_chunk:
+                        continue
+                    buffer += text_chunk
+                    lines = buffer.splitlines(keepends=True)
+                    if lines:
+                        if not buffer.endswith(("\n", "\r")):
+                            buffer = lines.pop() if lines else buffer
+                        else:
+                            buffer = ""
+                        for line in lines:
+                            yield line
+                tail = buffer + decoder.decode(b"", final=True)
+                if tail:
+                    for line in tail.splitlines(keepends=True):
+                        yield line
+
         base_id = make_chunk_id(str(path))
         chunks = chunk_lines(
-            lines=iter(text.splitlines(keepends=True)),
+            lines=_iter_lines(),
             base_id=base_id,
             meta=base_meta,
             target_tokens=chunk_size_tokens,
             overlap_tokens=overlap_tokens,
         )
-        return chunks, content_hash
+        return chunks, hasher.hexdigest()
 
     if ext == ".pdf":
         from pypdf import PdfReader
 
+        content_hash = hash_file(path_context, path, Path(root), max_bytes)
         max_text_chars = max_bytes * 4
-        reader = PdfReader(io.BytesIO(raw_data))
+        with path_context.open_file(path, "rb") as fh:
+            reader = PdfReader(fh)
         chunks: List[Chunk] = []
         base_id = make_chunk_id(str(path))
         total_chars = 0
@@ -266,7 +288,9 @@ def hash_and_parse_file(
     if ext == ".docx":
         from docx import Document
 
-        doc = Document(io.BytesIO(raw_data))
+        content_hash = hash_file(path_context, path, Path(root), max_bytes)
+        with path_context.open_file(path, "rb") as fh:
+            doc = Document(fh)
         paras = [p.text for p in doc.paragraphs if p.text and p.text.strip()]
         text = "\n".join(paras)
         base_id = make_chunk_id(str(path))
@@ -279,6 +303,7 @@ def hash_and_parse_file(
         )
         return chunks, content_hash
 
+    content_hash = hash_file(path_context, path, Path(root), max_bytes)
     return [], content_hash
 
 

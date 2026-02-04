@@ -55,16 +55,16 @@ CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
 
 -- Keep FTS in sync (triggers)
 CREATE TRIGGER IF NOT EXISTS chunks_ai AFTER INSERT ON chunks BEGIN
-  INSERT INTO chunks_fts(chunk_id, project_id, content)
-  VALUES (new.chunk_id, new.project_id, new.content);
+  INSERT INTO chunks_fts(rowid, chunk_id, project_id, content)
+  VALUES (new.rowid, new.chunk_id, new.project_id, new.content);
 END;
 
 CREATE TRIGGER IF NOT EXISTS chunks_ad AFTER DELETE ON chunks BEGIN
-  DELETE FROM chunks_fts WHERE chunk_id = old.chunk_id;
+  DELETE FROM chunks_fts WHERE rowid = old.rowid;
 END;
 
 CREATE TRIGGER IF NOT EXISTS chunks_au AFTER UPDATE OF content ON chunks BEGIN
-  UPDATE chunks_fts SET content = new.content WHERE chunk_id = new.chunk_id;
+  UPDATE chunks_fts SET content = new.content WHERE rowid = new.rowid;
 END;
 
 CREATE TABLE IF NOT EXISTS embedding_cache (
@@ -178,14 +178,22 @@ class _ConnectionPool:
                 conn = self._queue.get_nowait()
                 return conn
             except asyncio.QueueEmpty:
+                should_create = False
                 async with self._lock:
                     if self._created < self.maxsize:
-                        conn = await aiosqlite.connect(self.db_path)
+                        self._created += 1
+                        should_create = True
+                if should_create:
+                    try:
+                        conn = await aiosqlite.connect(self.db_path, isolation_level=None)
                         await conn.execute("PRAGMA foreign_keys=ON;")
                         await conn.execute("PRAGMA journal_mode=WAL;")
-                        self._created += 1
                         self._all.add(conn)
                         return conn
+                    except Exception:
+                        async with self._lock:
+                            self._created -= 1
+                        raise
                 conn = await self._queue.get()
                 return conn
         except Exception:
@@ -254,6 +262,7 @@ async def init_db(db_path: str) -> None:
         await _ensure_file_metadata_schema(db)
         await _ensure_file_chunks_schema(db)
         await _ensure_fts_tokenizer(db)
+        await _ensure_fts_triggers(db)
         await db.commit()
 
 
@@ -345,9 +354,34 @@ async def _ensure_fts_tokenizer(db: aiosqlite.Connection) -> None:
             content,
             tokenize = 'unicode61'
         );
-        INSERT INTO chunks_fts(chunk_id, project_id, content)
-        SELECT chunk_id, project_id, content FROM chunks;
+        INSERT INTO chunks_fts(rowid, chunk_id, project_id, content)
+        SELECT rowid, chunk_id, project_id, content FROM chunks;
         """
+    )
+
+
+async def _ensure_fts_triggers(db: aiosqlite.Connection) -> None:
+    await db.executescript(
+        """
+        DROP TRIGGER IF EXISTS chunks_ai;
+        DROP TRIGGER IF EXISTS chunks_ad;
+        DROP TRIGGER IF EXISTS chunks_au;
+        CREATE TRIGGER chunks_ai AFTER INSERT ON chunks BEGIN
+          INSERT INTO chunks_fts(rowid, chunk_id, project_id, content)
+          VALUES (new.rowid, new.chunk_id, new.project_id, new.content);
+        END;
+        CREATE TRIGGER chunks_ad AFTER DELETE ON chunks BEGIN
+          DELETE FROM chunks_fts WHERE rowid = old.rowid;
+        END;
+        CREATE TRIGGER chunks_au AFTER UPDATE OF content ON chunks BEGIN
+          UPDATE chunks_fts SET content = new.content WHERE rowid = new.rowid;
+        END;
+        """
+    )
+    await db.execute("DELETE FROM chunks_fts;")
+    await db.execute(
+        "INSERT INTO chunks_fts(rowid, chunk_id, project_id, content) "
+        "SELECT rowid, chunk_id, project_id, content FROM chunks;"
     )
 
 
