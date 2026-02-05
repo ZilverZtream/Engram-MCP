@@ -886,6 +886,7 @@ class Indexer:
             pending_ids: List[np.ndarray] = []
             pending_rows: List[List[Tuple[str, int, str, int, Dict[str, Any]]]] = []
             pending_file_rows: List[List[dbmod.FileMetadataRow]] = []
+            pending_file_metadata: List[dbmod.FileMetadataRow] = []
             training_vectors: List[np.ndarray] = []
             total_chunks = 0
             train_target = max(1000, int(self.cfg.faiss_nlist) * 20)
@@ -913,7 +914,10 @@ class Indexer:
                     chunk_ids=all_chunk_ids,
                 )
                 if not parsed.chunks:
-                    await dbmod.upsert_file_metadata(self.cfg.db_path, str(project_id), [file_row])
+                    if project_initialized:
+                        await dbmod.upsert_file_metadata(self.cfg.db_path, str(project_id), [file_row])
+                    else:
+                        pending_file_metadata.append(file_row)
                     continue
 
                 internal_ids = await dbmod.reserve_internal_ids(
@@ -952,6 +956,11 @@ class Indexer:
                             faiss_index_uuid=index_uuid,
                         )
                         project_initialized = True
+                        if pending_file_metadata:
+                            await dbmod.upsert_file_metadata(
+                                self.cfg.db_path, str(project_id), pending_file_metadata
+                            )
+                            pending_file_metadata.clear()
 
                     batch_rows = [
                         (c.chunk_id, int(iid), c.content, int(c.token_count), c.metadata)
@@ -1014,7 +1023,10 @@ class Indexer:
                     total_chunks += len(batch_chunks)
 
                 # All batches for this file persisted; now write its metadata.
-                await dbmod.upsert_file_metadata(self.cfg.db_path, str(project_id), [file_row])
+                if project_initialized:
+                    await dbmod.upsert_file_metadata(self.cfg.db_path, str(project_id), [file_row])
+                else:
+                    pending_file_metadata.append(file_row)
 
             if file_count == 0:
                 raise ValueError("No indexable content found.")
@@ -1044,6 +1056,10 @@ class Indexer:
                     },
                     faiss_index_uuid=index_uuid,
                 )
+                project_initialized = True
+            if pending_file_metadata:
+                await dbmod.upsert_file_metadata(self.cfg.db_path, str(project_id), pending_file_metadata)
+                pending_file_metadata.clear()
 
             if index is None:
                 train_vecs = np.vstack(training_vectors) if training_vectors else np.vstack(pending_vectors)
