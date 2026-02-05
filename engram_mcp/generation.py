@@ -278,11 +278,13 @@ class GenerationService:
         worker_count: int = 2,
         max_workers_per_model: int = 2,
         max_cached_models: int = 2,
+        gpu_semaphore: Optional[asyncio.Semaphore] = None,
     ) -> None:
         self._prefer_thread_for_cuda = prefer_thread_for_cuda
         self._worker_count = max(1, int(worker_count))
         self._max_workers_per_model = max(1, int(max_workers_per_model))
         self._max_cached_models = max(1, int(max_cached_models))
+        self._gpu_semaphore = gpu_semaphore
         self._queue: asyncio.Queue[_GenerationRequest] = asyncio.Queue()
         self._workers: list[asyncio.Task] = []
         self._started = asyncio.Event()
@@ -318,12 +320,22 @@ class GenerationService:
                 else:
                     generator_cache.move_to_end(key)
                 try:
-                    result = await generator.generate(
-                        req.prompt,
-                        max_new_tokens=req.max_new_tokens,
-                        temperature=req.temperature,
-                        top_p=req.top_p,
-                    )
+                    # Use GPU semaphore if available (low-VRAM mode)
+                    if self._gpu_semaphore is not None:
+                        async with self._gpu_semaphore:
+                            result = await generator.generate(
+                                req.prompt,
+                                max_new_tokens=req.max_new_tokens,
+                                temperature=req.temperature,
+                                top_p=req.top_p,
+                            )
+                    else:
+                        result = await generator.generate(
+                            req.prompt,
+                            max_new_tokens=req.max_new_tokens,
+                            temperature=req.temperature,
+                            top_p=req.top_p,
+                        )
                 except Exception as exc:
                     if not req.future.done():
                         req.future.set_exception(exc)

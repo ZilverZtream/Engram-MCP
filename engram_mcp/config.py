@@ -81,6 +81,9 @@ class EngramConfig:
     # Optional: keep GPU embeddings in-process (recommended)
     prefer_thread_for_cuda: bool = True
 
+    # GPU memory management
+    low_vram_mode: bool = False  # Enable to prevent embedding & generation from running concurrently
+
     # FAISS IVF+PQ settings
     faiss_nlist: int = 100
     faiss_m: int = 8
@@ -158,6 +161,9 @@ class AllowedConfig(BaseModel):
     auto_dream_max_runs_per_day: int = 1
 
     prefer_thread_for_cuda: bool = True
+
+    # GPU memory management
+    low_vram_mode: bool = False
 
     # FAISS IVF+PQ settings
     faiss_nlist: int = 100

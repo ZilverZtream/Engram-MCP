@@ -224,49 +224,57 @@ async def find_temporal_couplings(
 
     # Step 2: Build a query to fetch recent commits for ALL pairs at once
     # We'll use UNION ALL to combine queries for each pair
+    # IMPORTANT: Process in chunks to avoid SQLite query size limits
+    CHUNK_SIZE = 100  # Process 100 file pairs at a time to prevent SQLite errors
+
+    pair_commits: Dict[Tuple[str, str], List[str]] = {}
+
     async with dbmod.get_connection(_cfg.db_path) as db:
-        # Build batch query for recent commits
-        # For each pair, we need to find commits where both files changed
-        commit_queries = []
-        commit_params = []
+        # Process file_pairs in chunks
+        for chunk_idx in range(0, len(file_pairs), CHUNK_SIZE):
+            chunk = file_pairs[chunk_idx : chunk_idx + CHUNK_SIZE]
 
-        for file_a, file_b, _ in file_pairs:
-            commit_queries.append(
-                """
-                SELECT ? as file_a, ? as file_b, a.commit_hash, c.timestamp
-                FROM git_diffs a
-                JOIN git_diffs b ON a.commit_hash = b.commit_hash
-                JOIN git_commits c ON a.commit_hash = c.commit_hash
-                WHERE
-                    a.project_id = ? AND
-                    b.project_id = ? AND
-                    a.file_path = ? AND
-                    b.file_path = ?
-                """
-            )
-            commit_params.extend([file_a, file_b, project_id, project_id, file_a, file_b])
+            # Build batch query for recent commits
+            # For each pair, we need to find commits where both files changed
+            commit_queries = []
+            commit_params = []
 
-        # Execute batch query
-        batch_commit_query = " UNION ALL ".join(commit_queries)
-        batch_commit_query = f"""
-            WITH all_commits AS (
-                {batch_commit_query}
-            )
-            SELECT file_a, file_b, commit_hash, timestamp,
-                   ROW_NUMBER() OVER (PARTITION BY file_a, file_b ORDER BY timestamp DESC) as rn
-            FROM all_commits
-        """
+            for file_a, file_b, _ in chunk:
+                commit_queries.append(
+                    """
+                    SELECT ? as file_a, ? as file_b, a.commit_hash, c.timestamp
+                    FROM git_diffs a
+                    JOIN git_diffs b ON a.commit_hash = b.commit_hash
+                    JOIN git_commits c ON a.commit_hash = c.commit_hash
+                    WHERE
+                        a.project_id = ? AND
+                        b.project_id = ? AND
+                        a.file_path = ? AND
+                        b.file_path = ?
+                    """
+                )
+                commit_params.extend([file_a, file_b, project_id, project_id, file_a, file_b])
 
-        commit_rows = await db.execute_fetchall(batch_commit_query, commit_params)
+            # Execute batch query for this chunk
+            batch_commit_query = " UNION ALL ".join(commit_queries)
+            batch_commit_query = f"""
+                WITH all_commits AS (
+                    {batch_commit_query}
+                )
+                SELECT file_a, file_b, commit_hash, timestamp,
+                       ROW_NUMBER() OVER (PARTITION BY file_a, file_b ORDER BY timestamp DESC) as rn
+                FROM all_commits
+            """
 
-        # Map commits to file pairs (keep only top 3 per pair)
-        pair_commits: Dict[Tuple[str, str], List[str]] = {}
-        for file_a, file_b, commit_hash, _, rn in commit_rows:
-            if rn <= 3:  # Keep only top 3 recent commits per pair
-                key = (file_a, file_b)
-                if key not in pair_commits:
-                    pair_commits[key] = []
-                pair_commits[key].append(commit_hash)
+            commit_rows = await db.execute_fetchall(batch_commit_query, commit_params)
+
+            # Map commits to file pairs (keep only top 3 per pair)
+            for file_a, file_b, commit_hash, _, rn in commit_rows:
+                if rn <= 3:  # Keep only top 3 recent commits per pair
+                    key = (file_a, file_b)
+                    if key not in pair_commits:
+                        pair_commits[key] = []
+                    pair_commits[key].append(commit_hash)
 
         # Step 3: Build batch query for tags
         # Collect all unique commit hashes
