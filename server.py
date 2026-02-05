@@ -6,9 +6,11 @@ import hashlib
 import importlib.util
 import logging
 import os
+import re
 import signal
 import stat
 import time
+from fnmatch import fnmatch
 from typing import Any, Dict, List, Optional
 
 from fastmcp import FastMCP
@@ -662,10 +664,50 @@ async def search_memory(
     except Exception:
         logging.warning("Auto dream trigger failed", exc_info=True)
 
+    # Shadow Documentation: Inject repo_rules into matching file paths
+    repo_rules = await dbmod.fetch_repo_rules(cfg.db_path, project_id=project_id)
+
+    def _match_file_pattern(file_path: str, pattern: str) -> bool:
+        """Match file path against glob pattern (e.g., *.py, src/**/*.ts)."""
+        # Simple glob matching
+        if "**" in pattern:
+            # Handle ** as "any directory depth"
+            pattern_parts = pattern.split("**")
+            if len(pattern_parts) == 2:
+                prefix, suffix = pattern_parts
+                # Check if path starts with prefix and ends with suffix pattern
+                if prefix and not file_path.startswith(prefix.rstrip("/")):
+                    return False
+                return fnmatch(file_path, f"*{suffix}")
+        return fnmatch(file_path, pattern)
+
+    def _inject_repo_rules(content: str, file_path: str) -> str:
+        """Prepend matching repo rules to content."""
+        if not repo_rules or not file_path:
+            return content
+
+        applicable_rules = []
+        for rule in repo_rules:
+            if _match_file_pattern(file_path, rule["file_pattern"]):
+                applicable_rules.append(rule)
+
+        if not applicable_rules:
+            return content
+
+        # Build rule header
+        rule_header = ""
+        for rule in applicable_rules:
+            rule_header += f"[Repo Constraint]: {rule['rule_text']}\n"
+        rule_header += "\n"
+
+        return rule_header + content
+
     # Compact response (clients can format)
-    def _trim_content(text: str) -> str:
+    def _trim_content(text: str, file_path: str = "") -> str:
         if not include_content:
             return ""
+        # Inject repo rules before trimming
+        text = _inject_repo_rules(text, file_path)
         if max_content_chars and len(text) > max_content_chars:
             return text[:max_content_chars] + "…"
         return text
@@ -681,7 +723,16 @@ async def search_memory(
                 "score": r.get("relevance_score"),
                 "token_count": r.get("token_count"),
                 "metadata": r.get("metadata"),
-                **({"content": _trim_content(r.get("content") or "")} if include_content else {}),
+                **(
+                    {
+                        "content": _trim_content(
+                            r.get("content") or "",
+                            file_path=r.get("metadata", {}).get("file_path", ""),
+                        )
+                    }
+                    if include_content
+                    else {}
+                ),
             }
             for r in results
         ],
@@ -1090,6 +1141,313 @@ async def delete_project(project_id: str) -> str:
     await remove_project_lock(project_id)
     await remove_project_rwlock(project_id)
     return f"✅ Deleted {project_id}"
+
+
+# ============================================================================
+# Agent-Native Tool Suite: Deterministic, High-Value Tools
+# ============================================================================
+
+
+@mcp.tool
+async def get_codebase_overview(project_id: str) -> Dict[str, Any]:
+    """Get high-level codebase map: file count, top modified files, directory structure.
+
+    AGENT NOTE: Call this first to orient yourself in a new project. Returns a quick
+    snapshot of the codebase structure without expensive operations.
+
+    Hints after reading results:
+    - To explore dependencies, use find_symbol_references
+    - To debug errors, use analyze_error_stack
+    - To search code semantically, use search_memory
+    """
+    await dbmod.init_db(cfg.db_path)
+
+    try:
+        ProjectID(project_id)
+    except ValueError as e:
+        return {"error": str(e)}
+
+    proj = await dbmod.get_project(cfg.db_path, project_id)
+    if not proj:
+        return {"error": f"Project not found: {project_id}"}
+
+    start_time = time.perf_counter()
+
+    try:
+        stats = await dbmod.get_codebase_statistics(cfg.db_path, project_id=project_id)
+        duration_ms = int((time.perf_counter() - start_time) * 1000)
+
+        # Build hint based on stats
+        hints = []
+        if stats["total_files"] > 100:
+            hints.append("Large codebase detected. Use find_symbol_references for precise navigation.")
+        if len(stats["language_breakdown"]) > 3:
+            hints.append("Polyglot project. Check language_breakdown to understand tech stack.")
+        hints.append("To explore symbol definitions and dependencies, use find_symbol_references(symbol_name).")
+        hints.append("To debug stack traces, use analyze_error_stack(traceback).")
+
+        logging.info(
+            "get_codebase_overview completed",
+            extra={
+                "project_id": project_id,
+                "duration_ms": duration_ms,
+                "total_files": stats["total_files"],
+            },
+        )
+
+        return {
+            **stats,
+            "hints": hints,
+            "latency_ms": duration_ms,
+        }
+    except Exception as exc:
+        logging.error("get_codebase_overview failed", exc_info=True)
+        return {"error": f"Failed to generate overview: {exc}"}
+
+
+@mcp.tool
+async def find_symbol_references(symbol_name: str, project_id: str) -> Dict[str, Any]:
+    """Deterministic lookup: Find exactly where a class/function/variable is defined and used.
+
+    AGENT NOTE: Use this for refactoring, dependency analysis, or understanding call graphs.
+    Returns precise file paths and line numbers, not fuzzy search results.
+
+    Args:
+        symbol_name: Exact or partial name (e.g., "AuthService" or "parse")
+        project_id: Project identifier
+
+    Returns:
+        - definitions: Where the symbol is defined (file, line range)
+        - references: Where the symbol is called/imported (with edge types)
+        - total counts for both
+
+    Performance: Pure SQLite queries, <200ms for most codebases.
+    """
+    await dbmod.init_db(cfg.db_path)
+
+    try:
+        ProjectID(project_id)
+    except ValueError as e:
+        return {"error": str(e)}
+
+    proj = await dbmod.get_project(cfg.db_path, project_id)
+    if not proj:
+        return {"error": f"Project not found: {project_id}"}
+
+    if not symbol_name or not symbol_name.strip():
+        return {"error": "symbol_name cannot be empty"}
+
+    start_time = time.perf_counter()
+
+    try:
+        result = await dbmod.find_symbol_with_references(
+            cfg.db_path,
+            project_id=project_id,
+            symbol_name=symbol_name.strip(),
+        )
+        duration_ms = int((time.perf_counter() - start_time) * 1000)
+
+        if result["total_definitions"] == 0:
+            msg = (
+                f"Symbol '{symbol_name}' not found in AST index. "
+                "This means either: (1) it doesn't exist, (2) the file hasn't been indexed yet, "
+                "or (3) it's not a top-level function/class (try searching for the parent scope)."
+            )
+            logging.info(
+                "find_symbol_references: symbol not found",
+                extra={
+                    "project_id": project_id,
+                    "symbol_name": symbol_name,
+                    "duration_ms": duration_ms,
+                },
+            )
+            return {
+                "definitions": [],
+                "references": [],
+                "total_definitions": 0,
+                "total_references": 0,
+                "message": msg,
+                "latency_ms": duration_ms,
+            }
+
+        logging.info(
+            "find_symbol_references completed",
+            extra={
+                "project_id": project_id,
+                "symbol_name": symbol_name,
+                "duration_ms": duration_ms,
+                "definitions_found": result["total_definitions"],
+                "references_found": result["total_references"],
+            },
+        )
+
+        return {
+            **result,
+            "latency_ms": duration_ms,
+        }
+    except Exception as exc:
+        logging.error("find_symbol_references failed", exc_info=True)
+        return {"error": f"Failed to find symbol: {exc}"}
+
+
+@mcp.tool
+async def analyze_error_stack(traceback: str, project_id: str) -> Dict[str, Any]:
+    """Parse a stack trace and return relevant code chunks + their callers.
+
+    AGENT NOTE: Paste error messages or stack traces here to get immediate context.
+    This tool extracts file paths and line numbers, fetches the relevant code,
+    and shows you what functions are involved.
+
+    Args:
+        traceback: Raw error output (Python, JS, Rust, etc.)
+        project_id: Project identifier
+
+    Returns:
+        - parsed_frames: List of {file, line, error_msg} extracted from trace
+        - code_context: Relevant code chunks for each frame
+        - total_frames: Number of stack frames parsed
+
+    Performance: Regex parsing + chunk lookups, <200ms for typical traces.
+    """
+    await dbmod.init_db(cfg.db_path)
+
+    try:
+        ProjectID(project_id)
+    except ValueError as e:
+        return {"error": str(e)}
+
+    proj = await dbmod.get_project(cfg.db_path, project_id)
+    if not proj:
+        return {"error": f"Project not found: {project_id}"}
+
+    if not traceback or not traceback.strip():
+        return {"error": "traceback cannot be empty"}
+
+    start_time = time.perf_counter()
+
+    try:
+        # Parse stack trace for file paths and line numbers
+        # Common patterns:
+        #   Python: File "/path/to/file.py", line 42
+        #   JavaScript: at /path/to/file.js:42:5
+        #   Rust: at src/main.rs:42:5
+        #   Go: /path/to/file.go:42
+
+        import re
+
+        frames = []
+
+        # Python pattern
+        py_pattern = r'File "([^"]+)", line (\d+)'
+        for match in re.finditer(py_pattern, traceback):
+            file_path = match.group(1)
+            line_num = int(match.group(2))
+            frames.append({"file": file_path, "line": line_num, "language": "python"})
+
+        # JavaScript/TypeScript pattern
+        js_pattern = r'at (?:.*?\()?([^:)]+):(\d+):(\d+)'
+        for match in re.finditer(js_pattern, traceback):
+            file_path = match.group(1)
+            line_num = int(match.group(2))
+            # Filter out node_modules and built-in modules
+            if "node_modules" not in file_path and not file_path.startswith("internal/"):
+                frames.append({"file": file_path, "line": line_num, "language": "javascript"})
+
+        # Rust/Go pattern
+        rust_go_pattern = r'at ([^:]+):(\d+):(\d+)'
+        for match in re.finditer(rust_go_pattern, traceback):
+            file_path = match.group(1)
+            line_num = int(match.group(2))
+            if file_path.endswith((".rs", ".go")):
+                frames.append({"file": file_path, "line": line_num, "language": "rust_or_go"})
+
+        if not frames:
+            return {
+                "parsed_frames": [],
+                "code_context": [],
+                "total_frames": 0,
+                "message": "No file paths or line numbers detected in traceback. Supported formats: Python, JavaScript/TypeScript, Rust, Go.",
+                "latency_ms": int((time.perf_counter() - start_time) * 1000),
+            }
+
+        # Fetch code chunks for each frame
+        code_context = []
+        project_dir = proj.get("directory_realpath") or proj.get("directory", "")
+
+        for frame in frames:
+            file_path = frame["file"]
+            line_num = frame["line"]
+
+            # Normalize path: remove project directory prefix if present
+            if project_dir and file_path.startswith(project_dir):
+                file_path = file_path[len(project_dir):].lstrip("/")
+
+            # Fetch chunks covering this line (with ±5 line context)
+            try:
+                chunks = await dbmod.fetch_chunks_by_file_lines(
+                    cfg.db_path,
+                    project_id=project_id,
+                    file_path=file_path,
+                    start_line=max(1, line_num - 5),
+                    end_line=line_num + 5,
+                )
+
+                if chunks:
+                    # Take the first chunk (most relevant)
+                    chunk = chunks[0]
+                    code_context.append(
+                        {
+                            "file": file_path,
+                            "line": line_num,
+                            "chunk_id": chunk["id"],
+                            "content": chunk["content"][:1000],  # Limit to 1000 chars
+                            "start_line": chunk["metadata"].get("start_line"),
+                            "end_line": chunk["metadata"].get("end_line"),
+                        }
+                    )
+                else:
+                    # No chunk found, but include the frame info
+                    code_context.append(
+                        {
+                            "file": file_path,
+                            "line": line_num,
+                            "content": f"[No indexed code found for {file_path}:{line_num}]",
+                        }
+                    )
+            except Exception as chunk_exc:
+                logging.warning(
+                    "Failed to fetch chunk for frame",
+                    extra={"file": file_path, "line": line_num, "error": str(chunk_exc)},
+                )
+                code_context.append(
+                    {
+                        "file": file_path,
+                        "line": line_num,
+                        "content": f"[Error fetching code: {chunk_exc}]",
+                    }
+                )
+
+        duration_ms = int((time.perf_counter() - start_time) * 1000)
+
+        logging.info(
+            "analyze_error_stack completed",
+            extra={
+                "project_id": project_id,
+                "duration_ms": duration_ms,
+                "frames_parsed": len(frames),
+                "code_contexts_found": len([c for c in code_context if "No indexed code" not in c.get("content", "")]),
+            },
+        )
+
+        return {
+            "parsed_frames": frames,
+            "code_context": code_context,
+            "total_frames": len(frames),
+            "latency_ms": duration_ms,
+        }
+    except Exception as exc:
+        logging.error("analyze_error_stack failed", exc_info=True)
+        return {"error": f"Failed to analyze stack trace: {exc}"}
 
 
 def main() -> None:

@@ -353,6 +353,7 @@ async def init_db(db_path: str) -> None:
         await _ensure_fts_triggers(db)
         await _ensure_search_sessions_schema(db)
         await _ensure_graph_schema(db)
+        await _ensure_repo_rules_schema(db)
         await db.commit()
 
 async def _ensure_chunks_vector_column(db: aiosqlite.Connection) -> None:
@@ -1930,4 +1931,342 @@ async def clear_project_dirty(db_path: str, project_id: str) -> None:
             "UPDATE projects SET index_dirty = 0, updated_at = datetime('now') WHERE project_id = ?",
             (project_id,),
         )
+        await db.commit()
+
+
+# ============================================================================
+# Agent-Native Tool Suite: Deterministic Queries
+# ============================================================================
+
+
+async def get_codebase_statistics(
+    db_path: str,
+    *,
+    project_id: str,
+) -> Dict[str, Any]:
+    """Return high-level codebase overview for agent orientation.
+
+    Returns:
+        - total_files: Total file count
+        - total_chunks: Total chunk count
+        - top_modified_files: Top 5 most recently modified files
+        - top_directories: Top-level directories in the project
+        - language_breakdown: Count of files by extension
+    """
+    async with get_connection(db_path) as db:
+        db.row_factory = aiosqlite.Row
+
+        # Get total files and chunks
+        stats_row = await db.execute_fetchone(
+            """
+            SELECT
+                COUNT(DISTINCT fm.file_path) as file_count,
+                COUNT(DISTINCT c.chunk_id) as chunk_count
+            FROM file_metadata fm
+            LEFT JOIN file_chunks fc ON fm.project_id = fc.project_id AND fm.file_path = fc.file_path
+            LEFT JOIN chunks c ON fc.chunk_id = c.chunk_id
+            WHERE fm.project_id = ?
+            """,
+            (project_id,),
+        )
+
+        # Get top 5 most recently modified files
+        top_files_rows = await db.execute_fetchall(
+            """
+            SELECT file_path, mtime_ns, size_bytes
+            FROM file_metadata
+            WHERE project_id = ?
+            ORDER BY mtime_ns DESC
+            LIMIT 5
+            """,
+            (project_id,),
+        )
+
+        # Get all file paths for directory and extension analysis
+        all_files_rows = await db.execute_fetchall(
+            "SELECT file_path FROM file_metadata WHERE project_id = ?",
+            (project_id,),
+        )
+
+    # Analyze directories
+    top_dirs: set[str] = set()
+    ext_counts: Dict[str, int] = {}
+
+    for row in all_files_rows:
+        path = str(row["file_path"])
+        # Extract top-level directory
+        parts = path.split("/")
+        if len(parts) > 1:
+            top_dirs.add(parts[0])
+        # Extract extension
+        if "." in path:
+            ext = path.rsplit(".", 1)[-1]
+            ext_counts[ext] = ext_counts.get(ext, 0) + 1
+
+    # Sort extensions by count
+    sorted_exts = sorted(ext_counts.items(), key=lambda x: x[1], reverse=True)[:10]
+
+    return {
+        "total_files": int(stats_row["file_count"]) if stats_row else 0,
+        "total_chunks": int(stats_row["chunk_count"]) if stats_row else 0,
+        "top_modified_files": [
+            {
+                "path": r["file_path"],
+                "size_bytes": int(r["size_bytes"]),
+            }
+            for r in top_files_rows
+        ],
+        "top_directories": sorted(top_dirs),
+        "language_breakdown": [{"extension": ext, "count": count} for ext, count in sorted_exts],
+    }
+
+
+async def find_symbol_with_references(
+    db_path: str,
+    *,
+    project_id: str,
+    symbol_name: str,
+) -> Dict[str, Any]:
+    """Deterministic symbol lookup with full reference graph.
+
+    Args:
+        symbol_name: Exact or partial name (uses LIKE %symbol%)
+
+    Returns:
+        Dictionary with:
+        - definitions: List of locations where symbol is defined
+        - references: List of files/functions that reference the symbol
+        - total_definitions: Count of definitions found
+        - total_references: Count of references found
+    """
+    async with get_connection(db_path) as db:
+        db.row_factory = aiosqlite.Row
+
+        # Find all matching definitions (exact and partial)
+        definition_rows = await db.execute_fetchall(
+            """
+            SELECT node_id, node_type, name, file_path, start_line, end_line, metadata
+            FROM graph_nodes
+            WHERE project_id = ? AND (name = ? OR name LIKE ?)
+            ORDER BY file_path, start_line
+            LIMIT 50
+            """,
+            (project_id, symbol_name, f"%{symbol_name}%"),
+        )
+
+        definitions = []
+        all_node_ids = []
+
+        for r in definition_rows:
+            node_id = r["node_id"]
+            all_node_ids.append(node_id)
+            definitions.append(
+                {
+                    "node_id": node_id,
+                    "node_type": r["node_type"],
+                    "name": r["name"],
+                    "file_path": r["file_path"],
+                    "start_line": int(r["start_line"]),
+                    "end_line": int(r["end_line"]),
+                    "metadata": _safe_load_metadata(r["metadata"], context=f"symbol:{node_id}"),
+                }
+            )
+
+        # Find all references (incoming edges to these symbols)
+        references = []
+        if all_node_ids:
+            # Find all nodes that reference our symbols
+            for node_id in all_node_ids:
+                ref_rows = await db.execute_fetchall(
+                    """
+                    SELECT DISTINCT gn.node_id, gn.node_type, gn.name, gn.file_path,
+                           gn.start_line, gn.end_line, ge.edge_type
+                    FROM graph_edges ge
+                    JOIN graph_nodes gn ON ge.source_id = gn.node_id AND ge.project_id = gn.project_id
+                    WHERE ge.project_id = ? AND ge.target_id = ?
+                    ORDER BY gn.file_path, gn.start_line
+                    LIMIT 100
+                    """,
+                    (project_id, node_id),
+                )
+
+                for ref in ref_rows:
+                    references.append(
+                        {
+                            "source_node_id": ref["node_id"],
+                            "source_type": ref["node_type"],
+                            "source_name": ref["name"],
+                            "source_file": ref["file_path"],
+                            "source_line": int(ref["start_line"]),
+                            "edge_type": ref["edge_type"],
+                            "target_symbol": symbol_name,
+                        }
+                    )
+
+    return {
+        "definitions": definitions,
+        "references": references,
+        "total_definitions": len(definitions),
+        "total_references": len(references),
+    }
+
+
+async def fetch_chunks_by_file_lines(
+    db_path: str,
+    *,
+    project_id: str,
+    file_path: str,
+    start_line: int,
+    end_line: int,
+) -> List[Dict[str, Any]]:
+    """Retrieve chunks that cover a specific line range in a file.
+
+    This is optimized for stack trace analysis where we need to fetch
+    the exact code around a specific line number.
+
+    Args:
+        file_path: Relative path within the project
+        start_line: Starting line number (1-indexed)
+        end_line: Ending line number (1-indexed)
+
+    Returns:
+        List of chunk dictionaries containing the relevant lines
+    """
+    async with get_connection(db_path) as db:
+        db.row_factory = aiosqlite.Row
+
+        # Get all chunks for this file
+        rows = await db.execute_fetchall(
+            """
+            SELECT c.chunk_id, c.internal_id, c.content, c.token_count,
+                   c.metadata, c.access_count
+            FROM chunks c
+            JOIN file_chunks fc ON c.chunk_id = fc.chunk_id
+            WHERE fc.project_id = ? AND fc.file_path = ?
+            ORDER BY c.internal_id
+            """,
+            (project_id, file_path),
+        )
+
+    results = []
+    for r in rows:
+        meta = _safe_load_metadata(r["metadata"], context=f"chunk:{r['chunk_id']}")
+
+        # Check if chunk covers the requested line range
+        chunk_start = meta.get("start_line", 0)
+        chunk_end = meta.get("end_line", 999999)
+
+        # Include chunk if there's any overlap with requested range
+        if chunk_start <= end_line and chunk_end >= start_line:
+            results.append(
+                {
+                    "id": r["chunk_id"],
+                    "internal_id": int(r["internal_id"]),
+                    "content": r["content"],
+                    "token_count": int(r["token_count"]),
+                    "metadata": meta,
+                    "access_count": int(r["access_count"] or 0),
+                    "file_path": file_path,
+                }
+            )
+
+    return results
+
+
+async def _ensure_repo_rules_schema(db: aiosqlite.Connection) -> None:
+    """Migration repo_rules_v1: create repo_rules table for Shadow Documentation."""
+    row = await db.execute_fetchone(
+        "SELECT 1 FROM schema_migrations WHERE name = 'repo_rules_v1'"
+    )
+    if row:
+        return
+
+    await db.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS repo_rules (
+            rule_id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            file_pattern TEXT NOT NULL,
+            rule_text TEXT NOT NULL,
+            priority INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT DEFAULT (datetime('now')),
+            FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_repo_rules_project
+            ON repo_rules(project_id, priority DESC);
+        """
+    )
+    await db.execute(
+        "INSERT INTO schema_migrations(name) VALUES(?)", ("repo_rules_v1",)
+    )
+
+
+async def upsert_repo_rule(
+    db_path: str,
+    *,
+    project_id: str,
+    rule_id: str,
+    file_pattern: str,
+    rule_text: str,
+    priority: int = 0,
+) -> None:
+    """Add or update a repository rule for Shadow Documentation.
+
+    Args:
+        rule_id: Unique identifier for the rule
+        file_pattern: Glob pattern to match files (e.g., "*.py", "src/**/*.ts")
+        rule_text: The constraint or guideline text to inject
+        priority: Higher priority rules are applied first (default 0)
+    """
+    async with get_connection(db_path) as db:
+        await _ensure_repo_rules_schema(db)
+        await db.execute(
+            """
+            INSERT INTO repo_rules(rule_id, project_id, file_pattern, rule_text, priority)
+            VALUES(?, ?, ?, ?, ?)
+            ON CONFLICT(rule_id) DO UPDATE SET
+                project_id = excluded.project_id,
+                file_pattern = excluded.file_pattern,
+                rule_text = excluded.rule_text,
+                priority = excluded.priority
+            """,
+            (rule_id, project_id, file_pattern, rule_text, priority),
+        )
+        await db.commit()
+
+
+async def fetch_repo_rules(
+    db_path: str,
+    *,
+    project_id: str,
+) -> List[Dict[str, Any]]:
+    """Fetch all repository rules for a project, ordered by priority."""
+    async with get_connection(db_path) as db:
+        await _ensure_repo_rules_schema(db)
+        db.row_factory = aiosqlite.Row
+        rows = await db.execute_fetchall(
+            """
+            SELECT rule_id, file_pattern, rule_text, priority
+            FROM repo_rules
+            WHERE project_id = ?
+            ORDER BY priority DESC
+            """,
+            (project_id,),
+        )
+
+    return [
+        {
+            "rule_id": r["rule_id"],
+            "file_pattern": r["file_pattern"],
+            "rule_text": r["rule_text"],
+            "priority": int(r["priority"]),
+        }
+        for r in rows
+    ]
+
+
+async def delete_repo_rule(db_path: str, rule_id: str) -> None:
+    """Delete a repository rule by ID."""
+    async with get_connection(db_path) as db:
+        await db.execute("DELETE FROM repo_rules WHERE rule_id = ?", (rule_id,))
         await db.commit()
