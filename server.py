@@ -641,6 +641,207 @@ async def get_chunk(project_id: str, chunk_id: str, include_content: bool = True
 
 
 @mcp.tool
+async def query_graph_nodes(
+    project_id: str,
+    node_type: str = "",
+    name_pattern: str = "",
+    file_path: str = "",
+    limit: int = 100,
+) -> Dict[str, Any]:
+    """List functions/classes extracted from the code graph.
+
+    node_type   – filter to ``function`` or ``class`` (empty = both).
+    name_pattern – SQL LIKE pattern; e.g. ``%parse%`` matches any name
+                   containing "parse".  Wrap in ``%`` for substring match.
+    file_path   – restrict results to a single source file.
+    limit       – max rows returned (cap 500).
+    """
+    await dbmod.init_db(cfg.db_path)
+    proj = await dbmod.get_project(cfg.db_path, project_id)
+    if not proj:
+        return {"error": f"Project not found: {project_id}"}
+    limit = max(1, min(500, int(limit)))
+    nodes = await dbmod.query_graph_nodes(
+        cfg.db_path,
+        project_id=project_id,
+        node_type=node_type or None,
+        name_pattern=name_pattern or None,
+        file_path=file_path or None,
+        limit=limit,
+    )
+    return {"project_id": project_id, "count": len(nodes), "nodes": nodes}
+
+
+@mcp.tool
+async def find_references(project_id: str, node_id: str) -> Dict[str, Any]:
+    """Find all graph edges (callers / callees / containment) for a node.
+
+    node_id is the value returned by ``query_graph_nodes`` (format
+    ``<file_path>:<node_type>:<name>``).
+
+    Returns:
+      outgoing – edges where this node is the *source* (e.g. calls)
+      incoming – edges where this node is the *target* (e.g. called_by)
+
+    Each edge entry includes the peer node_id and edge_type.  Resolve
+    peer details by passing the peer node_id back into ``query_graph_nodes``
+    with a matching name_pattern.
+    """
+    await dbmod.init_db(cfg.db_path)
+    proj = await dbmod.get_project(cfg.db_path, project_id)
+    if not proj:
+        return {"error": f"Project not found: {project_id}"}
+    edges = await dbmod.fetch_graph_edges(cfg.db_path, project_id=project_id, node_id=node_id)
+    # Resolve peer node details for all referenced node_ids in one batch.
+    peer_ids: List[str] = []
+    seen: set[str] = set()
+    for e in edges["outgoing"]:
+        tid = e["target_id"]
+        if tid not in seen:
+            peer_ids.append(tid)
+            seen.add(tid)
+    for e in edges["incoming"]:
+        sid = e["source_id"]
+        if sid not in seen:
+            peer_ids.append(sid)
+            seen.add(sid)
+    # Look up each peer.  node_id == "<file>:<type>:<name>" – extract name
+    # and do an exact match via the name_pattern filter.
+    peer_map: Dict[str, Dict[str, Any]] = {}
+    for pid in peer_ids:
+        parts = pid.split(":", 2)
+        if len(parts) == 3:
+            fp, _nt, _nm = parts
+            peers = await dbmod.query_graph_nodes(
+                cfg.db_path, project_id=project_id, file_path=fp, limit=500
+            )
+            for p in peers:
+                peer_map[p["node_id"]] = p
+    # Annotate edges with resolved peer info.
+    for e in edges["outgoing"]:
+        peer = peer_map.get(e["target_id"])
+        if peer:
+            e["target"] = peer
+    for e in edges["incoming"]:
+        peer = peer_map.get(e["source_id"])
+        if peer:
+            e["source"] = peer
+    return {
+        "project_id": project_id,
+        "node_id": node_id,
+        "outgoing": edges["outgoing"],
+        "incoming": edges["incoming"],
+    }
+
+
+@mcp.tool
+async def graph_search(
+    project_id: str,
+    query: str,
+    max_results: int = 10,
+    symbol_boost: float = 0.03,
+) -> Dict[str, Any]:
+    """Search that combines text search with code-graph symbol awareness.
+
+    1. Extracts potential symbol names from *query*.
+    2. Looks up those names in graph_nodes to find which files contain
+       matching symbols.
+    3. Runs a normal FTS search.
+    4. Boosts the RRF score of any chunk whose source file contains a
+       matching symbol by *symbol_boost* (default 0.03, ~15x the insight
+       bonus used elsewhere).
+    5. Returns results with a ``graph_match`` flag and, where applicable,
+       the matched node details.
+    """
+    await dbmod.init_db(cfg.db_path)
+    proj = await dbmod.get_project(cfg.db_path, project_id)
+    if not proj:
+        return {"error": f"Project not found: {project_id}"}
+
+    # --- Extract candidate symbol tokens (alphanumeric + _ sequences that
+    # look like identifiers; skip very short or all-lowercase common words).
+    import re as _re
+
+    raw_tokens = _re.findall(r'[A-Za-z_]\w*', query)
+    # Keep tokens that are either camelCase, contain underscore, start with
+    # upper-case, or are long enough to be interesting (>= 4 chars).
+    candidates = [
+        t for t in raw_tokens
+        if len(t) >= 4
+        or '_' in t
+        or (len(t) >= 2 and t[0].isupper())
+        or any(c.isupper() for c in t[1:])  # camelCase interior caps
+    ]
+
+    # --- Graph: find nodes whose names match any candidate ---
+    symbol_files: Dict[str, List[Dict[str, Any]]] = {}  # file_path → [node, …]
+    for sym in candidates:
+        pattern = f"%{sym}%"
+        nodes = await dbmod.query_graph_nodes(
+            cfg.db_path, project_id=project_id, name_pattern=pattern, limit=50
+        )
+        for n in nodes:
+            symbol_files.setdefault(n["file_path"], []).append(n)
+
+    # --- Text search (FTS, no vector needed – keeps this tool lightweight) ---
+    max_chars = int(getattr(cfg, "max_query_chars", 4096))
+    if len(query) > max_chars:
+        return {"error": f"Query too long ({len(query)} chars). Max is {max_chars}."}
+
+    fts_results = await dbmod.fts_search(
+        cfg.db_path,
+        project_id=project_id,
+        query=query,
+        limit=max(1, min(50, int(max_results) * 3)),  # over-fetch for re-ranking
+        mode="any",
+    )
+
+    # --- Apply symbol boost to chunks from files with matching symbols ---
+    boosted: List[Dict[str, Any]] = []
+    for r in fts_results:
+        meta = r.get("metadata") or {}
+        file_path = meta.get("item_name") or meta.get("path") or ""
+        # Normalise: item_name is the relative path stored during chunking.
+        matched_nodes = symbol_files.get(file_path, [])
+        base_score = float(r.get("lex_score", 0.0))
+        # bm25 scores from FTS5 are negative (lower = better); invert for
+        # a positive relevance score, then add the boost.
+        relevance = -base_score + (symbol_boost if matched_nodes else 0.0)
+        boosted.append(
+            {
+                "id": r.get("id"),
+                "score": round(relevance, 6),
+                "content": r.get("content", ""),
+                "metadata": meta,
+                "graph_match": bool(matched_nodes),
+                "matched_symbols": [
+                    {"name": n["name"], "node_type": n["node_type"], "node_id": n["node_id"]}
+                    for n in matched_nodes
+                ] if matched_nodes else [],
+            }
+        )
+
+    # Sort descending by score, trim to max_results.
+    boosted.sort(key=lambda x: x["score"], reverse=True)
+    boosted = boosted[: max(1, min(50, int(max_results)))]
+
+    # Trim content for response size.
+    max_content = 1200
+    for r in boosted:
+        c = r.get("content") or ""
+        if len(c) > max_content:
+            r["content"] = c[:max_content] + "…"
+
+    return {
+        "query": query,
+        "project_id": project_id,
+        "symbol_files_matched": len(symbol_files),
+        "count": len(boosted),
+        "results": boosted,
+    }
+
+
+@mcp.tool
 async def project_health(project_id: str) -> Dict[str, Any]:
     """Report index/DB health for a project."""
     await dbmod.init_db(cfg.db_path)

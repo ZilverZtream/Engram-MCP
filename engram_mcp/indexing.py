@@ -461,8 +461,8 @@ class Indexer:
             try:
                 if str(path.suffix).lower() == ".pdf":
                     async with pdf_sem:
-                        chunks = await _run_parse_with_timeout(
-                            mode="parse",
+                        chunks, _hash, nodes, edges = await _run_parse_with_timeout(
+                            mode="hash_and_parse",
                             path_context=self.project_path_context,
                             path=path,
                             root=directory,
@@ -472,8 +472,8 @@ class Indexer:
                             max_file_size_mb=self.cfg.max_file_size_mb,
                         )
                 else:
-                    chunks = await _run_parse_with_timeout(
-                        mode="parse",
+                    chunks, _hash, nodes, edges = await _run_parse_with_timeout(
+                        mode="hash_and_parse",
                         path_context=self.project_path_context,
                         path=path,
                         root=directory,
@@ -492,7 +492,12 @@ class Indexer:
                 size_bytes=size_bytes,
                 content_hash=content_hash,
                 chunks=chunks,
+                nodes=nodes,
+                edges=edges,
             )
+
+        pending_graph_nodes: list = []
+        pending_graph_edges: list = []
 
         try:
             async for parsed in _bounded_gather(
@@ -510,6 +515,10 @@ class Indexer:
                         chunk_ids=chunk_ids,
                     )
                 )
+                # Collect graph nodes/edges; persist after the stale-node delete.
+                pending_graph_nodes.extend(parsed.nodes)
+                pending_graph_edges.extend(parsed.edges)
+
                 if not parsed.chunks:
                     continue
                 internal_ids = await dbmod.reserve_internal_ids(self.cfg.db_path, str(project), len(parsed.chunks))
@@ -521,10 +530,10 @@ class Indexer:
                 added_chunk_ids.extend(chunk_ids)
                 added_count += len(parsed.chunks)
 
-            # Only delete old chunks for files that were *successfully*
-            # re-parsed (or truly deleted from disk).  Chunks belonging to
-            # files that failed re-parsing are preserved so that the previous
-            # good index survives transient errors.
+            # Only delete old chunks/nodes for files that were *successfully*
+            # re-parsed (or truly deleted from disk).  Data belonging to files
+            # that failed re-parsing is preserved so the previous good index
+            # survives transient errors.
             safe_to_delete_paths = sorted(
                 (deleted_files | changed_files) - failed_changed_files
             )
@@ -537,8 +546,32 @@ class Indexer:
                 ]
                 if safe_delete_ids:
                     await dbmod.delete_chunks(self.cfg.db_path, str(project), safe_delete_ids)
+                # Purge stale graph nodes BEFORE upserting the fresh ones below.
+                await dbmod.delete_graph_nodes_for_files(
+                    self.cfg.db_path, project_id=str(project), file_paths=safe_to_delete_paths
+                )
             else:
                 safe_delete_ids = []
+
+            # Persist freshly extracted graph nodes/edges (after the delete).
+            if pending_graph_nodes:
+                await dbmod.upsert_graph_nodes(
+                    self.cfg.db_path,
+                    project_id=str(project),
+                    nodes=[
+                        (n.node_id, n.node_type, n.name, n.file_path, n.start_line, n.end_line, n.metadata)
+                        for n in pending_graph_nodes
+                    ],
+                )
+            if pending_graph_edges:
+                await dbmod.upsert_graph_edges(
+                    self.cfg.db_path,
+                    project_id=str(project),
+                    edges=[
+                        (e.source_id, e.target_id, e.edge_type)
+                        for e in pending_graph_edges
+                    ],
+                )
 
             if updated_file_rows:
                 await dbmod.upsert_file_metadata(self.cfg.db_path, str(project), updated_file_rows)
@@ -1328,8 +1361,8 @@ class Indexer:
                     try:
                         if str(path.suffix).lower() == ".pdf":
                             async with pdf_sem:
-                                chunks = await _run_parse_with_timeout(
-                                    mode="parse",
+                                chunks, _hash, nodes, edges = await _run_parse_with_timeout(
+                                    mode="hash_and_parse",
                                     path_context=self.project_path_context,
                                     path=path,
                                     root=directory,
@@ -1339,8 +1372,8 @@ class Indexer:
                                     max_file_size_mb=self.cfg.max_file_size_mb,
                                 )
                         else:
-                            chunks = await _run_parse_with_timeout(
-                                mode="parse",
+                            chunks, _hash, nodes, edges = await _run_parse_with_timeout(
+                                mode="hash_and_parse",
                                 path_context=self.project_path_context,
                                 path=path,
                                 root=directory,
@@ -1359,6 +1392,8 @@ class Indexer:
                         size_bytes=size_bytes,
                         content_hash=content_hash,
                         chunks=chunks,
+                        nodes=nodes,
+                        edges=edges,
                     )
 
                 # --- Phase 1: parse + embed outside the write lock so that
@@ -1521,10 +1556,10 @@ class Indexer:
                             deleting=proj.get("deleting") or 0,
                         )
 
-                # Only delete old chunks for files that were successfully
-                # re-parsed (or removed from disk).  Preserve chunks for
-                # files that failed to parse so the previous good data
-                # survives transient errors.
+                # Only delete old chunks/nodes for files that were successfully
+                # re-parsed (or removed from disk).  Preserve data for files
+                # that failed to parse so the previous good index survives
+                # transient errors.
                 safe_to_delete_paths = sorted(
                     (deleted_files | changed_files) - failed_changed_files
                 )
@@ -1537,8 +1572,34 @@ class Indexer:
                     ]
                     if safe_delete_ids:
                         await dbmod.delete_chunks(self.cfg.db_path, str(project), safe_delete_ids)
+                    # Purge stale graph nodes BEFORE upserting fresh ones.
+                    await dbmod.delete_graph_nodes_for_files(
+                        self.cfg.db_path, project_id=str(project), file_paths=safe_to_delete_paths
+                    )
                 else:
                     safe_delete_ids = []
+
+                # Persist freshly extracted graph nodes/edges for changed files.
+                all_new_nodes = [n for p in pending_parsed for n in p.nodes]
+                all_new_edges = [e for p in pending_parsed for e in p.edges]
+                if all_new_nodes:
+                    await dbmod.upsert_graph_nodes(
+                        self.cfg.db_path,
+                        project_id=str(project),
+                        nodes=[
+                            (n.node_id, n.node_type, n.name, n.file_path, n.start_line, n.end_line, n.metadata)
+                            for n in all_new_nodes
+                        ],
+                    )
+                if all_new_edges:
+                    await dbmod.upsert_graph_edges(
+                        self.cfg.db_path,
+                        project_id=str(project),
+                        edges=[
+                            (e.source_id, e.target_id, e.edge_type)
+                            for e in all_new_edges
+                        ],
+                    )
 
                 if updated_file_rows:
                     await dbmod.upsert_file_metadata(self.cfg.db_path, str(project), updated_file_rows)
