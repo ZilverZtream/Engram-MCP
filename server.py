@@ -388,12 +388,18 @@ async def _run_dream_cycle(project_id: str, *, max_pairs: int = 10) -> str:
             if not context_a.strip() or not context_b.strip():
                 return None
             async with semaphore:
-                insight = await generation.generate_insight(
-                    context_a,
-                    context_b,
-                    model_name=cfg.dream_model_name,
-                    device=_device(),
-                )
+                try:
+                    insight = await asyncio.wait_for(
+                        generation.generate_insight(
+                            context_a,
+                            context_b,
+                            model_name=cfg.dream_model_name,
+                            device=_device(),
+                        ),
+                        timeout=30,
+                    )
+                except asyncio.TimeoutError:
+                    return None
             insight = (insight or "").strip()
             if not insight or "NO_INSIGHT" in insight.upper():
                 return None
