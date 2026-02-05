@@ -6,6 +6,7 @@ import hashlib
 import math
 import os
 import re
+import threading as _threading
 import time
 import uuid
 import logging
@@ -63,25 +64,72 @@ _PARSE_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
 )
 
 
+class _CancellationToken:
+    """Lightweight signal shared between the async caller and the worker thread.
+
+    The token is passed into the wrapper closure submitted to the executor.
+    When ``asyncio.wait_for`` raises *TimeoutError* the async side calls
+    ``cancel()``; the worker thread checks ``is_cancelled()`` after *fn*
+    returns.  Because CPython cannot forcibly terminate a thread the token
+    does **not** interrupt a blocking call inside *fn* — it is a cooperative
+    mechanism that:
+
+    1. Lets the worker log and discard its result so stale data is never
+       returned.
+    2. Provides an observable hook for metrics / alerting on thread-leak
+       duration.
+    """
+
+    __slots__ = ("_event",)
+
+    def __init__(self) -> None:
+        self._event = _threading.Event()
+
+    def cancel(self) -> None:
+        self._event.set()
+
+    def is_cancelled(self) -> bool:
+        return self._event.is_set()
+
+
+class _ParseTimeout(Exception):
+    """Raised when a parse task exceeds its wall-clock budget."""
+
+
+def _cancellable_wrapper(token: _CancellationToken, fn, *args):
+    """Execute *fn* and raise _ParseTimeout if the token was cancelled before fn returned."""
+    result = fn(*args)
+    if token.is_cancelled():
+        # The async side has already timed out and raised; discard the result
+        # and log so operators can track how long the leaked thread ran.
+        logging.warning(
+            "Parse thread completed after its timeout was already raised; result discarded."
+        )
+        raise _ParseTimeout("discarded: token cancelled before return")
+    return result
+
+
 async def _run_in_thread_with_timeout(fn, *args, timeout: float = _PARSE_TIMEOUT_S):
     """Run *fn* in the shared parse executor with a wall-clock timeout.
 
-    On timeout the asyncio Future is cancelled; the underlying thread
-    continues until *fn* returns naturally.  CPython provides no portable
-    mechanism to kill a running thread, so truly stuck work (e.g. an
-    infinite loop inside a C extension) persists until process exit.  The
-    shared pool is bounded, so the total number of leaked threads is capped
-    at max_workers — unlike the previous per-call executor design that could
-    spawn one thread pool (and one OS thread) per file, leading to 50 000
-    pools for a 50 000-file repository.
+    A ``_CancellationToken`` is shared between this coroutine and the
+    worker thread.  On timeout the token is cancelled so the thread can
+    detect — after *fn* returns naturally — that its result is no longer
+    needed.  CPython provides no portable mechanism to kill a running
+    thread, so truly stuck work (e.g. an infinite loop inside a C
+    extension) persists until process exit; the shared pool is bounded at
+    ``_CONCURRENCY_CAP * 3`` workers, capping the total number of leaked
+    threads regardless of input size.
     """
     loop = asyncio.get_running_loop()
+    token = _CancellationToken()
     try:
         return await asyncio.wait_for(
-            loop.run_in_executor(_PARSE_EXECUTOR, fn, *args),
+            loop.run_in_executor(_PARSE_EXECUTOR, _cancellable_wrapper, token, fn, *args),
             timeout=timeout,
         )
     except asyncio.TimeoutError:
+        token.cancel()
         raise asyncio.TimeoutError(f"Parse timed out after {timeout}s")
 
 

@@ -17,8 +17,8 @@ import aiosqlite
 if not hasattr(aiosqlite.Connection, "execute_fetchone"):
 
     async def _execute_fetchone(self, sql: str, parameters: tuple = ()) -> Any:  # type: ignore[override]
-        cursor = await self.execute(sql, parameters)
-        return await cursor.fetchone()
+        async with self.execute(sql, parameters) as cursor:
+            return await cursor.fetchone()
 
     aiosqlite.Connection.execute_fetchone = _execute_fetchone  # type: ignore[attr-defined]
 
@@ -90,6 +90,8 @@ CREATE TABLE IF NOT EXISTS embedding_cache (
     model_name TEXT NOT NULL,
     created_at TEXT DEFAULT (datetime('now'))
 );
+
+CREATE INDEX IF NOT EXISTS idx_embedding_cache_created_at ON embedding_cache(created_at);
 
 CREATE TABLE IF NOT EXISTS file_metadata (
     project_id TEXT NOT NULL,
@@ -620,6 +622,7 @@ async def list_projects(db_path: str) -> List[Dict[str, Any]]:
             SELECT project_id, project_name, project_type, directory, directory_realpath,
                    chunk_count, file_count, total_tokens, updated_at, deleting
             FROM projects
+            WHERE deleting = 0
             ORDER BY updated_at DESC
             """
         )
@@ -632,7 +635,7 @@ async def get_project(db_path: str, project_id: str) -> Optional[Dict[str, Any]]
         row = await db.execute_fetchone(
             """
             SELECT project_id, project_name, project_type, directory, directory_realpath, embedding_dim, metadata,
-                   index_dirty, faiss_index_uuid, deleting, chunk_count, file_count, total_tokens, updated_at
+                   index_dirty, faiss_index_uuid, deleting, chunk_count, file_count, total_tokens, created_at, updated_at
             FROM projects
             WHERE project_id = ?
             """,
@@ -890,6 +893,9 @@ async def refresh_project_stats(db_path: str, project_id: str) -> None:
         await db.commit()
 
 
+_FTS5_KEYWORDS: set[str] = {"not", "and", "or", "near"}
+
+
 def _sanitize_fts_query(query: str) -> str:
     """Sanitise *query* for FTS5 MATCH while preserving code punctuation.
 
@@ -899,20 +905,25 @@ def _sanitize_fts_query(query: str) -> str:
     lost its decorator prefix, and ``C++`` collapsed to ``C``.
 
     FTS5 only needs a handful of structural operators removed to avoid
-    query-parse errors (*  "  ^  +  (  )  {  }).  Angle brackets are
-    replaced with spaces so that ``vector<int>`` tokenises the same way
-    at query time as at index time.  Each whitespace-delimited token is
-    then quoted so FTS5 treats it as a phrase; the ``unicode61``
-    tokeniser splits on the same boundaries used during indexing, making
-    ``"std::vector"`` match the adjacent-token pair (std, vector).
+    query-parse errors (*  "  ^  +  (  )  {  }).  Angle brackets and
+    hyphens are replaced with spaces: angle brackets so that
+    ``vector<int>`` tokenises the same way at query time as at index
+    time, and hyphens so that ``pre-trained`` is not mis-parsed as
+    ``pre NOT trained`` by the FTS5 query engine.  Each
+    whitespace-delimited token is then quoted so FTS5 treats it as a
+    phrase; the ``unicode61`` tokeniser splits on the same boundaries
+    used during indexing, making ``"std::vector"`` match the
+    adjacent-token pair (std, vector).  Tokens that are bare FTS5
+    operator keywords (NOT / AND / OR / NEAR) are dropped entirely to
+    prevent unintended query-syntax injection.
     """
     if not query or not query.strip():
         return '""'
-    # Replace FTS5 syntax operators and angle-brackets with spaces.
+    # Replace FTS5 syntax operators, angle-brackets, and hyphens with spaces.
     # Note: '+' is deliberately NOT stripped — it is not an FTS5 operator
     # and stripping it collapses "C++" to "C".
-    cleaned = re.sub(r'[*^(){}<>]', ' ', query)
-    tokens = [t for t in cleaned.split() if t]
+    cleaned = re.sub(r'[*^(){}<>\-]', ' ', query)
+    tokens = [t for t in cleaned.split() if t and t.lower() not in _FTS5_KEYWORDS]
     if not tokens:
         return '""'
     if len(tokens) > 50:
@@ -929,8 +940,9 @@ def build_fts_query(query: str, *, mode: str = "strict") -> str:
     """Build a sanitized FTS5 query string supporting AND/OR modes and phrases."""
     if not query or not query.strip():
         return '""'
+    # Replace FTS5 syntax operators, angle-brackets, and hyphens with spaces.
     # '+' is not an FTS5 operator; keeping it preserves "C++" precision.
-    cleaned = re.sub(r'[*^(){}<>]', ' ', query)
+    cleaned = re.sub(r'[*^(){}<>\-]', ' ', query)
     mode_lower = str(mode).lower()
     if mode_lower == "phrase":
         cleaned_phrase = re.sub(r'\s+', ' ', cleaned).strip()
@@ -945,6 +957,8 @@ def build_fts_query(query: str, *, mode: str = "strict") -> str:
         if not token:
             continue
         token = re.sub(r'\s+', ' ', token)
+        if token.lower() in _FTS5_KEYWORDS:
+            continue
         tokens.append(token)
     if not tokens:
         return '""'
