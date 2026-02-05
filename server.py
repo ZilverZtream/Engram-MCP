@@ -1918,6 +1918,99 @@ async def analyze_temporal_couplings(
 
 
 @mcp.tool
+async def analyze_file_coding_style(
+    project_id: str,
+    file_path: str,
+    diff_limit: int = 10,
+) -> Dict[str, Any]:
+    """Analyze coding style from git history to help agents write matching code.
+
+    This implements "Style Mimicry" - extracting coding patterns from a file's
+    git history so AI agents can generate code that looks like YOU wrote it,
+    not like generic AI code.
+
+    AGENT NOTE: Use this when:
+    - You're about to refactor or add features to a file
+    - You want to match the existing team's coding conventions
+    - You need to understand project-specific patterns (validation, error handling, etc.)
+
+    Args:
+        project_id: The project to analyze
+        file_path: Path to the file to analyze (relative to project root)
+        diff_limit: Number of recent diffs to analyze (default: 10)
+
+    Returns:
+        Dictionary with:
+        - style_guide: String with extracted patterns (or null if unavailable)
+        - analyzed_commits: List of commit hashes analyzed
+        - file_path: The file that was analyzed
+        - error: Error message if something went wrong
+
+    Example usage:
+        style = await analyze_file_coding_style("my-project", "src/auth.py")
+        # Returns: {
+        #   "style_guide": "- Use pydantic for validation\\n- Verify permissions before DB calls\\n...",
+        #   "analyzed_commits": ["abc123", "def456", ...],
+        #   "file_path": "src/auth.py"
+        # }
+    """
+    await dbmod.init_db(cfg.db_path)
+
+    try:
+        ProjectID(project_id)
+    except ValueError as e:
+        return {"error": str(e)}
+
+    proj = await dbmod.get_project(cfg.db_path, project_id)
+    if not proj:
+        return {"error": f"Project not found: {project_id}"}
+
+    # Check if git history is indexed
+    commit_count = await dbmod.count_git_commits(cfg.db_path, project_id=project_id)
+    if commit_count == 0:
+        return {
+            "error": (
+                "No git history indexed. Run index_git_history first to enable "
+                "style analysis."
+            ),
+            "hint": f"Call: index_git_history(project_id='{project_id}')",
+        }
+
+    start = time.time()
+
+    try:
+        # Import dreaming module
+        from engram_mcp import dreaming
+
+        # Analyze file style
+        result = await dreaming.analyze_file_style(
+            project_id,
+            file_path,
+            diff_limit=int(diff_limit),
+        )
+
+        duration_ms = int((time.time() - start) * 1000)
+
+        logging.info(
+            "analyze_file_coding_style completed",
+            extra={
+                "project_id": project_id,
+                "file_path": file_path,
+                "operation": "analyze_file_coding_style",
+                "duration_ms": duration_ms,
+                "commits_analyzed": len(result.get("analyzed_commits", [])),
+            },
+        )
+
+        result["duration_ms"] = duration_ms
+        return result
+
+    except Exception as exc:
+        logging.error("analyze_file_coding_style failed", exc_info=True)
+        return {"error": f"Failed to analyze file style: {exc}"}
+
+
+@mcp.tool
 async def analyze_reverts(project_id: str) -> Dict[str, Any]:
     """Analyze revert commits and auto-generate repo_rules (The Immune System).
 
