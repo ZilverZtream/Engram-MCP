@@ -351,6 +351,29 @@ class GenerationService:
         )
         return await future
 
+    async def generate_insight(
+        self,
+        context_a: str,
+        context_b: str,
+        *,
+        model_name: Optional[str] = None,
+        device: Optional[str] = None,
+        max_new_tokens: int = 128,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+    ) -> str:
+        prompt = build_insight_prompt(context_a, context_b)
+        model = model_name or os.getenv("ENGRAM_GENERATION_MODEL", "gpt2")
+        device_name = device or os.getenv("ENGRAM_GENERATION_DEVICE", "cpu")
+        return await self.generate(
+            prompt,
+            model_name=model,
+            device=device_name,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+        )
+
     async def close(self, *, graceful: bool = True) -> None:
         for task in self._workers:
             task.cancel()

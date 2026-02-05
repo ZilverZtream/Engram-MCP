@@ -1643,6 +1643,46 @@ async def fetch_chunk_by_id(db_path: str, *, project_id: str, chunk_id: str) -> 
     }
 
 
+async def fetch_chunks_by_ids(
+    db_path: str,
+    *,
+    project_id: str,
+    chunk_ids: List[str],
+) -> List[Dict[str, Any]]:
+    if not chunk_ids:
+        return []
+    batch_size = 900
+    row_map: Dict[str, Dict[str, Any]] = {}
+    async with get_connection(db_path) as db:
+        for i in range(0, len(chunk_ids), batch_size):
+            batch = chunk_ids[i:i + batch_size]
+            query = build_in_query(
+                """
+                SELECT chunk_id, internal_id, content, token_count, metadata, access_count
+                FROM chunks
+                WHERE project_id = ? AND chunk_id IN 
+                """,
+                batch,
+            )
+            rows = await db.execute_fetchall(query.text, (project_id, *query.params))
+            for cid, iid, content, tcount, meta_json, access_count in rows:
+                meta = {}
+                try:
+                    meta = json.loads(meta_json or "{}")
+                except json.JSONDecodeError:
+                    logging.warning("Failed to decode chunk metadata for %s", cid, exc_info=True)
+                    meta = {}
+                row_map[str(cid)] = {
+                    "id": cid,
+                    "internal_id": int(iid),
+                    "content": content,
+                    "token_count": int(tcount),
+                    "metadata": meta,
+                    "access_count": int(access_count or 0),
+                }
+    return [row_map[cid] for cid in chunk_ids if cid in row_map]
+
+
 async def mark_project_dirty(db_path: str, project_id: str) -> None:
     """Set index_dirty flag before writing chunks to the DB.
 
