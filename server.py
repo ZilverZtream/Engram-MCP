@@ -58,6 +58,7 @@ indexer = Indexer(cfg, embedding_service, project_path_context, index_path_conte
 
 _AUTO_DREAM_SEARCH_INTERVAL = 25
 _AUTO_DREAM_MIN_INTERVAL_S = 300.0
+MAX_DREAM_PAIRS = 100
 _auto_dream_state: Dict[str, Dict[str, float]] = {}
 _auto_dream_lock = asyncio.Lock()
 
@@ -345,7 +346,7 @@ async def _run_dream_cycle(project_id: str, *, max_pairs: int = 10) -> str:
     candidates = await identify_candidates(project_id)
     if not candidates:
         return "ℹ️ No dream candidates found."
-    max_pairs_int = max(1, int(max_pairs))
+    max_pairs_int = min(MAX_DREAM_PAIRS, max(1, int(max_pairs)))
     candidates = candidates[:max_pairs_int]
 
     unique_ids: List[str] = []
