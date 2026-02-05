@@ -442,13 +442,14 @@ class SearchEngine:
             )
             for shard_id in range(shard_count)
         ]
+        existing_shard_paths = [path for path in shard_paths if self.index_path_context.exists(path)]
         tasks = [
             self.vector_search(project_id=project_id, query_vec=query_vec, top_k=top_k, index_path=path)
-            for path in shard_paths
-            if self.index_path_context.exists(path)
+            for path in existing_shard_paths
         ]
         if not tasks:
-            return await self.vector_search(project_id=project_id, query_vec=query_vec, top_k=top_k)
+            logging.warning("No shard indexes found for project %s (expected %s).", project_id, shard_paths)
+            raise FileNotFoundError(f"No shard indexes found for project {project_id}.")
 
         shard_results = await asyncio.gather(*tasks)
         merged = [item for sub in shard_results for item in sub]
