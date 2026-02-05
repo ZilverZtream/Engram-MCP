@@ -317,22 +317,18 @@ async def update_project(project_id: str, wait: bool = True) -> str:
     """Update an existing project by scanning its stored directory."""
 
     async def _run() -> str:
-        lock = await get_project_lock(project_id)
-        rwlock = await get_project_rwlock(project_id)
-        async with lock:
-            async with rwlock.write_lock():
-                start = time.time()
-                changes = await indexer.update_project(project_id=project_id)
-                logging.info(
-                    "update_project",
-                    extra={
-                        "project_id": project_id,
-                        "operation": "update",
-                        "duration_ms": int((time.time() - start) * 1000),
-                        "added": changes.get("added"),
-                        "deleted": changes.get("deleted"),
-                    },
-                )
+        start = time.time()
+        changes = await indexer.update_project(project_id=project_id)
+        logging.info(
+            "update_project",
+            extra={
+                "project_id": project_id,
+                "operation": "update",
+                "duration_ms": int((time.time() - start) * 1000),
+                "added": changes.get("added"),
+                "deleted": changes.get("deleted"),
+            },
+        )
         return f"✅ Updated {project_id}: +{changes['added']} added, -{changes['deleted']} deleted"
 
     job = await jobs.create("update", _run())

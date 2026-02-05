@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import asyncio
-import concurrent.futures
 import hashlib
 import math
 import os
 import re
-import threading as _threading
+import multiprocessing as mp
+import queue as queue_mod
 import time
 import uuid
 import logging
@@ -52,135 +52,112 @@ from . import db as dbmod
 # Per-file parse timeout in seconds.
 _PARSE_TIMEOUT_S = 30
 
-class _CancellationToken:
-    """Lightweight signal shared between the async caller and the worker thread.
-
-    The token is passed into the wrapper closure submitted to the executor.
-    When ``asyncio.wait_for`` raises *TimeoutError* the async side calls
-    ``cancel()``; the worker thread checks ``is_cancelled()`` after *fn*
-    returns.  Because CPython cannot forcibly terminate a thread the token
-    does **not** interrupt a blocking call inside *fn* — it is a cooperative
-    mechanism that:
-
-    1. Lets the worker log and discard its result so stale data is never
-       returned.
-    2. Provides an observable hook for metrics / alerting on thread-leak
-       duration.
-    """
-
-    __slots__ = ("_event",)
-
-    def __init__(self) -> None:
-        self._event = _threading.Event()
-
-    def cancel(self) -> None:
-        self._event.set()
-
-    def is_cancelled(self) -> bool:
-        return self._event.is_set()
-
-
-class _ParseTimeout(Exception):
-    """Raised when a parse task exceeds its wall-clock budget."""
-
-
-class _ResizableParsePool:
-    """Thread-pool that survives thread-leak exhaustion from timed-out parses.
-
-    CPython cannot forcibly terminate a blocked thread.  When a parse task
-    times out the thread remains alive, occupying a slot in the pool.  A
-    long-running sequence of malformed files could exhaust all
-    ``max_workers`` slots, stalling every future submission.
-
-    This wrapper tracks the number of *leaked* threads (those whose
-    cancellation token was signalled but which have not yet returned).
-    When the leaked count reaches ``_leak_ceiling`` — the point at which
-    the pool has no usable capacity — the current pool is *abandoned*
-    (``shutdown(wait=False)``; leaked threads continue to run but will exit
-    on their own or at process exit) and replaced with a fresh pool of
-    ``max_workers`` threads.  New submissions always land on a pool with
-    available capacity.
-    """
-
-    def __init__(self, max_workers: int) -> None:
-        self._max_workers = max_workers
-        # Ceiling at which a fresh pool is created.  Leave at least
-        # _CONCURRENCY_CAP slots free so that the next batch of real work
-        # never blocks on pool capacity.
-        self._leak_ceiling = max(1, max_workers - _CONCURRENCY_CAP)
-        self._leaked: int = 0
-        self._lock = _threading.Lock()
-        self._pool = concurrent.futures.ThreadPoolExecutor(
-            max_workers=max_workers,
-            thread_name_prefix="engram-parse",
-        )
-
-    def _on_leaked(self) -> None:
-        """Called from the wrapper when a thread discovers it was cancelled."""
-        with self._lock:
-            self._leaked += 1
-            if self._leaked >= self._leak_ceiling:
-                logging.warning(
-                    "Parse pool leak ceiling hit (%d/%d leaked threads); "
-                    "replacing pool to prevent stall.",
-                    self._leaked,
-                    self._max_workers,
-                )
-                self._pool.shutdown(wait=False, cancel_futures=False)
-                self._pool = concurrent.futures.ThreadPoolExecutor(
-                    max_workers=self._max_workers,
-                    thread_name_prefix="engram-parse",
-                )
-                self._leaked = 0
-
-    @property
-    def pool(self) -> concurrent.futures.ThreadPoolExecutor:
-        return self._pool
-
-
-_PARSE_POOL = _ResizableParsePool(max_workers=_CONCURRENCY_CAP * 3)
-
-
-def _cancellable_wrapper(pool_ref: _ResizableParsePool, token: _CancellationToken, fn, *args):
-    """Execute *fn* and handle post-timeout accounting on the pool."""
-    result = fn(*args)
-    if token.is_cancelled():
-        logging.warning(
-            "Parse thread completed after its timeout was already raised; result discarded."
-        )
-        pool_ref._on_leaked()
-        raise _ParseTimeout("discarded: token cancelled before return")
-    return result
-
-
-async def _run_in_thread_with_timeout(fn, *args, timeout: float = _PARSE_TIMEOUT_S):
-    """Run *fn* in the shared parse executor with a wall-clock timeout.
-
-    A ``_CancellationToken`` is shared between this coroutine and the
-    worker thread.  On timeout the token is cancelled so the thread can
-    detect — after *fn* returns naturally — that its result is no longer
-    needed.  CPython provides no portable mechanism to kill a running
-    thread; leaked threads are tracked by ``_ResizableParsePool`` and the
-    pool is replaced transparently when the leak ceiling is reached, so
-    new submissions are never starved regardless of input.
-    """
-    loop = asyncio.get_running_loop()
-    token = _CancellationToken()
+def _parse_worker(
+    queue: mp.Queue,
+    mode: str,
+    allowed_roots: List[str],
+    path: str,
+    root: str,
+    project_type: str,
+    chunk_size_tokens: int,
+    overlap_tokens: int,
+    max_file_size_mb: int,
+) -> None:
     try:
-        return await asyncio.wait_for(
-            loop.run_in_executor(
-                _PARSE_POOL.pool,
-                _cancellable_wrapper,
-                _PARSE_POOL,
-                token,
-                fn,
-                *args,
-            ),
-            timeout=timeout,
-        )
-    except asyncio.TimeoutError:
-        token.cancel()
-        raise asyncio.TimeoutError(f"Parse timed out after {timeout}s")
+        path_context = PathContext(allowed_roots)
+        if mode == "hash_and_parse":
+            result = hash_and_parse_file(
+                path_context=path_context,
+                path=Path(path),
+                root=root,
+                project_type=project_type,
+                chunk_size_tokens=chunk_size_tokens,
+                overlap_tokens=overlap_tokens,
+                max_file_size_mb=max_file_size_mb,
+            )
+        elif mode == "parse":
+            result = parse_file_to_chunks(
+                path_context=path_context,
+                path=Path(path),
+                root=root,
+                project_type=project_type,
+                chunk_size_tokens=chunk_size_tokens,
+                overlap_tokens=overlap_tokens,
+                max_file_size_mb=max_file_size_mb,
+            )
+        else:
+            raise ValueError(f"Unknown parse mode: {mode}")
+        queue.put(("ok", result))
+    except Exception as exc:
+        queue.put(("error", f"{exc!r}"))
+
+
+async def _run_parse_with_timeout(
+    *,
+    mode: str,
+    path_context: PathContext,
+    path: Path,
+    root: str,
+    project_type: str,
+    chunk_size_tokens: int,
+    overlap_tokens: int,
+    max_file_size_mb: int,
+    timeout: float = _PARSE_TIMEOUT_S,
+):
+    ctx = mp.get_context("spawn")
+    result_queue: mp.Queue = ctx.Queue()
+    proc = ctx.Process(
+        target=_parse_worker,
+        args=(
+            result_queue,
+            mode,
+            path_context.allowed_roots,
+            str(path),
+            root,
+            project_type,
+            chunk_size_tokens,
+            overlap_tokens,
+            max_file_size_mb,
+        ),
+    )
+    proc.daemon = True
+    proc.start()
+    deadline = time.monotonic() + timeout
+    success = False
+    try:
+        while True:
+            try:
+                status, payload = result_queue.get_nowait()
+                if status == "ok":
+                    success = True
+                    return payload
+                raise RuntimeError(f"Parse failed in worker: {payload}")
+            except queue_mod.Empty:
+                pass
+
+            if not proc.is_alive():
+                try:
+                    status, payload = result_queue.get_nowait()
+                    if status == "ok":
+                        success = True
+                        return payload
+                    raise RuntimeError(f"Parse failed in worker: {payload}")
+                except queue_mod.Empty:
+                    raise RuntimeError("Parse process exited without a result.")
+
+            if time.monotonic() > deadline:
+                raise asyncio.TimeoutError(f"Parse timed out after {timeout}s")
+
+            await asyncio.sleep(0.05)
+    finally:
+        if proc.is_alive():
+            if success:
+                proc.join(timeout=1.0)
+            if proc.is_alive():
+                proc.terminate()
+        proc.join(timeout=1.0)
+        result_queue.close()
+        result_queue.join_thread()
 
 
 def _write_index_uuid(path_context: PathContext, index_path: str, uuid_str: str) -> None:
@@ -306,8 +283,21 @@ class Indexer:
             async def parse_one(path: Any) -> Optional[ParsedFile]:
                 rel = str(path.relative_to(directory))
                 try:
-                    def _do_parse():
-                        return hash_and_parse_file(
+                    if str(path.suffix).lower() == ".pdf":
+                        async with pdf_sem:
+                            chunks, content_hash, nodes, edges = await _run_parse_with_timeout(
+                                mode="hash_and_parse",
+                                path_context=self.project_path_context,
+                                path=path,
+                                root=directory,
+                                project_type=project_type,
+                                chunk_size_tokens=self.cfg.chunk_size_tokens,
+                                overlap_tokens=self.cfg.overlap_tokens,
+                                max_file_size_mb=self.cfg.max_file_size_mb,
+                            )
+                    else:
+                        chunks, content_hash, nodes, edges = await _run_parse_with_timeout(
+                            mode="hash_and_parse",
                             path_context=self.project_path_context,
                             path=path,
                             root=directory,
@@ -316,12 +306,6 @@ class Indexer:
                             overlap_tokens=self.cfg.overlap_tokens,
                             max_file_size_mb=self.cfg.max_file_size_mb,
                         )
-
-                    if str(path.suffix).lower() == ".pdf":
-                        async with pdf_sem:
-                            chunks, content_hash, nodes, edges = await _run_in_thread_with_timeout(_do_parse)
-                    else:
-                        chunks, content_hash, nodes, edges = await _run_in_thread_with_timeout(_do_parse)
                 except Exception:
                     logging.warning("Failed to parse %s", rel, exc_info=True)
                     return None
@@ -475,8 +459,21 @@ class Indexer:
         async def parse_one(rel_path: str) -> Optional[ParsedFile]:
             mtime_ns, size_bytes, content_hash, path = current_files[rel_path]
             try:
-                def _do_parse():
-                    return parse_file_to_chunks(
+                if str(path.suffix).lower() == ".pdf":
+                    async with pdf_sem:
+                        chunks = await _run_parse_with_timeout(
+                            mode="parse",
+                            path_context=self.project_path_context,
+                            path=path,
+                            root=directory,
+                            project_type=project_type,
+                            chunk_size_tokens=self.cfg.chunk_size_tokens,
+                            overlap_tokens=self.cfg.overlap_tokens,
+                            max_file_size_mb=self.cfg.max_file_size_mb,
+                        )
+                else:
+                    chunks = await _run_parse_with_timeout(
+                        mode="parse",
                         path_context=self.project_path_context,
                         path=path,
                         root=directory,
@@ -485,12 +482,6 @@ class Indexer:
                         overlap_tokens=self.cfg.overlap_tokens,
                         max_file_size_mb=self.cfg.max_file_size_mb,
                     )
-
-                if str(path.suffix).lower() == ".pdf":
-                    async with pdf_sem:
-                        chunks = await _run_in_thread_with_timeout(_do_parse)
-                else:
-                    chunks = await _run_in_thread_with_timeout(_do_parse)
             except Exception:
                 logging.warning("Failed to parse %s", rel_path, exc_info=True)
                 failed_changed_files.add(rel_path)
@@ -869,8 +860,21 @@ class Indexer:
             async def parse_one(path: Any) -> Optional[ParsedFile]:
                 rel = str(path.relative_to(directory))
                 try:
-                    def _do_parse():
-                        return hash_and_parse_file(
+                    if str(path.suffix).lower() == ".pdf":
+                        async with pdf_sem:
+                            chunks, content_hash, nodes, edges = await _run_parse_with_timeout(
+                                mode="hash_and_parse",
+                                path_context=self.project_path_context,
+                                path=path,
+                                root=directory,
+                                project_type=project_type,
+                                chunk_size_tokens=self.cfg.chunk_size_tokens,
+                                overlap_tokens=self.cfg.overlap_tokens,
+                                max_file_size_mb=self.cfg.max_file_size_mb,
+                            )
+                    else:
+                        chunks, content_hash, nodes, edges = await _run_parse_with_timeout(
+                            mode="hash_and_parse",
                             path_context=self.project_path_context,
                             path=path,
                             root=directory,
@@ -879,12 +883,6 @@ class Indexer:
                             overlap_tokens=self.cfg.overlap_tokens,
                             max_file_size_mb=self.cfg.max_file_size_mb,
                         )
-
-                    if str(path.suffix).lower() == ".pdf":
-                        async with pdf_sem:
-                            chunks, content_hash, nodes, edges = await _run_in_thread_with_timeout(_do_parse)
-                    else:
-                        chunks, content_hash, nodes, edges = await _run_in_thread_with_timeout(_do_parse)
                 except Exception:
                     logging.warning("Failed to parse %s", rel, exc_info=True)
                     return None
@@ -1313,6 +1311,7 @@ class Indexer:
                 return {"added": 0, "deleted": 0}
 
             added_chunk_ids: List[str] = []
+            dirty_marked = False
             try:
                 internal_ids_to_delete = await dbmod.fetch_internal_ids_for_chunk_ids(
                     self.cfg.db_path, str(project), to_delete_chunk_ids
@@ -1327,8 +1326,21 @@ class Indexer:
                 async def parse_one(rel_path: str) -> Optional[ParsedFile]:
                     mtime_ns, size_bytes, content_hash, path = current_files[rel_path]
                     try:
-                        def _do_parse():
-                            return parse_file_to_chunks(
+                        if str(path.suffix).lower() == ".pdf":
+                            async with pdf_sem:
+                                chunks = await _run_parse_with_timeout(
+                                    mode="parse",
+                                    path_context=self.project_path_context,
+                                    path=path,
+                                    root=directory,
+                                    project_type=project_type,
+                                    chunk_size_tokens=self.cfg.chunk_size_tokens,
+                                    overlap_tokens=self.cfg.overlap_tokens,
+                                    max_file_size_mb=self.cfg.max_file_size_mb,
+                                )
+                        else:
+                            chunks = await _run_parse_with_timeout(
+                                mode="parse",
                                 path_context=self.project_path_context,
                                 path=path,
                                 root=directory,
@@ -1337,12 +1349,6 @@ class Indexer:
                                 overlap_tokens=self.cfg.overlap_tokens,
                                 max_file_size_mb=self.cfg.max_file_size_mb,
                             )
-
-                        if str(path.suffix).lower() == ".pdf":
-                            async with pdf_sem:
-                                chunks = await _run_in_thread_with_timeout(_do_parse)
-                        else:
-                            chunks = await _run_in_thread_with_timeout(_do_parse)
                     except Exception:
                         logging.warning("Failed to parse %s", rel_path, exc_info=True)
                         failed_changed_files.add(rel_path)
@@ -1375,6 +1381,10 @@ class Indexer:
                     )
                     if parsed.chunks:
                         pending_parsed.append(parsed)
+
+                if not dirty_marked:
+                    await dbmod.mark_project_dirty(self.cfg.db_path, str(project))
+                    dirty_marked = True
 
                 # Pre-embed all pending chunks while still outside the lock
                 pending_embed: List[Tuple[ParsedFile, np.ndarray, List[int]]] = []
@@ -1463,7 +1473,7 @@ class Indexer:
                             embedding_dim=int(proj.get("embedding_dim") or 0),
                             metadata=metadata,
                             faiss_index_uuid=index_uuid,
-                            index_dirty=proj.get("index_dirty") or 0,
+                            index_dirty=1 if dirty_marked else (proj.get("index_dirty") or 0),
                             deleting=proj.get("deleting") or 0,
                         )
                 else:
@@ -1507,7 +1517,7 @@ class Indexer:
                             embedding_dim=int(proj.get("embedding_dim") or 0),
                             metadata=metadata,
                             faiss_index_uuid=index_uuid,
-                            index_dirty=proj.get("index_dirty") or 0,
+                            index_dirty=1 if dirty_marked else (proj.get("index_dirty") or 0),
                             deleting=proj.get("deleting") or 0,
                         )
 
@@ -1542,6 +1552,8 @@ class Indexer:
                 shard_count = int((proj or {}).get("metadata", {}).get("shard_count") or 1)
                 await self._sync_project_artifacts(project_id=project, shard_count=shard_count)
                 await invalidate_search_cache_project(str(project))
+                if dirty_marked:
+                    await dbmod.clear_project_dirty(self.cfg.db_path, str(project))
                 return {"added": added_count, "deleted": len(safe_delete_ids)}
             except BaseException:
                 if added_chunk_ids:
