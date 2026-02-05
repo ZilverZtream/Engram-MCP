@@ -62,6 +62,17 @@ It is a **cognitive substrate** for agents.
 
 ---
 
+## 🧬 Cognitive Intelligence (Phase 3)
+
+Engram goes beyond static files to understand **Time** and **Evolution**:
+
+* **Episodic Memory:** Indexes the full Git history. Searches not just code, but *changes* and *commit messages* to find how bugs were fixed in the past.
+* **The Immune System:** Automatically detects "Revert" commits and generates high-priority anti-pattern rules to stop you from repeating mistakes.
+* **Style Mimicry:** Analyzes recent diffs to generate a dynamic "Style Guide" for the specific file you are editing, ensuring agents write code that matches your conventions.
+* **Temporal Coupling:** Discovers hidden dependencies between files that frequently change together (e.g., `auth.py` and `user_model.py`) even if they don't import each other.
+
+---
+
 ## 🏗️ Architecture Overview
 
 ```
@@ -166,6 +177,22 @@ Engram MCP is now available to MCP‑compatible clients.
 
 ---
 
+### 4️⃣ Recommended Agent System Prompt
+
+To unlock the full power of Engram, add this protocol to your AI assistant's system instructions (Cursor, Windsurf, Cline, etc.):
+
+```markdown
+# ENGRAM AGENT PROTOCOL
+
+1. **BOOT:** When starting a task, ALWAYS call `get_project_context(project_id)`. Read the `activeContext` to resume work exactly where you left off.
+2. **STYLE:** Before writing ANY code, call `analyze_file_coding_style(file_path)`. Follow the returned conventions (naming, libraries, error handling) strictly.
+3. **DEBUG:** If you see a stack trace, IMMEDIATELY call `analyze_error_stack(traceback)`. Do not manually read files until you have done this.
+4. **HISTORY:** If fixing a complex bug, call `search_history(query)` to see if a similar issue was fixed in the past.
+5. **SAFETY:** Before refactoring, call `analyze_temporal_couplings(project_id)` to verify implicit dependencies.
+```
+
+---
+
 ## ⚙️ Configuration Highlights
 
 You can control Engram behavior via `engram_mcp.yaml`:
@@ -226,6 +253,27 @@ embedding_cache_max_rows: 0
 ---
 
 ## 🧠 MCP Tools
+
+### Tool Reference
+
+| Tool | Purpose | When to Use |
+|------|---------|-------------|
+| **`index_git_history`** | Indexes commits/diffs into episodic memory | Run once per project to enable time-travel features |
+| **`search_history`** | Semantic search on Git log & commit messages | "How did we fix the deadlock last time?" |
+| **`analyze_file_coding_style`** | Extracts coding patterns from recent changes | Before writing code to match the repo's style |
+| **`analyze_reverts`** | Scans for "Revert" commits & anti-patterns | To populate the "Immune System" with learnings |
+| **`analyze_temporal_couplings`** | Discovers files that change together | Before refactoring to identify hidden dependencies |
+| **`get_project_context`** | Retrieves active session context & memory bank | First tool to call in a new session |
+| **`update_memory_bank`** | Stores agent learnings & decisions | After completing tasks to preserve context |
+| **`get_codebase_overview`** | Fast file stats & project map | Agent orientation tool for new repositories |
+| **`find_symbol_references`** | AST-based symbol lookup across files | Finding function/class definitions & usages |
+| **`analyze_error_stack`** | Parses Python/JS/Rust/Go stack traces | When the user pastes an error message |
+| **`graph_search`** | Symbol-aware code search using AST graph | Advanced semantic code navigation |
+| **`query_graph_nodes`** | Graph traversal for code structure analysis | Understanding code relationships & dependencies |
+
+---
+
+### Core Indexing Tools
 
 ### `index_project`
 Indexes a directory (must be within `allowed_roots`).
@@ -304,6 +352,151 @@ Queues an insight-generation cycle from search co‑occurrences.
 
 ### `trigger_rem_cycle`
 Queues a REM‑style dream cycle (alias to dream job creation).
+
+---
+
+### Cognitive Intelligence Tools
+
+### `index_git_history`
+Indexes the full Git history into episodic memory. **Run this once per project** after `index_project` to enable time-travel features.
+
+```json
+{
+  "project_id": "my_repo_123",
+  "since_days": 90,
+  "wait": true
+}
+```
+
+### `search_history`
+Semantic search across Git commits, diffs, and messages.
+
+```json
+{
+  "query": "authentication bug fix",
+  "project_id": "my_repo_123",
+  "max_results": 5
+}
+```
+
+### `analyze_file_coding_style`
+Analyzes recent Git diffs to extract coding patterns for a specific file. **Call this before writing code** to match the repository's conventions.
+
+```json
+{
+  "project_id": "my_repo_123",
+  "file_path": "src/auth/login.py",
+  "num_commits": 10
+}
+```
+
+Returns:
+- Naming conventions
+- Preferred libraries
+- Error handling patterns
+- Code style guidelines
+
+### `analyze_reverts`
+Scans for "Revert" commits and generates anti-pattern rules. Populates the "Immune System" to prevent repeated mistakes.
+
+```json
+{
+  "project_id": "my_repo_123",
+  "lookback_days": 180
+}
+```
+
+### `analyze_temporal_couplings`
+Discovers files that frequently change together, revealing hidden dependencies.
+
+```json
+{
+  "project_id": "my_repo_123",
+  "min_coupling_strength": 0.6,
+  "lookback_days": 90
+}
+```
+
+### `get_project_context`
+Retrieves the active session context and memory bank. **Call this at the start of every session** to resume work.
+
+```json
+{
+  "project_id": "my_repo_123"
+}
+```
+
+Returns:
+- Active context from previous sessions
+- Stored learnings and decisions
+- Work-in-progress state
+
+### `update_memory_bank`
+Stores agent learnings, decisions, and context for future sessions.
+
+```json
+{
+  "project_id": "my_repo_123",
+  "key": "refactoring_decision",
+  "value": "Decided to use dependency injection for testability",
+  "context": "authentication module redesign"
+}
+```
+
+### `get_codebase_overview`
+Fast file statistics and project map. **The first tool to call** in a new session for agent orientation.
+
+```json
+{
+  "project_id": "my_repo_123"
+}
+```
+
+### `find_symbol_references`
+AST-based lookup for function/class definitions and usages.
+
+```json
+{
+  "project_id": "my_repo_123",
+  "symbol_name": "authenticate_user",
+  "symbol_type": "function"
+}
+```
+
+### `analyze_error_stack`
+Parses stack traces from Python, JavaScript, Rust, Go, and other languages. Identifies relevant files and line numbers.
+
+```json
+{
+  "project_id": "my_repo_123",
+  "traceback": "Traceback (most recent call last):\n  File \"app.py\", line 42...",
+  "language": "python"
+}
+```
+
+### `graph_search`
+Symbol-aware code search using the AST graph. More powerful than text search for understanding code relationships.
+
+```json
+{
+  "project_id": "my_repo_123",
+  "query": "authentication flow",
+  "node_types": ["function", "class"],
+  "max_results": 10
+}
+```
+
+### `query_graph_nodes`
+Graph traversal for code structure analysis. Explore relationships between symbols, files, and modules.
+
+```json
+{
+  "project_id": "my_repo_123",
+  "start_node": "authenticate_user",
+  "relationship": "calls",
+  "max_depth": 3
+}
+```
 
 ---
 
