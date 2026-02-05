@@ -14,7 +14,7 @@ import os
 import re
 import subprocess
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import AsyncIterator, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -24,6 +24,7 @@ from .security import PathContext
 
 _COMMIT_MARKER = "===COMMIT_START==="
 _MAX_DIFF_CHARS = 2000
+_MAX_COMMIT_SECTION_BYTES = 1_048_576  # 1MB safety valve per commit
 
 
 @dataclass
@@ -151,11 +152,12 @@ class GitIndexer:
     ) -> Tuple[List[GitCommit], List[GitDiff]]:
         """Retrieve commits and diffs in a single ``git log -p`` subprocess.
 
+        Uses streaming parsing to avoid loading the entire output into RAM.
         The custom ``--format`` string embeds a unique delimiter before each
-        commit's metadata line.  Everything between two delimiters — metadata,
+        commit's metadata line. Everything between two delimiters — metadata,
         name-status, and the full unified patch — belongs to the same commit.
-        This eliminates the O(N*M) subprocess fan-out that the previous
-        per-commit ``git show`` approach required.
+
+        Memory usage: O(single commit size) instead of O(total log size).
         """
         cmd = [
             "git",
@@ -176,100 +178,162 @@ class GitIndexer:
             stderr=subprocess.PIPE,
         )
 
-        stdout, stderr = await proc.communicate()
-
-        if proc.returncode != 0:
-            error_msg = stderr.decode("utf-8", errors="replace")
-            raise RuntimeError(f"git log failed: {error_msg}")
-
-        return self._parse_log_output(stdout.decode("utf-8", errors="replace"))
-
-    def _parse_log_output(self, output: str) -> Tuple[List[GitCommit], List[GitDiff]]:
-        """State-machine parser for ``git log -p --name-status`` output.
-
-        Layout per commit::
-
-            ===COMMIT_START===<hash>|<author>|<ts>|<subject>
-            <status>\\t<path>        ← name-status block
-            ...
-            diff --git a/<path> b/<path>   ← patch blocks
-            <diff header + body>
-            ...
-
-        The parser splits on the commit marker, then within each section
-        splits on the first ``diff --git`` occurrence to separate
-        name-status metadata from patch content.
-        """
         commits: List[GitCommit] = []
         all_diffs: List[GitDiff] = []
 
-        for section in output.split(_COMMIT_MARKER)[1:]:
-            if not section.strip():
-                continue
+        async for commit, diffs in self._stream_parse_git_log(proc.stdout):
+            commits.append(commit)
+            all_diffs.extend(diffs)
 
-            # --- Header (first line) ---------------------------------------------
-            newline_pos = section.find("\n")
-            if newline_pos < 0:
-                continue
-            header = section[:newline_pos].strip()
-            body = section[newline_pos + 1:]
+        await proc.wait()
 
-            parts = header.split("|", 3)
-            if len(parts) < 4:
-                continue
-            commit_hash, author, timestamp_str, message = parts
-            try:
-                timestamp = int(timestamp_str)
-            except ValueError:
-                continue
+        if proc.returncode != 0:
+            stderr_data = await proc.stderr.read()
+            error_msg = stderr_data.decode("utf-8", errors="replace")
+            raise RuntimeError(f"git log failed: {error_msg}")
 
-            # --- Split body into name-status vs patch sections -------------------
-            diff_start = body.find("diff --git ")
-            if diff_start >= 0:
-                name_status_text = body[:diff_start]
-                diff_text = body[diff_start:]
+        return commits, all_diffs
+
+    async def _stream_parse_git_log(
+        self,
+        stdout: asyncio.StreamReader,
+    ) -> AsyncIterator[Tuple[GitCommit, List[GitDiff]]]:
+        """Stream-parse git log output line-by-line, yielding commits incrementally.
+
+        Accumulates lines for each commit section, then offloads the CPU-intensive
+        parsing to a thread pool. This prevents:
+        1. Memory spike: only one commit section in RAM at a time
+        2. Event loop blocking: heavy parsing happens in a thread
+
+        Implements a 1MB safety valve: if a commit section exceeds the limit,
+        it truncates and yields a warning in the diff content.
+        """
+        loop = asyncio.get_running_loop()
+        commit_section_lines: List[str] = []
+        commit_section_bytes = 0
+        truncated = False
+
+        async for line_bytes in stdout:
+            line = line_bytes.decode("utf-8", errors="replace")
+
+            if line.startswith(_COMMIT_MARKER):
+                if commit_section_lines:
+                    section_text = "".join(commit_section_lines)
+
+                    commit, diffs = await loop.run_in_executor(
+                        None, self._parse_single_commit_section, section_text, truncated
+                    )
+
+                    if commit is not None:
+                        yield commit, diffs
+
+                    commit_section_lines = [line]
+                    commit_section_bytes = len(line_bytes)
+                    truncated = False
+                else:
+                    commit_section_lines.append(line)
+                    commit_section_bytes += len(line_bytes)
             else:
-                name_status_text = body
-                diff_text = ""
-
-            # --- Parse name-status → {file_path: change_type} -------------------
-            change_type_map: Dict[str, str] = {}
-            changed_files: List[str] = []
-            for line in name_status_text.split("\n"):
-                stripped = line.strip()
-                if not stripped:
-                    continue
-                tab_parts = stripped.split("\t")
-                if len(tab_parts) < 2:
-                    continue
-                status = tab_parts[0]
-                # Rename/Copy: R###\told\tnew  or  C###\told\tnew
-                if (status.startswith("R") or status.startswith("C")) and len(tab_parts) >= 3:
-                    file_path = tab_parts[2]
+                if commit_section_bytes + len(line_bytes) > _MAX_COMMIT_SECTION_BYTES:
+                    if not truncated:
+                        logging.warning(
+                            "Commit section exceeds 1MB limit, truncating to prevent memory spike"
+                        )
+                        commit_section_lines.append(
+                            "\n... (commit section truncated due to size limit)\n"
+                        )
+                        truncated = True
                 else:
-                    file_path = tab_parts[1]
+                    commit_section_lines.append(line)
+                    commit_section_bytes += len(line_bytes)
 
-                if status.startswith("A"):
-                    change_type_map[file_path] = "ADDED"
-                elif status.startswith("D"):
-                    change_type_map[file_path] = "DELETED"
-                else:
-                    change_type_map[file_path] = "MODIFIED"
-                changed_files.append(file_path)
+        if commit_section_lines:
+            section_text = "".join(commit_section_lines)
 
-            commits.append(
-                GitCommit(
-                    commit_hash=commit_hash,
-                    author=author,
-                    timestamp=timestamp,
-                    message=message,
-                    changed_files=changed_files,
-                )
+            commit, diffs = await loop.run_in_executor(
+                None, self._parse_single_commit_section, section_text, truncated
             )
 
-            # --- Parse per-file diffs --------------------------------------------
-            if not diff_text:
+            if commit is not None:
+                yield commit, diffs
+
+    def _parse_single_commit_section(
+        self, section: str, truncated: bool = False
+    ) -> Tuple[Optional[GitCommit], List[GitDiff]]:
+        """Parse a single commit section (runs in thread pool to avoid blocking event loop).
+
+        Args:
+            section: The raw text for one commit (everything between two markers)
+            truncated: Whether this section was truncated due to size limits
+
+        Returns:
+            (GitCommit, List[GitDiff]) or (None, []) if parsing fails
+        """
+        if not section.strip():
+            return None, []
+
+        newline_pos = section.find("\n")
+        if newline_pos < 0:
+            return None, []
+
+        header = section[:newline_pos].strip()
+        body = section[newline_pos + 1:]
+
+        if header.startswith(_COMMIT_MARKER):
+            header = header[len(_COMMIT_MARKER):]
+
+        parts = header.split("|", 3)
+        if len(parts) < 4:
+            return None, []
+
+        commit_hash, author, timestamp_str, message = parts
+        try:
+            timestamp = int(timestamp_str)
+        except ValueError:
+            return None, []
+
+        diff_start = body.find("diff --git ")
+        if diff_start >= 0:
+            name_status_text = body[:diff_start]
+            diff_text = body[diff_start:]
+        else:
+            name_status_text = body
+            diff_text = ""
+
+        change_type_map: Dict[str, str] = {}
+        changed_files: List[str] = []
+        for line in name_status_text.split("\n"):
+            stripped = line.strip()
+            if not stripped:
                 continue
+            tab_parts = stripped.split("\t")
+            if len(tab_parts) < 2:
+                continue
+            status = tab_parts[0]
+
+            if (status.startswith("R") or status.startswith("C")) and len(tab_parts) >= 3:
+                file_path = tab_parts[2]
+            else:
+                file_path = tab_parts[1]
+
+            if status.startswith("A"):
+                change_type_map[file_path] = "ADDED"
+            elif status.startswith("D"):
+                change_type_map[file_path] = "DELETED"
+            else:
+                change_type_map[file_path] = "MODIFIED"
+            changed_files.append(file_path)
+
+        commit = GitCommit(
+            commit_hash=commit_hash,
+            author=author,
+            timestamp=timestamp,
+            message=message,
+            changed_files=changed_files,
+        )
+
+        all_diffs: List[GitDiff] = []
+        if diff_text:
             for block in re.split(r"(?=diff --git )", diff_text):
                 if not block.strip():
                     continue
@@ -279,11 +343,15 @@ class GitIndexer:
                     continue
 
                 change_type = change_type_map.get(file_path, "MODIFIED")
-                diff_content = (
-                    block
-                    if len(block) <= _MAX_DIFF_CHARS
-                    else block[:_MAX_DIFF_CHARS] + "\n... (truncated)"
-                )
+
+                if truncated:
+                    diff_content = block[:_MAX_DIFF_CHARS] + "\n... (truncated - commit section exceeded 1MB)"
+                else:
+                    diff_content = (
+                        block
+                        if len(block) <= _MAX_DIFF_CHARS
+                        else block[:_MAX_DIFF_CHARS] + "\n... (truncated)"
+                    )
 
                 all_diffs.append(
                     GitDiff(
@@ -294,7 +362,7 @@ class GitIndexer:
                     )
                 )
 
-        return commits, all_diffs
+        return commit, all_diffs
 
     @staticmethod
     def _extract_filepath_from_diff(block: str) -> Optional[str]:
