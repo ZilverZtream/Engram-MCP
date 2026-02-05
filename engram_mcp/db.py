@@ -1079,11 +1079,7 @@ def _sanitize_fts_query(query: str) -> str:
     if not tokens:
         return '""'
     if len(tokens) > 50:
-        logging.warning(
-            "FTS strict query truncated from %d to 50 tokens; trailing terms dropped.",
-            len(tokens),
-        )
-        tokens = tokens[:50]
+        raise ValueError("FTS strict query exceeds the 50-token maximum.")
     tokens = [t[:64] for t in tokens]
     return " AND ".join(f'"{t}"' for t in tokens)
 
@@ -1115,11 +1111,7 @@ def build_fts_query(query: str, *, mode: str = "strict") -> str:
     if not tokens:
         return '""'
     if len(tokens) > 50:
-        logging.warning(
-            "FTS query truncated from %d to 50 tokens; trailing terms dropped.",
-            len(tokens),
-        )
-        tokens = tokens[:50]
+        raise ValueError("FTS query exceeds the 50-token maximum.")
     tokens = [t[:64] for t in tokens]
     joiner = " OR " if mode_lower == "any" else " AND "
     return joiner.join(f'"{t}"' for t in tokens)
