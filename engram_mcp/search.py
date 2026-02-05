@@ -600,3 +600,81 @@ class SearchEngine:
                 while len(_search_cache) > _cache_max_items:
                     _search_cache.popitem(last=False)
         return combined
+
+    async def search_history(
+        self,
+        *,
+        project_id: str,
+        query: str,
+        file_filter: Optional[str] = None,
+        limit: int = 10,
+    ) -> Dict[str, Any]:
+        """Search git history for commits related to the query.
+
+        This implements the "Déjà Vu" search algorithm that looks for historical
+        fixes and changes related to the current problem.
+
+        Args:
+            project_id: The project to search
+            query: Search query (error message, bug description, etc.)
+            file_filter: Optional file path filter
+            limit: Maximum number of results
+
+        Returns:
+            Dictionary with related commits and their diffs
+        """
+        # Search commit messages using text matching
+        commits = await dbmod.search_git_commits_by_message(
+            self.db_path,
+            project_id=project_id,
+            query=query,
+            limit=limit,
+        )
+
+        # Enrich commits with diffs and tags
+        related_commits = []
+        for commit in commits:
+            commit_hash = commit["commit_hash"]
+
+            # Fetch diffs for this commit
+            diffs = await dbmod.fetch_git_diffs_for_commit(
+                self.db_path,
+                commit_hash=commit_hash,
+            )
+
+            # Apply file filter if specified
+            if file_filter:
+                diffs = [d for d in diffs if file_filter in d["file_path"]]
+
+            # Fetch tags
+            tags = await dbmod.fetch_git_tags_for_commit(
+                self.db_path,
+                commit_hash=commit_hash,
+            )
+
+            # Format the result
+            related_commits.append(
+                {
+                    "hash": commit_hash,
+                    "author": commit["author"],
+                    "timestamp": commit["timestamp"],
+                    "message": commit["message"],
+                    "tags": tags,
+                    "diffs": [
+                        {
+                            "file_path": d["file_path"],
+                            "change_type": d["change_type"],
+                            "diff_preview": d["diff_content"][:500]
+                            if d["diff_content"]
+                            else "",
+                        }
+                        for d in diffs[:5]  # Limit to 5 diffs per commit
+                    ],
+                }
+            )
+
+        return {
+            "query": query,
+            "related_commits": related_commits,
+            "total_commits": len(related_commits),
+        }

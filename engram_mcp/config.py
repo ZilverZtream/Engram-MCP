@@ -103,6 +103,10 @@ class EngramConfig:
     openai_api_key: SecretStr = SecretStr("")
     openai_embedding_model: str = "text-embedding-3-small"
 
+    # Episodic Diff Memory (Git History)
+    enable_history_indexing: bool = True
+    max_history_commits: int = 1000
+
 
 class AllowedConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -175,6 +179,10 @@ class AllowedConfig(BaseModel):
     ollama_url: str = "http://localhost:11434"
     openai_api_key: SecretStr = SecretStr("")
     openai_embedding_model: str = "text-embedding-3-small"
+
+    # Episodic Diff Memory (Git History)
+    enable_history_indexing: bool = True
+    max_history_commits: int = 1000
 
     @field_validator("overlap_tokens")
     @classmethod
