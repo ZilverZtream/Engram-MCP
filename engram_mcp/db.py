@@ -11,6 +11,17 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import aiosqlite
 
+# Polyfill: aiosqlite >= 0.22 removed execute_fetchone.  Re-add it so that
+# the rest of the module can use the convenient one-liner without changing
+# every call site.
+if not hasattr(aiosqlite.Connection, "execute_fetchone"):
+
+    async def _execute_fetchone(self, sql: str, parameters: tuple = ()) -> Any:  # type: ignore[override]
+        cursor = await self.execute(sql, parameters)
+        return await cursor.fetchone()
+
+    aiosqlite.Connection.execute_fetchone = _execute_fetchone  # type: ignore[attr-defined]
+
 
 SCHEMA_SQL = """
 PRAGMA journal_mode=WAL;
@@ -42,6 +53,7 @@ CREATE TABLE IF NOT EXISTS chunks (
     content TEXT NOT NULL,
     token_count INTEGER NOT NULL,
     metadata TEXT,
+    vector BLOB,
     access_count INTEGER DEFAULT 0,
     updated_at TEXT DEFAULT (datetime('now')),
     FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE
@@ -319,9 +331,18 @@ async def init_db(db_path: str) -> None:
         await _ensure_projects_schema(db)
         await _ensure_file_metadata_schema(db)
         await _ensure_file_chunks_schema(db)
+        await _ensure_chunks_vector_column(db)
         await _ensure_fts_tokenizer(db)
         await _ensure_fts_triggers(db)
         await db.commit()
+
+async def _ensure_chunks_vector_column(db: aiosqlite.Connection) -> None:
+    """Add the vector BLOB column used for crash-recovery without re-embedding."""
+    rows = await db.execute_fetchall("PRAGMA table_info(chunks)")
+    columns = {r[1] for r in rows}
+    if "vector" not in columns:
+        await db.execute("ALTER TABLE chunks ADD COLUMN vector BLOB")
+
 
 async def _ensure_projects_schema(db: aiosqlite.Connection) -> None:
     rows = await db.execute_fetchall("PRAGMA table_info(projects)")
@@ -365,6 +386,35 @@ async def _ensure_file_chunks_schema(db: aiosqlite.Connection) -> None:
     await _migrate_file_chunks_from_metadata(db)
 
 
+def _iter_json_string_array(json_text: str) -> "Iterable[str]":
+    """Yield string elements from a JSON array without materialising the full list.
+
+    Avoids allocating a Python list when the array may contain hundreds of
+    thousands of elements (e.g. chunk-id lists for large files).  Falls back
+    to the standard decoder for each element so escape sequences are handled
+    correctly.
+    """
+    decoder = json.JSONDecoder()
+    idx = 0
+    length = len(json_text)
+    # Advance to the opening bracket.
+    while idx < length and json_text[idx] != '[':
+        idx += 1
+    idx += 1  # skip '['
+    while idx < length:
+        # Skip whitespace and commas.
+        while idx < length and json_text[idx] in ' \t\n\r,':
+            idx += 1
+        if idx >= length or json_text[idx] == ']':
+            break
+        try:
+            obj, end = decoder.raw_decode(json_text, idx)
+        except json.JSONDecodeError:
+            break
+        yield str(obj)
+        idx = end
+
+
 async def _migrate_file_chunks_from_metadata(db: aiosqlite.Connection) -> None:
     row = await db.execute_fetchone(
         "SELECT 1 FROM schema_migrations WHERE name = ?",
@@ -379,19 +429,18 @@ async def _migrate_file_chunks_from_metadata(db: aiosqlite.Connection) -> None:
     cursor = await db.execute("SELECT project_id, file_path, chunk_ids FROM file_metadata")
     batch: List[Tuple[str, str, str]] = []
     async for project_id, file_path, chunk_ids_json in cursor:
-        try:
-            chunk_ids = json.loads(chunk_ids_json or "[]")
-        except json.JSONDecodeError:
-            logging.warning("Failed to decode chunk_ids for %s", file_path, exc_info=True)
-            chunk_ids = []
-        for chunk_id in chunk_ids:
-            batch.append((str(project_id), str(file_path), str(chunk_id)))
-        if len(batch) >= 500:
-            await db.executemany(
-                "INSERT OR IGNORE INTO file_chunks(project_id, file_path, chunk_id) VALUES(?,?,?)",
-                batch,
-            )
-            batch.clear()
+        # Stream the JSON array element-by-element so that a file with
+        # 100 000+ chunk IDs does not materialise a 100 000-element Python
+        # list all at once.  Flush to the DB every 500 rows to keep peak
+        # memory bounded regardless of per-file chunk count.
+        for chunk_id in _iter_json_string_array(chunk_ids_json or "[]"):
+            batch.append((str(project_id), str(file_path), chunk_id))
+            if len(batch) >= 500:
+                await db.executemany(
+                    "INSERT OR IGNORE INTO file_chunks(project_id, file_path, chunk_id) VALUES(?,?,?)",
+                    batch,
+                )
+                batch.clear()
     if batch:
         await db.executemany(
             "INSERT OR IGNORE INTO file_chunks(project_id, file_path, chunk_id) VALUES(?,?,?)",
@@ -750,6 +799,26 @@ async def upsert_chunks(
         await db.commit()
 
 
+async def upsert_chunk_vectors(
+    db_path: str,
+    rows: List[Tuple[bytes, str, int]],
+) -> None:
+    """Persist embedding vectors for crash-recovery without re-embedding.
+
+    Each entry in *rows* is (vector_bytes, project_id, internal_id).
+    The UPDATE targets chunks that were just inserted by upsert_chunks in
+    the same logical batch, so all rows are guaranteed to exist.
+    """
+    if not rows:
+        return
+    async with get_connection(db_path) as db:
+        await db.executemany(
+            "UPDATE chunks SET vector = ? WHERE project_id = ? AND internal_id = ?",
+            rows,
+        )
+        await db.commit()
+
+
 async def delete_chunks(db_path: str, project_id: str, chunk_ids: List[str]) -> None:
     if not chunk_ids:
         return
@@ -846,7 +915,13 @@ def _sanitize_fts_query(query: str) -> str:
     tokens = [t for t in cleaned.split() if t]
     if not tokens:
         return '""'
-    tokens = [t[:64] for t in tokens[:50]]
+    if len(tokens) > 50:
+        logging.warning(
+            "FTS strict query truncated from %d to 50 tokens; trailing terms dropped.",
+            len(tokens),
+        )
+        tokens = tokens[:50]
+    tokens = [t[:64] for t in tokens]
     return " AND ".join(f'"{t}"' for t in tokens)
 
 
@@ -873,7 +948,13 @@ def build_fts_query(query: str, *, mode: str = "strict") -> str:
         tokens.append(token)
     if not tokens:
         return '""'
-    tokens = [t[:64] for t in tokens[:50]]
+    if len(tokens) > 50:
+        logging.warning(
+            "FTS query truncated from %d to 50 tokens; trailing terms dropped.",
+            len(tokens),
+        )
+        tokens = tokens[:50]
+    tokens = [t[:64] for t in tokens]
     joiner = " OR " if mode_lower == "any" else " AND "
     return joiner.join(f'"{t}"' for t in tokens)
 
@@ -1345,7 +1426,7 @@ async def fetch_chunk_batch(
     async with get_connection(db_path) as db:
         rows = await db.execute_fetchall(
             """
-            SELECT chunk_id, internal_id, content, token_count, metadata
+            SELECT chunk_id, internal_id, content, token_count, metadata, vector
             FROM chunks
             WHERE project_id = ? AND internal_id > ?
             ORDER BY internal_id ASC
@@ -1355,7 +1436,7 @@ async def fetch_chunk_batch(
         )
 
     out: List[Dict[str, Any]] = []
-    for cid, iid, content, tcount, meta_json in rows:
+    for cid, iid, content, tcount, meta_json, vector in rows:
         meta = {}
         try:
             meta = json.loads(meta_json or "{}")
@@ -1366,6 +1447,7 @@ async def fetch_chunk_batch(
             {
                 "chunk": Chunk(chunk_id=cid, content=content, token_count=int(tcount), metadata=meta),
                 "internal_id": int(iid),
+                "vector": vector,
             }
         )
     return out

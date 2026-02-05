@@ -615,6 +615,9 @@ async def delete_project(project_id: str) -> str:
             except Exception as exc:
                 failures.append(f"fallback cleanup ({exc})")
             if failures:
+                # Roll back the deleting flag so the project is not stuck in
+                # limbo and can be retried on the next call.
+                await dbmod.set_project_deleting(cfg.db_path, project_id, False)
                 return "❌ Failed to delete index artifacts: " + ", ".join(failures)
             await dbmod.delete_project(cfg.db_path, project_id)
             await invalidate_search_cache_project(project_id)
