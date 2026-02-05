@@ -424,8 +424,10 @@ def _iter_json_string_array(json_text: str) -> "Iterable[str]":
             break
         try:
             obj, end = decoder.raw_decode(json_text, idx)
-        except json.JSONDecodeError:
-            break
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"Malformed JSON array near index {idx}: {json_text[idx:idx + 32]!r}…"
+            ) from exc
         yield str(obj)
         idx = end
 
@@ -443,19 +445,32 @@ async def _migrate_file_chunks_from_metadata(db: aiosqlite.Connection) -> None:
         return
     cursor = await db.execute("SELECT project_id, file_path, chunk_ids FROM file_metadata")
     batch: List[Tuple[str, str, str]] = []
+    migration_failed = False
     async for project_id, file_path, chunk_ids_json in cursor:
         # Stream the JSON array element-by-element so that a file with
         # 100 000+ chunk IDs does not materialise a 100 000-element Python
         # list all at once.  Flush to the DB every 500 rows to keep peak
         # memory bounded regardless of per-file chunk count.
-        for chunk_id in _iter_json_string_array(chunk_ids_json or "[]"):
-            batch.append((str(project_id), str(file_path), chunk_id))
-            if len(batch) >= 500:
-                await db.executemany(
-                    "INSERT OR IGNORE INTO file_chunks(project_id, file_path, chunk_id) VALUES(?,?,?)",
-                    batch,
-                )
-                batch.clear()
+        try:
+            for chunk_id in _iter_json_string_array(chunk_ids_json or "[]"):
+                batch.append((str(project_id), str(file_path), chunk_id))
+                if len(batch) >= 500:
+                    await db.executemany(
+                        "INSERT OR IGNORE INTO file_chunks(project_id, file_path, chunk_id) VALUES(?,?,?)",
+                        batch,
+                    )
+                    batch.clear()
+        except ValueError as exc:
+            logging.error(
+                "Aborting file_chunks_backfill: malformed chunk_ids JSON for %s %s",
+                project_id,
+                file_path,
+            )
+            logging.error("Migration error details: %s", exc)
+            migration_failed = True
+            break
+    if migration_failed:
+        return
     if batch:
         await db.executemany(
             "INSERT OR IGNORE INTO file_chunks(project_id, file_path, chunk_id) VALUES(?,?,?)",
