@@ -2193,10 +2193,8 @@ def _save_faiss(index: Any, path_context: PathContext, path: str) -> None:
         if os.name == "posix" and os.path.exists(fd_path):
             write_path = fd_path
         faiss.write_index(index, write_path)
-        # Compute the checksum *before* the atomic replace so the hash
-        # covers exactly the bytes that end up at *path*.
-        checksum = _compute_file_checksum(tmp_path)
         _replace_with_retries(path_context, tmp_path, path)
+        checksum = _compute_file_checksum(path)
         # Persist checksum companion so project_health can detect bit-rot.
         path_context.write_text_atomic(path + ".checksum", checksum, encoding="utf-8")
         try:
