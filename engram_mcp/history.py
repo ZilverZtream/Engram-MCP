@@ -22,6 +22,9 @@ from . import db as dbmod
 from .embeddings import EmbeddingService
 from .security import PathContext
 
+_COMMIT_MARKER = "===COMMIT_START==="
+_MAX_DIFF_CHARS = 2000
+
 
 @dataclass
 class GitCommit:
@@ -77,7 +80,6 @@ class GitIndexer:
         Returns:
             Dict with counts of indexed commits, diffs, and tags
         """
-        # Validate that repo_path is a git repository
         safe_repo = str(self.project_path_context.resolve_path(repo_path))
         git_dir = os.path.join(safe_repo, ".git")
         if not os.path.exists(git_dir):
@@ -90,47 +92,55 @@ class GitIndexer:
             branch,
         )
 
-        # Parse git log
-        commits = await self._parse_git_log(safe_repo, limit=limit, branch=branch)
-        logging.info("Parsed %d commits from git log", len(commits))
-
-        # Filter meaningful commits
-        meaningful_commits = self._filter_meaningful_commits(commits)
+        # Single subprocess retrieves commit metadata AND diffs together.
+        commits, all_diffs = await self._parse_git_log(
+            safe_repo, limit=limit, branch=branch
+        )
         logging.info(
-            "Filtered to %d meaningful commits (%.1f%%)",
-            len(meaningful_commits),
-            100.0 * len(meaningful_commits) / max(1, len(commits)),
+            "Parsed %d commits and %d diffs from git log",
+            len(commits),
+            len(all_diffs),
         )
 
-        # Embed commit messages
-        embedded_commits = await self._embed_commit_messages(meaningful_commits)
-        logging.info("Embedded %d commit messages", len(embedded_commits))
+        # Filter meaningful commits and keep only their diffs.
+        meaningful_commits = self._filter_meaningful_commits(commits)
+        meaningful_hashes = {c.commit_hash for c in meaningful_commits}
+        filtered_diffs = [d for d in all_diffs if d.commit_hash in meaningful_hashes]
+        logging.info(
+            "Filtered to %d meaningful commits (%.1f%%), %d diffs",
+            len(meaningful_commits),
+            100.0 * len(meaningful_commits) / max(1, len(commits)),
+            len(filtered_diffs),
+        )
 
-        # Parse diffs for each commit
-        all_diffs: List[GitDiff] = []
-        all_tags: List[Tuple[str, str]] = []
-        for commit in meaningful_commits:
-            diffs = await self._parse_commit_diffs(safe_repo, commit.commit_hash)
-            all_diffs.extend(diffs)
-
-            # Auto-tag commits based on message
-            tags = self._extract_commit_tags(commit.message)
-            for tag in tags:
-                all_tags.append((commit.commit_hash, tag))
-
-        logging.info("Parsed %d diffs across all commits", len(all_diffs))
+        # Extract tags (pure CPU, no I/O).
+        all_tags: List[Tuple[str, str]] = [
+            (commit.commit_hash, tag)
+            for commit in meaningful_commits
+            for tag in self._extract_commit_tags(commit.message)
+        ]
         logging.info("Extracted %d tags", len(all_tags))
 
-        # Store in database
+        # Overlap GPU work (embedding) with DB writes (diffs + tags).
+        embedded_commits, _, _ = await asyncio.gather(
+            self._embed_commit_messages(meaningful_commits),
+            self._store_diffs(filtered_diffs),
+            self._store_tags(all_tags),
+        )
+        logging.info("Embedded %d commit messages", len(embedded_commits))
+
+        # Commits stored last — the embedding UUIDs from the gather are needed.
         await self._store_commits(project_id, embedded_commits)
-        await self._store_diffs(all_diffs)
-        await self._store_tags(all_tags)
 
         return {
             "commits": len(embedded_commits),
-            "diffs": len(all_diffs),
+            "diffs": len(filtered_diffs),
             "tags": len(all_tags),
         }
+
+    # ------------------------------------------------------------------
+    # Git log parsing — single subprocess
+    # ------------------------------------------------------------------
 
     async def _parse_git_log(
         self,
@@ -138,10 +148,15 @@ class GitIndexer:
         *,
         limit: int,
         branch: str,
-    ) -> List[GitCommit]:
-        """Parse git log using subprocess."""
-        # Format: hash|author|timestamp|subject
-        # We use --name-only to get changed files
+    ) -> Tuple[List[GitCommit], List[GitDiff]]:
+        """Retrieve commits and diffs in a single ``git log -p`` subprocess.
+
+        The custom ``--format`` string embeds a unique delimiter before each
+        commit's metadata line.  Everything between two delimiters — metadata,
+        name-status, and the full unified patch — belongs to the same commit.
+        This eliminates the O(N*M) subprocess fan-out that the previous
+        per-commit ``git show`` approach required.
+        """
         cmd = [
             "git",
             "-C",
@@ -149,8 +164,10 @@ class GitIndexer:
             "log",
             branch,
             f"--max-count={limit}",
-            "--format=%H|%an|%at|%s",
-            "--name-only",
+            f"--format={_COMMIT_MARKER}%H|%an|%at|%s",
+            "--name-status",
+            "-p",
+            "--no-merges",
         ]
 
         proc = await asyncio.create_subprocess_exec(
@@ -167,59 +184,141 @@ class GitIndexer:
 
         return self._parse_log_output(stdout.decode("utf-8", errors="replace"))
 
-    def _parse_log_output(self, output: str) -> List[GitCommit]:
-        """Parse git log output into GitCommit objects."""
-        commits: List[GitCommit] = []
-        lines = output.strip().split("\n")
-        i = 0
+    def _parse_log_output(self, output: str) -> Tuple[List[GitCommit], List[GitDiff]]:
+        """State-machine parser for ``git log -p --name-status`` output.
 
-        while i < len(lines):
-            line = lines[i].strip()
-            if not line:
-                i += 1
+        Layout per commit::
+
+            ===COMMIT_START===<hash>|<author>|<ts>|<subject>
+            <status>\\t<path>        ← name-status block
+            ...
+            diff --git a/<path> b/<path>   ← patch blocks
+            <diff header + body>
+            ...
+
+        The parser splits on the commit marker, then within each section
+        splits on the first ``diff --git`` occurrence to separate
+        name-status metadata from patch content.
+        """
+        commits: List[GitCommit] = []
+        all_diffs: List[GitDiff] = []
+
+        for section in output.split(_COMMIT_MARKER)[1:]:
+            if not section.strip():
                 continue
 
-            # Parse commit header
-            if "|" in line:
-                parts = line.split("|", 3)
-                if len(parts) < 4:
-                    i += 1
+            # --- Header (first line) ---------------------------------------------
+            newline_pos = section.find("\n")
+            if newline_pos < 0:
+                continue
+            header = section[:newline_pos].strip()
+            body = section[newline_pos + 1:]
+
+            parts = header.split("|", 3)
+            if len(parts) < 4:
+                continue
+            commit_hash, author, timestamp_str, message = parts
+            try:
+                timestamp = int(timestamp_str)
+            except ValueError:
+                continue
+
+            # --- Split body into name-status vs patch sections -------------------
+            diff_start = body.find("diff --git ")
+            if diff_start >= 0:
+                name_status_text = body[:diff_start]
+                diff_text = body[diff_start:]
+            else:
+                name_status_text = body
+                diff_text = ""
+
+            # --- Parse name-status → {file_path: change_type} -------------------
+            change_type_map: Dict[str, str] = {}
+            changed_files: List[str] = []
+            for line in name_status_text.split("\n"):
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                tab_parts = stripped.split("\t")
+                if len(tab_parts) < 2:
+                    continue
+                status = tab_parts[0]
+                # Rename/Copy: R###\told\tnew  or  C###\told\tnew
+                if (status.startswith("R") or status.startswith("C")) and len(tab_parts) >= 3:
+                    file_path = tab_parts[2]
+                else:
+                    file_path = tab_parts[1]
+
+                if status.startswith("A"):
+                    change_type_map[file_path] = "ADDED"
+                elif status.startswith("D"):
+                    change_type_map[file_path] = "DELETED"
+                else:
+                    change_type_map[file_path] = "MODIFIED"
+                changed_files.append(file_path)
+
+            commits.append(
+                GitCommit(
+                    commit_hash=commit_hash,
+                    author=author,
+                    timestamp=timestamp,
+                    message=message,
+                    changed_files=changed_files,
+                )
+            )
+
+            # --- Parse per-file diffs --------------------------------------------
+            if not diff_text:
+                continue
+            for block in re.split(r"(?=diff --git )", diff_text):
+                if not block.strip():
                     continue
 
-                commit_hash, author, timestamp_str, message = parts
-                try:
-                    timestamp = int(timestamp_str)
-                except ValueError:
-                    i += 1
+                file_path = self._extract_filepath_from_diff(block)
+                if not file_path:
                     continue
 
-                # Collect changed files (until next commit or end)
-                changed_files: List[str] = []
-                i += 1
-                while i < len(lines):
-                    file_line = lines[i].strip()
-                    if not file_line:
-                        i += 1
-                        break
-                    # Next commit starts
-                    if "|" in file_line:
-                        break
-                    changed_files.append(file_line)
-                    i += 1
+                change_type = change_type_map.get(file_path, "MODIFIED")
+                diff_content = (
+                    block
+                    if len(block) <= _MAX_DIFF_CHARS
+                    else block[:_MAX_DIFF_CHARS] + "\n... (truncated)"
+                )
 
-                commits.append(
-                    GitCommit(
+                all_diffs.append(
+                    GitDiff(
                         commit_hash=commit_hash,
-                        author=author,
-                        timestamp=timestamp,
-                        message=message,
-                        changed_files=changed_files,
+                        file_path=file_path,
+                        change_type=change_type,
+                        diff_content=diff_content,
                     )
                 )
-            else:
-                i += 1
 
-        return commits
+        return commits, all_diffs
+
+    @staticmethod
+    def _extract_filepath_from_diff(block: str) -> Optional[str]:
+        """Extract the canonical file path from a single diff block.
+
+        Checks ``+++ b/<path>`` first (present for all non-deleted files),
+        falls back to ``--- a/<path>`` for deleted files, and handles the
+        ``Binary files … differ`` line emitted for binary diffs.
+        """
+        minus_path: Optional[str] = None
+        for line in block.split("\n")[:15]:  # header is always in the first few lines
+            if line.startswith("+++ b/"):
+                return line[6:]
+            if line.startswith("--- a/") and minus_path is None:
+                minus_path = line[6:]
+            # Binary file: no +++ / --- lines
+            bin_match = re.match(r"^Binary files? a/.+ and b/(.+) differ$", line)
+            if bin_match:
+                return bin_match.group(1)
+        return minus_path
+
+    # ------------------------------------------------------------------
+    # Filtering & tagging
+    # ------------------------------------------------------------------
 
     def _filter_meaningful_commits(self, commits: List[GitCommit]) -> List[GitCommit]:
         """Filter out noise commits (version bumps, merges, etc.)."""
@@ -248,131 +347,6 @@ class GitIndexer:
 
         return meaningful
 
-    async def _embed_commit_messages(
-        self, commits: List[GitCommit]
-    ) -> List[Tuple[GitCommit, str, np.ndarray]]:
-        """Embed commit messages and return (commit, uuid, embedding) tuples."""
-        if not commits:
-            return []
-
-        messages = [commit.message for commit in commits]
-
-        # Embed all messages in batch
-        embeddings = await self.embedding_service.embed_batch(messages)
-
-        # Generate UUIDs for embeddings (for future FAISS indexing)
-        result = []
-        for commit, embedding in zip(commits, embeddings):
-            # Generate a deterministic UUID based on project + commit hash
-            uuid = hashlib.sha256(
-                f"{commit.commit_hash}:{commit.message}".encode("utf-8")
-            ).hexdigest()[:32]
-            result.append((commit, uuid, embedding))
-
-        return result
-
-    async def _parse_commit_diffs(
-        self, repo_path: str, commit_hash: str
-    ) -> List[GitDiff]:
-        """Parse diffs for a specific commit."""
-        cmd = [
-            "git",
-            "-C",
-            repo_path,
-            "show",
-            "--format=",
-            "--name-status",
-            commit_hash,
-        ]
-
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-
-        stdout, stderr = await proc.communicate()
-
-        if proc.returncode != 0:
-            logging.warning("Failed to get diff for commit %s: %s", commit_hash, stderr)
-            return []
-
-        diffs = []
-        output = stdout.decode("utf-8", errors="replace")
-
-        for line in output.strip().split("\n"):
-            line = line.strip()
-            if not line:
-                continue
-
-            # Format: STATUS\tFILENAME
-            parts = line.split("\t", 1)
-            if len(parts) != 2:
-                continue
-
-            status, file_path = parts
-
-            # Map git status to our change types
-            change_type = "MODIFIED"
-            if status.startswith("A"):
-                change_type = "ADDED"
-            elif status.startswith("D"):
-                change_type = "DELETED"
-            elif status.startswith("M"):
-                change_type = "MODIFIED"
-
-            # Get the actual diff content for this file
-            diff_content = await self._get_file_diff(
-                repo_path, commit_hash, file_path
-            )
-
-            # Create deterministic ID
-            diff_id = hashlib.sha256(
-                f"{commit_hash}:{file_path}".encode("utf-8")
-            ).hexdigest()
-
-            diffs.append(
-                GitDiff(
-                    commit_hash=commit_hash,
-                    file_path=file_path,
-                    change_type=change_type,
-                    diff_content=diff_content,
-                )
-            )
-
-        return diffs
-
-    async def _get_file_diff(
-        self, repo_path: str, commit_hash: str, file_path: str
-    ) -> str:
-        """Get the actual diff content for a specific file in a commit."""
-        cmd = [
-            "git",
-            "-C",
-            repo_path,
-            "show",
-            f"{commit_hash}:{file_path}",
-        ]
-
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-
-        stdout, stderr = await proc.communicate()
-
-        if proc.returncode != 0:
-            # File might have been deleted or renamed
-            return ""
-
-        # Truncate large diffs to first 2000 chars
-        content = stdout.decode("utf-8", errors="replace")
-        if len(content) > 2000:
-            content = content[:2000] + "\n... (truncated)"
-
-        return content
-
     def _extract_commit_tags(self, message: str) -> List[str]:
         """Extract semantic tags from commit message."""
         tags = []
@@ -396,22 +370,57 @@ class GitIndexer:
 
         return tags
 
+    # ------------------------------------------------------------------
+    # Embedding
+    # ------------------------------------------------------------------
+
+    async def _embed_commit_messages(
+        self, commits: List[GitCommit]
+    ) -> List[Tuple[GitCommit, str, np.ndarray]]:
+        """Embed commit messages and return (commit, uuid, embedding) tuples."""
+        if not commits:
+            return []
+
+        messages = [commit.message for commit in commits]
+
+        # Embed all messages in batch
+        embeddings = await self.embedding_service.embed_batch(messages)
+
+        # Generate UUIDs for embeddings (for future FAISS indexing)
+        result = []
+        for commit, embedding in zip(commits, embeddings):
+            # Generate a deterministic UUID based on project + commit hash
+            uuid = hashlib.sha256(
+                f"{commit.commit_hash}:{commit.message}".encode("utf-8")
+            ).hexdigest()[:32]
+            result.append((commit, uuid, embedding))
+
+        return result
+
+    # ------------------------------------------------------------------
+    # Database persistence
+    # ------------------------------------------------------------------
+
     async def _store_commits(
         self,
         project_id: str,
         commits: List[Tuple[GitCommit, str, np.ndarray]],
     ) -> None:
-        """Store commits in database."""
-        for commit, uuid, _embedding in commits:
-            await dbmod.upsert_git_commit(
-                self.db_path,
-                project_id=project_id,
-                commit_hash=commit.commit_hash,
-                author=commit.author,
-                timestamp=commit.timestamp,
-                message=commit.message,
-                embedding_uuid=uuid,
+        """Bulk-store commits via a single executemany round-trip."""
+        if not commits:
+            return
+        commit_tuples = [
+            (
+                commit.commit_hash,
+                project_id,
+                commit.author,
+                commit.timestamp,
+                commit.message,
+                uuid,
             )
+            for commit, uuid, _embedding in commits
+        ]
+        await dbmod.upsert_git_commits(self.db_path, commits=commit_tuples)
 
     async def _store_diffs(self, diffs: List[GitDiff]) -> None:
         """Store diffs in database."""

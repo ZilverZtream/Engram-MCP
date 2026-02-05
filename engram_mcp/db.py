@@ -170,6 +170,26 @@ CREATE TABLE IF NOT EXISTS git_commits (
 CREATE INDEX IF NOT EXISTS idx_git_commits_project ON git_commits(project_id, timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_git_commits_embedding ON git_commits(embedding_uuid);
 
+-- FTS5 index on commit messages for fast keyword search
+CREATE VIRTUAL TABLE IF NOT EXISTS git_commits_fts USING fts5(
+    commit_hash,
+    message,
+    tokenize = 'unicode61'
+);
+
+CREATE TRIGGER IF NOT EXISTS git_commits_fts_ai AFTER INSERT ON git_commits BEGIN
+  INSERT INTO git_commits_fts(rowid, commit_hash, message)
+  VALUES (new.rowid, new.commit_hash, new.message);
+END;
+
+CREATE TRIGGER IF NOT EXISTS git_commits_fts_ad AFTER DELETE ON git_commits BEGIN
+  DELETE FROM git_commits_fts WHERE rowid = old.rowid;
+END;
+
+CREATE TRIGGER IF NOT EXISTS git_commits_fts_au AFTER UPDATE OF message ON git_commits BEGIN
+  UPDATE git_commits_fts SET message = new.message WHERE rowid = new.rowid;
+END;
+
 CREATE TABLE IF NOT EXISTS git_diffs (
     id TEXT PRIMARY KEY,
     commit_hash TEXT NOT NULL,
@@ -389,6 +409,7 @@ async def init_db(db_path: str) -> None:
         await _ensure_search_sessions_schema(db)
         await _ensure_graph_schema(db)
         await _ensure_repo_rules_schema(db)
+        await _ensure_git_commits_fts_schema(db)
         await db.commit()
 
 async def _ensure_chunks_vector_column(db: aiosqlite.Connection) -> None:
@@ -2372,24 +2393,69 @@ async def delete_repo_rule(db_path: str, rule_id: str) -> None:
         await db.commit()
 
 
+async def _ensure_git_commits_fts_schema(db: aiosqlite.Connection) -> None:
+    """Migration git_commits_fts_v1: add FTS5 virtual table for commit message search."""
+    row = await db.execute_fetchone(
+        "SELECT 1 FROM schema_migrations WHERE name = 'git_commits_fts_v1'"
+    )
+    if row:
+        return
+
+    await db.executescript(
+        """
+        CREATE VIRTUAL TABLE IF NOT EXISTS git_commits_fts USING fts5(
+            commit_hash,
+            message,
+            tokenize = 'unicode61'
+        );
+
+        DROP TRIGGER IF EXISTS git_commits_fts_ai;
+        DROP TRIGGER IF EXISTS git_commits_fts_ad;
+        DROP TRIGGER IF EXISTS git_commits_fts_au;
+
+        CREATE TRIGGER git_commits_fts_ai AFTER INSERT ON git_commits BEGIN
+          INSERT INTO git_commits_fts(rowid, commit_hash, message)
+          VALUES (new.rowid, new.commit_hash, new.message);
+        END;
+
+        CREATE TRIGGER git_commits_fts_ad AFTER DELETE ON git_commits BEGIN
+          DELETE FROM git_commits_fts WHERE rowid = old.rowid;
+        END;
+
+        CREATE TRIGGER git_commits_fts_au AFTER UPDATE OF message ON git_commits BEGIN
+          UPDATE git_commits_fts SET message = new.message WHERE rowid = new.rowid;
+        END;
+        """
+    )
+    # Backfill any pre-existing commits into the new FTS index
+    await db.execute("DELETE FROM git_commits_fts;")
+    await db.execute(
+        "INSERT INTO git_commits_fts(rowid, commit_hash, message) "
+        "SELECT rowid, commit_hash, message FROM git_commits;"
+    )
+    await db.execute(
+        "INSERT INTO schema_migrations(name) VALUES(?)", ("git_commits_fts_v1",)
+    )
+
+
 # ============================================================================
 # Episodic Diff Memory: Git History API
 # ============================================================================
 
 
-async def upsert_git_commit(
+async def upsert_git_commits(
     db_path: str,
     *,
-    project_id: str,
-    commit_hash: str,
-    author: str,
-    timestamp: int,
-    message: str,
-    embedding_uuid: Optional[str] = None,
+    commits: List[Tuple[str, str, str, int, str, Optional[str]]],
 ) -> None:
-    """Insert or update a git commit record."""
+    """Bulk insert or update git commit records.
+
+    Each tuple: (commit_hash, project_id, author, timestamp, message, embedding_uuid)
+    """
+    if not commits:
+        return
     async with get_connection(db_path) as db:
-        await db.execute(
+        await db.executemany(
             """
             INSERT INTO git_commits(commit_hash, project_id, author, timestamp, message, embedding_uuid)
             VALUES(?, ?, ?, ?, ?, ?)
@@ -2399,7 +2465,7 @@ async def upsert_git_commit(
                 message = excluded.message,
                 embedding_uuid = excluded.embedding_uuid
             """,
-            (commit_hash, project_id, author, timestamp, message, embedding_uuid),
+            commits,
         )
         await db.commit()
 
@@ -2499,19 +2565,40 @@ async def search_git_commits_by_message(
     query: str,
     limit: int = 10,
 ) -> List[Dict[str, Any]]:
-    """Search commit messages using simple text matching."""
-    async with get_connection(db_path) as db:
-        db.row_factory = aiosqlite.Row
-        rows = await db.execute_fetchall(
-            """
-            SELECT commit_hash, author, timestamp, message, embedding_uuid
-            FROM git_commits
-            WHERE project_id = ? AND message LIKE ?
-            ORDER BY timestamp DESC
-            LIMIT ?
-            """,
-            (project_id, f"%{query}%", limit),
-        )
+    """Search commit messages using FTS5 full-text search.
+
+    Falls back to a plain LIKE query when the FTS index is not yet available
+    (e.g. on a database that has not been migrated yet).
+    """
+    sanitized = build_fts_query(query)
+    try:
+        async with get_connection(db_path) as db:
+            db.row_factory = aiosqlite.Row
+            rows = await db.execute_fetchall(
+                """
+                SELECT c.commit_hash, c.author, c.timestamp, c.message, c.embedding_uuid
+                FROM git_commits_fts AS fts
+                JOIN git_commits c ON c.commit_hash = fts.commit_hash
+                WHERE c.project_id = ? AND fts MATCH ?
+                ORDER BY bm25(fts) ASC, c.timestamp DESC
+                LIMIT ?
+                """,
+                (project_id, sanitized, limit),
+            )
+    except aiosqlite.OperationalError:
+        logging.warning("git_commits_fts not available, falling back to LIKE", exc_info=True)
+        async with get_connection(db_path) as db:
+            db.row_factory = aiosqlite.Row
+            rows = await db.execute_fetchall(
+                """
+                SELECT commit_hash, author, timestamp, message, embedding_uuid
+                FROM git_commits
+                WHERE project_id = ? AND message LIKE ?
+                ORDER BY timestamp DESC
+                LIMIT ?
+                """,
+                (project_id, f"%{query}%", limit),
+            )
     return [dict(r) for r in rows]
 
 
