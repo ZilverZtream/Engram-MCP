@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections import Counter
 from itertools import combinations
 from typing import Dict, List, Tuple
@@ -129,3 +130,118 @@ async def identify_candidates(project_id: str) -> List[Tuple[str, str, int]]:
     ]
     candidates.sort(key=lambda item: (-item[2], item[0], item[1]))
     return candidates
+
+
+async def find_temporal_couplings(
+    project_id: str,
+    *,
+    min_frequency: int = 5,
+    limit: int = 100,
+) -> List[Tuple[str, str, int, Dict[str, str]]]:
+    """Find files that frequently change together in git history.
+
+    This implements "Temporal Coupling Detection" - identifying files that
+    statistically change in the same commits, even if there's no explicit
+    import/call relationship between them.
+
+    Args:
+        project_id: The project to analyze
+        min_frequency: Minimum number of co-changes to consider a coupling (default: 5)
+        limit: Maximum number of couplings to return (default: 100)
+
+    Returns:
+        List of (file_a, file_b, frequency, metadata) tuples where:
+        - file_a, file_b: Coupled file paths (file_a < file_b alphabetically)
+        - frequency: Number of commits where both files changed
+        - metadata: Additional context (recent commits, common tags, etc.)
+    """
+    async with dbmod.get_connection(_cfg.db_path) as db:
+        # The Coupling Detector SQL
+        # Finds pairs of files that changed in the same commit
+        rows = await db.execute_fetchall(
+            """
+            SELECT
+                a.file_path as file_a,
+                b.file_path as file_b,
+                COUNT(*) as pair_frequency
+            FROM git_diffs a
+            JOIN git_diffs b ON a.commit_hash = b.commit_hash
+            WHERE
+                a.project_id = ? AND
+                b.project_id = ? AND
+                a.file_path < b.file_path
+            GROUP BY file_a, file_b
+            HAVING pair_frequency >= ?
+            ORDER BY pair_frequency DESC
+            LIMIT ?
+            """,
+            (project_id, project_id, min_frequency, limit),
+        )
+
+    if not rows:
+        logging.info("No temporal couplings found for project %s", project_id)
+        return []
+
+    couplings = []
+    async with dbmod.get_connection(_cfg.db_path) as db:
+        for file_a, file_b, frequency in rows:
+            # Fetch metadata: find recent commits and common tags
+            # Get commit hashes where both files changed
+            commit_rows = await db.execute_fetchall(
+                """
+                SELECT DISTINCT a.commit_hash
+                FROM git_diffs a
+                JOIN git_diffs b ON a.commit_hash = b.commit_hash
+                WHERE
+                    a.project_id = ? AND
+                    b.project_id = ? AND
+                    a.file_path = ? AND
+                    b.file_path = ?
+                ORDER BY a.commit_hash DESC
+                LIMIT 3
+                """,
+                (project_id, project_id, file_a, file_b),
+            )
+
+            recent_commits = [row[0] for row in commit_rows]
+
+            # Get common tags for these commits
+            tag_rows = await db.execute_fetchall(
+                """
+                SELECT tag, COUNT(*) as tag_count
+                FROM git_tags
+                WHERE commit_hash IN (
+                    SELECT DISTINCT a.commit_hash
+                    FROM git_diffs a
+                    JOIN git_diffs b ON a.commit_hash = b.commit_hash
+                    WHERE
+                        a.project_id = ? AND
+                        b.project_id = ? AND
+                        a.file_path = ? AND
+                        b.file_path = ?
+                )
+                GROUP BY tag
+                ORDER BY tag_count DESC
+                LIMIT 3
+                """,
+                (project_id, project_id, file_a, file_b),
+            )
+
+            common_tags = [tag for tag, _ in tag_rows]
+
+            metadata = {
+                "source": "temporal_history",
+                "recent_commits": recent_commits,
+                "common_tags": common_tags,
+            }
+
+            couplings.append((file_a, file_b, frequency, metadata))
+
+    logging.info(
+        "Found %d temporal couplings for project %s (min_frequency=%d)",
+        len(couplings),
+        project_id,
+        min_frequency,
+    )
+
+    return couplings
