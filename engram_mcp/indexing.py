@@ -319,9 +319,9 @@ class Indexer:
 
                     if str(path.suffix).lower() == ".pdf":
                         async with pdf_sem:
-                            chunks, content_hash = await _run_in_thread_with_timeout(_do_parse)
+                            chunks, content_hash, nodes, edges = await _run_in_thread_with_timeout(_do_parse)
                     else:
-                        chunks, content_hash = await _run_in_thread_with_timeout(_do_parse)
+                        chunks, content_hash, nodes, edges = await _run_in_thread_with_timeout(_do_parse)
                 except Exception:
                     logging.warning("Failed to parse %s", rel, exc_info=True)
                     return None
@@ -332,6 +332,8 @@ class Indexer:
                     size_bytes=stat.st_size,
                     content_hash=content_hash,
                     chunks=chunks,
+                    nodes=nodes,
+                    edges=edges,
                 )
 
             try:
@@ -387,6 +389,15 @@ class Indexer:
                         await dbmod.upsert_chunks(self.cfg.db_path, project_id=str(project_id), rows=rows)
                         total_chunks += len(parsed.chunks)
                     await dbmod.upsert_file_metadata(self.cfg.db_path, str(project_id), [file_row])
+                    if parsed.nodes:
+                        await dbmod.upsert_graph_nodes(
+                            self.cfg.db_path,
+                            project_id=str(project_id),
+                            nodes=[
+                                (n.node_id, n.node_type, n.name, n.file_path, n.start_line, n.end_line, n.metadata)
+                                for n in parsed.nodes
+                            ],
+                        )
 
                 if file_count == 0 or total_chunks == 0:
                     raise ValueError("No indexable content found.")
@@ -871,9 +882,9 @@ class Indexer:
 
                     if str(path.suffix).lower() == ".pdf":
                         async with pdf_sem:
-                            chunks, content_hash = await _run_in_thread_with_timeout(_do_parse)
+                            chunks, content_hash, nodes, edges = await _run_in_thread_with_timeout(_do_parse)
                     else:
-                        chunks, content_hash = await _run_in_thread_with_timeout(_do_parse)
+                        chunks, content_hash, nodes, edges = await _run_in_thread_with_timeout(_do_parse)
                 except Exception:
                     logging.warning("Failed to parse %s", rel, exc_info=True)
                     return None
@@ -884,6 +895,8 @@ class Indexer:
                     size_bytes=stat.st_size,
                     content_hash=content_hash,
                     chunks=chunks,
+                    nodes=nodes,
+                    edges=edges,
                 )
 
             embedding_dim: Optional[int] = None
@@ -893,6 +906,7 @@ class Indexer:
             pending_rows: List[List[Tuple[str, int, str, int, Dict[str, Any]]]] = []
             pending_file_rows: List[List[dbmod.FileMetadataRow]] = []
             pending_file_metadata: List[dbmod.FileMetadataRow] = []
+            pending_graph_nodes: list = []
             training_vectors: List[np.ndarray] = []
             total_chunks = 0
             train_target = max(1000, int(self.cfg.faiss_nlist) * 20)
@@ -967,6 +981,16 @@ class Indexer:
                                 self.cfg.db_path, str(project_id), pending_file_metadata
                             )
                             pending_file_metadata.clear()
+                        if pending_graph_nodes:
+                            await dbmod.upsert_graph_nodes(
+                                self.cfg.db_path,
+                                project_id=str(project_id),
+                                nodes=[
+                                    (n.node_id, n.node_type, n.name, n.file_path, n.start_line, n.end_line, n.metadata)
+                                    for n in pending_graph_nodes
+                                ],
+                            )
+                            pending_graph_nodes.clear()
 
                     batch_rows = [
                         (c.chunk_id, int(iid), c.content, int(c.token_count), c.metadata)
@@ -1033,6 +1057,20 @@ class Indexer:
                     await dbmod.upsert_file_metadata(self.cfg.db_path, str(project_id), [file_row])
                 else:
                     pending_file_metadata.append(file_row)
+
+                # Persist code-graph nodes extracted during parsing.
+                if parsed.nodes:
+                    if project_initialized:
+                        await dbmod.upsert_graph_nodes(
+                            self.cfg.db_path,
+                            project_id=str(project_id),
+                            nodes=[
+                                (n.node_id, n.node_type, n.name, n.file_path, n.start_line, n.end_line, n.metadata)
+                                for n in parsed.nodes
+                            ],
+                        )
+                    else:
+                        pending_graph_nodes.extend(parsed.nodes)
 
             if file_count == 0:
                 raise ValueError("No indexable content found.")

@@ -5,9 +5,9 @@ import hashlib
 import logging
 import os
 from contextlib import ExitStack
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, Iterator, List, Optional
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
 from .chunking import Chunk, chunk_lines, chunk_text, make_chunk_id, token_count
 from .security import PathContext
@@ -18,6 +18,289 @@ SUPPORTED_TEXT_EXTS = {
 }
 
 SUPPORTED_DOC_EXTS = {".pdf", ".docx"}
+
+
+# ---------------------------------------------------------------------------
+# Graph dataclasses
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class GraphNodeObj:
+    """A single code-graph node (function / class) extracted from a source file."""
+
+    node_id: str  # Unique within a project:  "path:type:name"
+    node_type: str  # "function" | "class"
+    name: str  # Simple identifier; may include qualifier for C++ (MyClass::method)
+    file_path: str  # Relative path within the project root
+    start_line: int  # 1-based, inclusive
+    end_line: int  # 1-based, inclusive
+    metadata: Dict[str, Any]  # e.g. {"language": "rust"}
+
+
+@dataclass(frozen=True)
+class GraphEdgeObj:
+    """A directed edge in the code graph."""
+
+    source_id: str
+    target_id: str
+    edge_type: str  # "calls", "contains", "imports", …
+
+
+# ---------------------------------------------------------------------------
+# Polyglot query registry
+# ---------------------------------------------------------------------------
+# Maps file extension → (tree-sitter language name, SCM query string).
+# Adding a new language only requires a new entry here.
+
+LANGUAGE_CONFIG: Dict[str, Tuple[str, str]] = {
+    # --- Systems languages ---
+    ".rs": (
+        "rust",
+        """
+        (function_item name: (identifier) @name) @func
+        (struct_item name: (type_identifier) @name) @cls
+        (impl_item type: (type_identifier) @name) @impl
+        """,
+    ),
+    ".go": (
+        "go",
+        """
+        (function_declaration name: (identifier) @name) @func
+        (method_declaration name: (field_identifier) @name) @method
+        (type_declaration (type_spec name: (type_identifier) @name)) @cls
+        """,
+    ),
+    ".c": (
+        "c",
+        """
+        (function_definition) @func
+        (struct_specifier name: (type_identifier) @name) @cls
+        """,
+    ),
+    ".cpp": (
+        "cpp",
+        """
+        (function_definition) @func
+        (class_specifier name: (type_identifier) @name) @cls
+        """,
+    ),
+    ".h": (
+        "cpp",
+        """
+        (class_specifier name: (type_identifier) @name) @cls
+        """,
+    ),
+    ".hpp": (
+        "cpp",
+        """
+        (class_specifier name: (type_identifier) @name) @cls
+        """,
+    ),
+    # --- Enterprise languages ---
+    ".java": (
+        "java",
+        """
+        (method_declaration name: (identifier) @name) @func
+        (class_declaration name: (identifier) @name) @cls
+        (interface_declaration name: (identifier) @name) @cls
+        """,
+    ),
+    ".cs": (
+        "c_sharp",
+        """
+        (method_declaration name: (identifier) @name) @func
+        (class_declaration name: (identifier) @name) @cls
+        (interface_declaration name: (identifier) @name) @cls
+        """,
+    ),
+    # --- Web languages ---
+    ".js": (
+        "javascript",
+        """
+        (function_declaration name: (identifier) @name) @func
+        (class_declaration name: (identifier) @name) @cls
+        """,
+    ),
+    ".ts": (
+        "typescript",
+        """
+        (function_declaration name: (identifier) @name) @func
+        (class_declaration name: (type_identifier) @name) @cls
+        (interface_declaration name: (type_identifier) @name) @cls
+        """,
+    ),
+    ".tsx": (
+        "tsx",
+        """
+        (function_declaration name: (identifier) @name) @func
+        (class_declaration name: (type_identifier) @name) @cls
+        """,
+    ),
+}
+
+
+# ---------------------------------------------------------------------------
+# Graph extraction helpers
+# ---------------------------------------------------------------------------
+
+
+def _extract_python_graph(
+    content: str, file_path: str
+) -> Tuple[List[GraphNodeObj], List[GraphEdgeObj]]:
+    """Extract functions and classes from Python source using the stdlib ast."""
+    import ast as _ast
+
+    try:
+        tree = _ast.parse(content)
+    except SyntaxError:
+        return [], []
+
+    nodes: List[GraphNodeObj] = []
+    for node in _ast.walk(tree):
+        if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+            nodes.append(
+                GraphNodeObj(
+                    node_id=f"{file_path}:function:{node.name}",
+                    node_type="function",
+                    name=node.name,
+                    file_path=file_path,
+                    start_line=node.lineno,
+                    end_line=node.end_lineno or node.lineno,
+                    metadata={"language": "python"},
+                )
+            )
+        elif isinstance(node, _ast.ClassDef):
+            nodes.append(
+                GraphNodeObj(
+                    node_id=f"{file_path}:class:{node.name}",
+                    node_type="class",
+                    name=node.name,
+                    file_path=file_path,
+                    start_line=node.lineno,
+                    end_line=node.end_lineno or node.lineno,
+                    metadata={"language": "python"},
+                )
+            )
+    return nodes, []
+
+
+def _get_node_name(node: Any, content: str) -> "Optional[str]":
+    """Navigate tree-sitter grammar quirks to extract the definition name.
+
+    Most grammars expose a direct ``name`` field on the definition node.
+    Two exceptions need special handling:
+
+    * C / C++ ``function_definition`` – the identifier is nested inside a
+      (possibly pointer-wrapped) ``function_declarator``.
+    * Go ``type_declaration`` – the ``name`` field lives on the inner
+      ``type_spec`` child, not on the declaration node itself.
+    """
+    # Fast path – works for Rust, Go func/method, Java, C#, JS, TS, C struct,
+    # C++ class, …
+    name_node = node.child_by_field_name("name")
+    if name_node:
+        return content[name_node.start_byte : name_node.end_byte]
+
+    # C / C++ function_definition: unwrap the declarator chain.
+    # function_definition → (pointer_declarator →)* function_declarator → identifier
+    if node.type == "function_definition":
+        decl = node.child_by_field_name("declarator")
+        while decl:
+            if decl.type in (
+                "function_declarator",
+                "pointer_declarator",
+                "reference_declarator",
+            ):
+                decl = decl.child_by_field_name("declarator")
+            else:
+                # Terminal: identifier, field_identifier, or scope_resolution
+                return content[decl.start_byte : decl.end_byte]
+
+    # Go type_declaration: the name is on the inner type_spec node.
+    if node.type == "type_declaration":
+        for child in node.children:
+            if child.type == "type_spec":
+                spec_name = child.child_by_field_name("name")
+                if spec_name:
+                    return content[spec_name.start_byte : spec_name.end_byte]
+
+    return None
+
+
+def _extract_polyglot_graph(
+    content: str, file_path: str, ext: str
+) -> Tuple[List[GraphNodeObj], List[GraphEdgeObj]]:
+    """Extract functions and classes from any language in LANGUAGE_CONFIG.
+
+    Uses tree-sitter-languages for parsing.  Returns empty lists when the
+    dependency is missing or the language is unavailable — never raises.
+    """
+    config = LANGUAGE_CONFIG.get(ext)
+    if not config:
+        return [], []
+
+    lang_name, query_scm = config
+
+    try:
+        from tree_sitter_languages import get_language, get_parser
+
+        language = get_language(lang_name)
+        parser = get_parser(lang_name)
+    except ImportError:
+        logging.warning("tree-sitter-languages not installed; graph extraction skipped.")
+        return [], []
+    except Exception:
+        logging.warning(
+            "Language %s not available in tree-sitter-languages.", lang_name, exc_info=True
+        )
+        return [], []
+
+    tree = parser.parse(content.encode("utf-8"))
+    try:
+        query = language.query(query_scm)
+    except Exception:
+        logging.warning("Invalid tree-sitter query for %s.", lang_name, exc_info=True)
+        return [], []
+
+    raw_captures = query.captures(tree.root_node)
+    # Normalise across tree-sitter versions:
+    #   < 0.21  →  [(Node, str), …]
+    #   >= 0.21 →  {str: [Node, …]}
+    if isinstance(raw_captures, dict):
+        captures: List[Tuple[Any, str]] = [
+            (n, name) for name, nodes in raw_captures.items() for n in nodes
+        ]
+    else:
+        captures = list(raw_captures)
+
+    nodes: List[GraphNodeObj] = []
+    for node, tag in captures:
+        # @name captures are only used as markers in the SCM query; the actual
+        # name is extracted via _get_node_name on the parent definition node.
+        if tag == "name":
+            continue
+
+        node_type = "function"
+        if tag in ("cls", "interface", "struct"):
+            node_type = "class"
+
+        name = _get_node_name(node, content)
+        if not name:
+            continue  # anonymous / un-navigable (e.g. Rust impl blocks)
+
+        nodes.append(
+            GraphNodeObj(
+                node_id=f"{file_path}:{node_type}:{name}",
+                node_type=node_type,
+                name=name,
+                file_path=file_path,
+                start_line=node.start_point[0] + 1,
+                end_line=node.end_point[0] + 1,
+                metadata={"language": lang_name},
+            )
+        )
+    return nodes, []
 
 
 def _is_ignored(path: str, ignore_patterns: List[str]) -> bool:
@@ -200,8 +483,8 @@ def hash_and_parse_file(
     chunk_size_tokens: int,
     overlap_tokens: int,
     max_file_size_mb: int,
-) -> "tuple[List[Chunk], str]":
-    """Stream a file to return both its chunks and SHA-256 hash.
+) -> "tuple[List[Chunk], str, List[GraphNodeObj], List[GraphEdgeObj]]":
+    """Stream a file to return its chunks, SHA-256 hash, and graph nodes/edges.
 
     Text files are parsed line-by-line while hashing the raw bytes to avoid
     large in-memory buffers. Binary formats (PDF/DOCX) fall back to a second
@@ -233,6 +516,10 @@ def hash_and_parse_file(
         hasher = hashlib.sha256()
         decoder = codecs.getincrementaldecoder("utf-8")(errors="ignore")
         buffer = ""
+        # Accumulate decoded text only for extensions that need graph extraction
+        # so that large plain-text files (README, SQL, …) stay streaming.
+        _needs_graph = (ext == ".py") or (ext in LANGUAGE_CONFIG)
+        _content_parts: List[str] = []
 
         def _iter_lines() -> Iterator[str]:
             nonlocal buffer
@@ -245,6 +532,8 @@ def hash_and_parse_file(
                     text_chunk = decoder.decode(chunk)
                     if not text_chunk:
                         continue
+                    if _needs_graph:
+                        _content_parts.append(text_chunk)
                     buffer += text_chunk
                     lines = buffer.splitlines(keepends=True)
                     if lines:
@@ -254,7 +543,11 @@ def hash_and_parse_file(
                             buffer = ""
                         for line in lines:
                             yield line
-                tail = buffer + decoder.decode(b"", final=True)
+                # Flush any incomplete multi-byte sequence at EOF.
+                final_flush = decoder.decode(b"", final=True)
+                if _needs_graph and final_flush:
+                    _content_parts.append(final_flush)
+                tail = buffer + final_flush
                 if tail:
                     for line in tail.splitlines(keepends=True):
                         yield line
@@ -267,7 +560,17 @@ def hash_and_parse_file(
             target_tokens=chunk_size_tokens,
             overlap_tokens=overlap_tokens,
         )
-        return chunks, hasher.hexdigest()
+
+        # --- graph extraction (single-pass: content already buffered) ---
+        nodes: List[GraphNodeObj] = []
+        edges: List[GraphEdgeObj] = []
+        if _needs_graph:
+            content_str = "".join(_content_parts)
+            if ext == ".py":
+                nodes, edges = _extract_python_graph(content_str, rel)
+            elif ext in LANGUAGE_CONFIG:
+                nodes, edges = _extract_polyglot_graph(content_str, rel, ext)
+        return chunks, hasher.hexdigest(), nodes, edges
 
     if ext == ".pdf":
         import io
@@ -307,7 +610,7 @@ def hash_and_parse_file(
                         overlap_tokens=overlap_tokens,
                     )
                 )
-        return chunks, content_hash
+        return chunks, content_hash, [], []
 
     if ext == ".docx":
         import io
@@ -338,10 +641,10 @@ def hash_and_parse_file(
             target_tokens=chunk_size_tokens,
             overlap_tokens=overlap_tokens,
         )
-        return chunks, content_hash
+        return chunks, content_hash, [], []
 
     content_hash = hash_file(path_context, path, Path(root), max_bytes)
-    return [], content_hash
+    return [], content_hash, [], []
 
 
 @dataclass(frozen=True)
@@ -351,4 +654,6 @@ class ParsedFile:
     size_bytes: int
     content_hash: str
     chunks: List[Chunk]
+    nodes: List[GraphNodeObj] = field(default_factory=list)
+    edges: List[GraphEdgeObj] = field(default_factory=list)
 

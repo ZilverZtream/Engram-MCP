@@ -352,6 +352,7 @@ async def init_db(db_path: str) -> None:
         await _ensure_fts_tokenizer(db)
         await _ensure_fts_triggers(db)
         await _ensure_search_sessions_schema(db)
+        await _ensure_graph_schema(db)
         await db.commit()
 
 async def _ensure_chunks_vector_column(db: aiosqlite.Connection) -> None:
@@ -581,6 +582,56 @@ async def _ensure_search_sessions_schema(db: aiosqlite.Connection) -> None:
     column_names = {str(row[1]) for row in columns}
     if "result_chunk_ids" not in column_names:
         await db.execute("ALTER TABLE search_sessions ADD COLUMN result_chunk_ids TEXT")
+
+
+async def _ensure_graph_schema(db: aiosqlite.Connection) -> None:
+    """Migration graph_v1: create graph_nodes and graph_edges tables.
+
+    node_id is TEXT (not an integer) so that it can carry fully-qualified
+    C++ signatures such as ``MyClass::method`` without loss.
+    """
+    row = await db.execute_fetchone(
+        "SELECT 1 FROM schema_migrations WHERE name = 'graph_v1'"
+    )
+    if row:
+        return
+
+    await db.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS graph_nodes (
+            node_id   TEXT    NOT NULL,
+            project_id TEXT   NOT NULL,
+            node_type TEXT    NOT NULL,
+            name      TEXT    NOT NULL,
+            file_path TEXT    NOT NULL,
+            start_line INTEGER NOT NULL,
+            end_line   INTEGER NOT NULL,
+            metadata  TEXT,
+            PRIMARY KEY (project_id, node_id),
+            FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_graph_nodes_project_file
+            ON graph_nodes(project_id, file_path);
+        CREATE INDEX IF NOT EXISTS idx_graph_nodes_project_name
+            ON graph_nodes(project_id, name);
+
+        CREATE TABLE IF NOT EXISTS graph_edges (
+            source_id  TEXT NOT NULL,
+            target_id  TEXT NOT NULL,
+            project_id TEXT NOT NULL,
+            edge_type  TEXT NOT NULL,
+            PRIMARY KEY (project_id, source_id, target_id),
+            FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_graph_edges_project_source
+            ON graph_edges(project_id, source_id);
+        CREATE INDEX IF NOT EXISTS idx_graph_edges_project_target
+            ON graph_edges(project_id, target_id);
+        """
+    )
+    await db.execute(
+        "INSERT INTO schema_migrations(name) VALUES(?)", ("graph_v1",)
+    )
 
 
 async def upsert_project(
@@ -970,6 +1021,68 @@ async def upsert_chunk_vectors(
         await db.executemany(
             "UPDATE chunks SET vector = ? WHERE project_id = ? AND internal_id = ?",
             rows,
+        )
+        await db.commit()
+
+
+async def upsert_graph_nodes(
+    db_path: str,
+    *,
+    project_id: str,
+    nodes: List[Tuple[str, str, str, str, int, int, Dict[str, Any]]],
+) -> None:
+    """Upsert graph nodes.
+
+    Each tuple in *nodes*:
+        (node_id, node_type, name, file_path, start_line, end_line, metadata)
+    """
+    if not nodes:
+        return
+    async with get_connection(db_path) as db:
+        await db.executemany(
+            """
+            INSERT INTO graph_nodes(
+                project_id, node_id, node_type, name, file_path,
+                start_line, end_line, metadata
+            )
+            VALUES(?,?,?,?,?,?,?,?)
+            ON CONFLICT(project_id, node_id) DO UPDATE SET
+              node_type  = excluded.node_type,
+              name       = excluded.name,
+              file_path  = excluded.file_path,
+              start_line = excluded.start_line,
+              end_line   = excluded.end_line,
+              metadata   = excluded.metadata
+            """,
+            [
+                (project_id, nid, ntype, name, fp, sl, el, json.dumps(meta))
+                for (nid, ntype, name, fp, sl, el, meta) in nodes
+            ],
+        )
+        await db.commit()
+
+
+async def upsert_graph_edges(
+    db_path: str,
+    *,
+    project_id: str,
+    edges: List[Tuple[str, str, str]],
+) -> None:
+    """Upsert graph edges.
+
+    Each tuple in *edges*: (source_id, target_id, edge_type)
+    """
+    if not edges:
+        return
+    async with get_connection(db_path) as db:
+        await db.executemany(
+            """
+            INSERT INTO graph_edges(project_id, source_id, target_id, edge_type)
+            VALUES(?,?,?,?)
+            ON CONFLICT(project_id, source_id, target_id) DO UPDATE SET
+              edge_type = excluded.edge_type
+            """,
+            [(project_id, src, tgt, etype) for (src, tgt, etype) in edges],
         )
         await db.commit()
 
