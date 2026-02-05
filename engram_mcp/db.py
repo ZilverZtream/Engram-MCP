@@ -1454,7 +1454,7 @@ async def fetch_file_chunk_ids(
                 """
                 SELECT file_path, chunk_id
                 FROM file_chunks
-                WHERE project_id = ? AND file_path IN 
+                WHERE project_id = ? AND file_path IN
                 """,
                 batch,
             )
@@ -1462,6 +1462,71 @@ async def fetch_file_chunk_ids(
             for file_path, chunk_id in rows:
                 out[str(file_path)].append(str(chunk_id))
     return out
+
+
+async def fetch_virtual_memory_files(
+    db_path: str,
+    project_id: str,
+    prefix: str = "vfs://memory/",
+) -> Dict[str, str]:
+    """
+    Fetch virtual memory bank files for a project.
+
+    Returns a dictionary mapping section names to their content.
+    For example: {"activeContext": "...", "productContext": "..."}
+    """
+    async with get_connection(db_path) as db:
+        # Get all file paths that match the memory bank prefix
+        rows = await db.execute_fetchall(
+            """
+            SELECT file_path
+            FROM file_metadata
+            WHERE project_id = ? AND file_path LIKE ?
+            """,
+            (project_id, f"{prefix}%"),
+        )
+
+        if not rows:
+            return {}
+
+        file_paths = [str(row[0]) for row in rows]
+
+        # Fetch chunk IDs for these files
+        chunk_map = await fetch_file_chunk_ids(db_path, project_id, file_paths)
+
+        # Fetch the actual chunk content
+        all_chunk_ids = [cid for cids in chunk_map.values() for cid in cids]
+        if not all_chunk_ids:
+            return {}
+
+        # Fetch chunks in batches
+        chunks_by_id: Dict[str, str] = {}
+        batch_size = 900
+        for i in range(0, len(all_chunk_ids), batch_size):
+            batch = all_chunk_ids[i:i + batch_size]
+            query = build_in_query(
+                """
+                SELECT chunk_id, content
+                FROM chunks
+                WHERE project_id = ? AND chunk_id IN
+                """,
+                batch,
+            )
+            chunk_rows = await db.execute_fetchall(query.text, (project_id, *query.params))
+            for chunk_id, content in chunk_rows:
+                chunks_by_id[str(chunk_id)] = str(content)
+
+        # Assemble content by section
+        result: Dict[str, str] = {}
+        for file_path, chunk_ids in chunk_map.items():
+            # Extract section name from path: vfs://memory/{section}.md -> section
+            section_name = file_path.replace(prefix, "").replace(".md", "")
+            # Concatenate all chunks for this file
+            content = "".join(chunks_by_id.get(cid, "") for cid in chunk_ids)
+            if content:
+                result[section_name] = content
+
+        return result
 
 
 async def upsert_file_metadata(

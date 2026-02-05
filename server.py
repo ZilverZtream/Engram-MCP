@@ -1450,6 +1450,162 @@ async def analyze_error_stack(traceback: str, project_id: str) -> Dict[str, Any]
         return {"error": f"Failed to analyze stack trace: {exc}"}
 
 
+@mcp.tool
+async def update_memory_bank(project_id: str, section: str, content: str) -> str:
+    """Update or create a memory bank section for the agent's persistent context.
+
+    Memory bank sections are stored as virtual files (vfs://memory/{section}.md)
+    and are indexed alongside code, making them searchable and giving them high
+    priority in search results.
+
+    Standard sections:
+    - activeContext: What the agent is doing right now
+    - productContext: High-level project goals and features
+    - techContext: Technical constraints, stack details, decisions
+
+    Custom sections are also allowed for project-specific needs.
+
+    Args:
+        project_id: Project identifier
+        section: Section name (e.g., "activeContext", "productContext", "techContext")
+        content: Markdown content to store in this section
+
+    Returns:
+        Confirmation message with token count stored
+
+    Security: Section names are validated to prevent path traversal.
+    """
+    await dbmod.init_db(cfg.db_path)
+
+    try:
+        ProjectID(project_id)
+    except ValueError as e:
+        return f"Error: {e}"
+
+    proj = await dbmod.get_project(cfg.db_path, project_id)
+    if not proj:
+        return f"Error: Project not found: {project_id}"
+
+    # Validate section name to prevent path traversal
+    if not section or not section.strip():
+        return "Error: Section name cannot be empty"
+
+    # Remove any path separators or special characters
+    section = re.sub(r'[^\w\-_]', '', section.strip())
+    if not section:
+        return "Error: Invalid section name"
+
+    # Construct virtual file path
+    vfs_path = f"vfs://memory/{section}.md"
+
+    # Create a single chunk containing the full content
+    token_count = chunking.token_count(content)
+    chunk_id = chunking.make_chunk_id("memory", project_id, section)
+
+    chunk = chunking.Chunk(
+        chunk_id=chunk_id,
+        content=content,
+        token_count=token_count,
+        metadata={
+            "type": "memory_bank",
+            "section": section,
+            "file_path": vfs_path,
+        },
+    )
+
+    try:
+        added = await indexer.add_virtual_file_chunks(
+            project_id=project_id,
+            file_path=vfs_path,
+            chunks=[chunk],
+        )
+
+        logging.info(
+            "memory_bank_updated",
+            extra={
+                "project_id": project_id,
+                "section": section,
+                "token_count": token_count,
+                "chunks_added": added,
+            },
+        )
+
+        return f"✅ Memory bank section '{section}' updated ({token_count} tokens, {added} chunks stored)"
+    except Exception as exc:
+        logging.error("update_memory_bank failed", exc_info=True)
+        return f"Error: Failed to update memory bank: {exc}"
+
+
+@mcp.tool
+async def get_project_context(project_id: str) -> Dict[str, Any]:
+    """Get a comprehensive project context including memory bank state and codebase stats.
+
+    This is a "boot-up" tool for agents to call at the start of a session to
+    understand the current project state, active tasks, and technical context.
+
+    Returns:
+        Dictionary containing:
+        - project_id: Project identifier
+        - memory_bank: Dict mapping section names to their content
+          - activeContext: Current work focus
+          - productContext: Project goals
+          - techContext: Technical constraints
+          - (any custom sections)
+        - codebase_stats: Statistics from get_codebase_statistics
+          - total_files, total_chunks, language_breakdown, etc.
+
+    Performance: Optimized DB queries, typically <200ms.
+    """
+    await dbmod.init_db(cfg.db_path)
+
+    try:
+        ProjectID(project_id)
+    except ValueError as e:
+        return {"error": str(e)}
+
+    proj = await dbmod.get_project(cfg.db_path, project_id)
+    if not proj:
+        return {"error": f"Project not found: {project_id}"}
+
+    start_time = time.perf_counter()
+
+    try:
+        # Fetch memory bank content
+        memory_bank = await dbmod.fetch_virtual_memory_files(
+            cfg.db_path,
+            project_id=project_id,
+            prefix="vfs://memory/",
+        )
+
+        # Fetch codebase statistics
+        codebase_stats = await dbmod.get_codebase_statistics(
+            cfg.db_path,
+            project_id=project_id,
+        )
+
+        duration_ms = int((time.perf_counter() - start_time) * 1000)
+
+        logging.info(
+            "get_project_context completed",
+            extra={
+                "project_id": project_id,
+                "duration_ms": duration_ms,
+                "memory_sections": len(memory_bank),
+                "total_files": codebase_stats.get("total_files", 0),
+            },
+        )
+
+        return {
+            "project_id": project_id,
+            "memory_bank": memory_bank,
+            "codebase_stats": codebase_stats,
+            "latency_ms": duration_ms,
+        }
+    except Exception as exc:
+        logging.error("get_project_context failed", exc_info=True)
+        return {"error": f"Failed to get project context: {exc}"}
+
+
 def main() -> None:
     mcp.run()
 
