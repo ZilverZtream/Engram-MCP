@@ -157,6 +157,8 @@ CREATE INDEX IF NOT EXISTS idx_search_sessions_project_created_at
 ON search_sessions(project_id, created_at DESC);
 """
 
+MAX_RESERVE_COUNT = 1_000_000
+
 
 @dataclass(frozen=True)
 class ChunkRow:
@@ -886,6 +888,8 @@ async def reserve_internal_ids(db_path: str, project_id: str, count: int) -> Lis
     zombie transaction causes spurious SQLITE_BUSY errors on unrelated
     requests later.
     """
+    if count > MAX_RESERVE_COUNT:
+        raise ValueError(f"count cannot exceed {MAX_RESERVE_COUNT}")
     if count <= 0:
         return []
 
