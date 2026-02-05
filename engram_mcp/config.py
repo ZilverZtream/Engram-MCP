@@ -180,6 +180,17 @@ class AllowedConfig(BaseModel):
             raise ValueError(f"vector_backend must be one of {sorted(allowed)}")
         return normalized
 
+    @field_validator("embedding_batch_size")
+    @classmethod
+    def validate_embedding_batch_size(cls, value: int) -> int:
+        min_value = 1
+        max_value = 1000
+        if not min_value <= int(value) <= max_value:
+            raise ValueError(
+                f"embedding_batch_size must be between {min_value} and {max_value}"
+            )
+        return value
+
 
 def load_config(path: Optional[str] = None) -> EngramConfig:
     """Load config from YAML.
