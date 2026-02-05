@@ -606,35 +606,109 @@ class SearchEngine:
         *,
         project_id: str,
         query: str,
+        query_vec: Optional[np.ndarray] = None,
         file_filter: Optional[str] = None,
         limit: int = 10,
+        enable_hybrid: bool = True,
     ) -> Dict[str, Any]:
         """Search git history for commits related to the query.
 
-        This implements the "Déjà Vu" search algorithm that looks for historical
-        fixes and changes related to the current problem.
+        This implements the "Déjà Vu" search algorithm with hybrid semantic search.
+        Combines FTS (lexical) and vector (semantic) search using RRF fusion.
 
         Args:
             project_id: The project to search
             query: Search query (error message, bug description, etc.)
+            query_vec: Optional pre-computed query embedding
             file_filter: Optional file path filter
             limit: Maximum number of results
+            enable_hybrid: Enable hybrid search (vector + FTS), default True
 
         Returns:
             Dictionary with related commits and their diffs
         """
-        # Search commit messages using text matching
-        commits = await dbmod.search_git_commits_by_message(
+        commit_hash_to_info = {}
+
+        # FTS search on commit messages
+        fts_commits = await dbmod.search_git_commits_by_message(
             self.db_path,
             project_id=project_id,
             query=query,
-            limit=limit,
+            limit=limit * 2,  # Get more for fusion
         )
+        fts_hashes = [c["commit_hash"] for c in fts_commits]
+        for rank, commit in enumerate(fts_commits, 1):
+            commit_hash_to_info[commit["commit_hash"]] = {
+                "commit": commit,
+                "fts_rank": rank,
+                "vec_rank": None,
+            }
+
+        # Vector search on git commit chunks (if enabled and vector available)
+        vec_hashes = []
+        if enable_hybrid and self.faiss_available and query_vec is not None:
+            try:
+                # Search for git_commit chunks
+                vec_results = await self.vector_search(
+                    project_id=project_id,
+                    query_vec=query_vec,
+                    top_k=limit * 2,
+                )
+
+                # Filter for git_commit chunks and extract commit hashes
+                for rank, result in enumerate(vec_results, 1):
+                    metadata = result.get("metadata")
+                    if metadata:
+                        try:
+                            import json
+                            meta_dict = json.loads(metadata) if isinstance(metadata, str) else metadata
+                            if meta_dict.get("type") == "git_commit":
+                                commit_hash = meta_dict.get("commit_hash")
+                                if commit_hash:
+                                    vec_hashes.append(commit_hash)
+                                    if commit_hash not in commit_hash_to_info:
+                                        # Fetch commit info if not already from FTS
+                                        commit_info = await dbmod.fetch_commits_by_uuids(
+                                            self.db_path,
+                                            project_id=project_id,
+                                            uuids=[result["id"]],
+                                        )
+                                        if commit_info:
+                                            commit_hash_to_info[commit_hash] = {
+                                                "commit": commit_info[0],
+                                                "fts_rank": None,
+                                                "vec_rank": rank,
+                                            }
+                                    else:
+                                        commit_hash_to_info[commit_hash]["vec_rank"] = rank
+                        except (json.JSONDecodeError, KeyError):
+                            continue
+            except Exception as e:
+                logging.warning("Vector search for git history failed: %s", e)
+
+        # RRF fusion: combine FTS and vector ranks
+        k = 60  # RRF constant
+        for hash_val, info in commit_hash_to_info.items():
+            fts_rank = info["fts_rank"]
+            vec_rank = info["vec_rank"]
+            score = 0.0
+            if fts_rank is not None:
+                score += 1.0 / (k + fts_rank)
+            if vec_rank is not None:
+                score += 1.0 / (k + vec_rank)
+            info["rrf_score"] = score
+
+        # Sort by RRF score and take top limit
+        sorted_commits = sorted(
+            commit_hash_to_info.items(),
+            key=lambda x: x[1]["rrf_score"],
+            reverse=True,
+        )[:limit]
 
         # Enrich commits with diffs and tags
         related_commits = []
-        for commit in commits:
-            commit_hash = commit["commit_hash"]
+        for commit_hash, info in sorted_commits:
+            commit = info["commit"]
 
             # Fetch diffs for this commit
             diffs = await dbmod.fetch_git_diffs_for_commit(
@@ -659,6 +733,7 @@ class SearchEngine:
                     "author": commit["author"],
                     "timestamp": commit["timestamp"],
                     "message": commit["message"],
+                    "relevance_score": round(info["rrf_score"], 4),
                     "tags": tags,
                     "diffs": [
                         {
@@ -677,4 +752,5 @@ class SearchEngine:
             "query": query,
             "related_commits": related_commits,
             "total_commits": len(related_commits),
+            "search_mode": "hybrid" if (enable_hybrid and query_vec is not None) else "fts_only",
         }

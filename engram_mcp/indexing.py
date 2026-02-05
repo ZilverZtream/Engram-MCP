@@ -2424,3 +2424,70 @@ async def ensure_index_permissions(path_context: PathContext, index_dir: str, *,
                 logging.debug("Failed to chmod index artifact %s", candidate, exc_info=True)
     except Exception:
         logging.debug("Failed to chmod stray index artifacts in %s", index_dir, exc_info=True)
+
+
+async def inject_temporal_coupling_edges(
+    db_path: str,
+    *,
+    project_id: str,
+    couplings: List[Tuple[str, str, int, Dict[str, Any]]],
+) -> int:
+    """Inject temporal coupling edges into the knowledge graph.
+
+    Creates graph edges between file nodes that frequently change together.
+    These edges are discovered by analyzing git history and finding files
+    that statistically co-occur in commits.
+
+    Args:
+        db_path: Path to the database
+        project_id: The project ID
+        couplings: List of (file_a, file_b, frequency, metadata) tuples
+
+    Returns:
+        Number of edges created
+    """
+    if not couplings:
+        return 0
+
+    # Create graph edges for coupled files
+    edges = []
+    for file_a, file_b, frequency, metadata in couplings:
+        # Create node IDs for file nodes
+        # File nodes use the pattern: project_id:file_path:FILE:file_path
+        node_id_a = f"{project_id}:{file_a}:FILE:{file_a}"
+        node_id_b = f"{project_id}:{file_b}:FILE:{file_b}"
+
+        # Create bidirectional coupling edges
+        # Edge type: "coupled_with" with metadata containing frequency
+        edge_metadata = {
+            "frequency": frequency,
+            "source": metadata.get("source", "temporal_history"),
+            "recent_commits": metadata.get("recent_commits", []),
+            "common_tags": metadata.get("common_tags", []),
+        }
+
+        # Create edges in both directions for easier querying
+        edges.append((
+            node_id_a,
+            node_id_b,
+            "coupled_with",
+        ))
+        edges.append((
+            node_id_b,
+            node_id_a,
+            "coupled_with",
+        ))
+
+    await dbmod.upsert_graph_edges(
+        db_path,
+        project_id=project_id,
+        edges=edges,
+    )
+
+    logging.info(
+        "Injected %d temporal coupling edges for project %s",
+        len(edges),
+        project_id,
+    )
+
+    return len(edges)

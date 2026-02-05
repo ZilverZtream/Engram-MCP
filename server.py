@@ -1773,9 +1773,17 @@ async def search_history(
     start = time.time()
 
     try:
+        # Generate query embedding for hybrid semantic search
+        query_vec = None
+        try:
+            query_vec = await embedding_service.embed(query.strip())
+        except Exception as e:
+            logging.warning("Failed to generate query embedding for history search: %s", e)
+
         result = await search_engine.search_history(
             project_id=project_id,
             query=query.strip(),
+            query_vec=query_vec,
             file_filter=file_filter,
             limit=int(limit),
         )
@@ -1794,6 +1802,232 @@ async def search_history(
     except Exception as exc:
         logging.error("search_history failed", exc_info=True)
         return {"error": f"Failed to search history: {exc}"}
+
+
+@mcp.tool
+async def analyze_temporal_couplings(
+    project_id: str,
+    min_frequency: int = 5,
+    limit: int = 50,
+    inject_edges: bool = True,
+) -> Dict[str, Any]:
+    """Analyze temporal coupling: find files that frequently change together.
+
+    This implements "Dreaming V2" - discovering hidden relationships by analyzing
+    git history. Files that change together often have logical dependencies even
+    if there's no explicit import/call between them.
+
+    AGENT NOTE: Use this when:
+    - You're refactoring a file and want to know what else might need updating
+    - You see mysterious bugs after changing one file
+    - You want to understand the "social structure" of the codebase
+
+    Args:
+        project_id: The project to analyze
+        min_frequency: Minimum co-changes to report (default: 5)
+        limit: Maximum couplings to return (default: 50)
+        inject_edges: If True, inject coupling edges into knowledge graph (default: True)
+
+    Returns:
+        Dictionary with:
+        - couplings: List of {file_a, file_b, frequency, metadata}
+        - total_couplings: Number found
+        - edges_injected: Number of graph edges created (if inject_edges=True)
+    """
+    await dbmod.init_db(cfg.db_path)
+
+    try:
+        ProjectID(project_id)
+    except ValueError as e:
+        return {"error": str(e)}
+
+    proj = await dbmod.get_project(cfg.db_path, project_id)
+    if not proj:
+        return {"error": f"Project not found: {project_id}"}
+
+    # Check if git history is indexed
+    commit_count = await dbmod.count_git_commits(cfg.db_path, project_id=project_id)
+    if commit_count == 0:
+        return {
+            "error": (
+                "No git history indexed. Run index_git_history first to enable "
+                "temporal coupling analysis."
+            ),
+            "hint": f"Call: index_git_history(project_id='{project_id}')",
+        }
+
+    start = time.time()
+
+    try:
+        # Import dreaming module
+        from engram_mcp import dreaming
+
+        # Find temporal couplings
+        couplings = await dreaming.find_temporal_couplings(
+            project_id,
+            min_frequency=int(min_frequency),
+            limit=int(limit),
+        )
+
+        # Optionally inject edges into knowledge graph
+        edges_injected = 0
+        if inject_edges and couplings:
+            from engram_mcp import indexing
+
+            edges_injected = await indexing.inject_temporal_coupling_edges(
+                cfg.db_path,
+                project_id=project_id,
+                couplings=couplings,
+            )
+
+        # Format results
+        coupling_results = []
+        for file_a, file_b, frequency, metadata in couplings:
+            coupling_results.append({
+                "file_a": file_a,
+                "file_b": file_b,
+                "frequency": frequency,
+                "recent_commits": metadata.get("recent_commits", [])[:3],
+                "common_tags": metadata.get("common_tags", []),
+            })
+
+        duration_ms = int((time.time() - start) * 1000)
+
+        logging.info(
+            "analyze_temporal_couplings completed",
+            extra={
+                "project_id": project_id,
+                "operation": "analyze_temporal_couplings",
+                "duration_ms": duration_ms,
+                "couplings_found": len(couplings),
+                "edges_injected": edges_injected,
+            },
+        )
+
+        return {
+            "couplings": coupling_results,
+            "total_couplings": len(couplings),
+            "edges_injected": edges_injected,
+            "min_frequency": min_frequency,
+            "duration_ms": duration_ms,
+        }
+
+    except Exception as exc:
+        logging.error("analyze_temporal_couplings failed", exc_info=True)
+        return {"error": f"Failed to analyze temporal couplings: {exc}"}
+
+
+@mcp.tool
+async def analyze_reverts(project_id: str) -> Dict[str, Any]:
+    """Analyze revert commits and auto-generate repo_rules (The Immune System).
+
+    This implements the "Immune System" - automatically learning from mistakes by
+    detecting reverted commits and treating their patterns as anti-patterns to avoid.
+
+    AGENT NOTE: Use this to:
+    - Learn from past mistakes in the codebase
+    - Automatically generate guardrails against repeated regressions
+    - Understand what patterns have historically caused problems
+
+    When you see a revert commit, this tool:
+    1. Finds the original (bad) commit that was reverted
+    2. Extracts the affected files and changes
+    3. Auto-generates a high-priority repo_rule warning against similar changes
+
+    Args:
+        project_id: The project to analyze
+
+    Returns:
+        Dictionary with:
+        - reverts_found: Number of revert commits detected
+        - rules_generated: Number of anti-pattern rules created
+        - sample_rules: Preview of generated rules
+    """
+    await dbmod.init_db(cfg.db_path)
+
+    try:
+        ProjectID(project_id)
+    except ValueError as e:
+        return {"error": str(e)}
+
+    proj = await dbmod.get_project(cfg.db_path, project_id)
+    if not proj:
+        return {"error": f"Project not found: {project_id}"}
+
+    # Check if git history is indexed
+    commit_count = await dbmod.count_git_commits(cfg.db_path, project_id=project_id)
+    if commit_count == 0:
+        return {
+            "error": (
+                "No git history indexed. Run index_git_history first to enable "
+                "revert analysis."
+            ),
+            "hint": f"Call: index_git_history(project_id='{project_id}')",
+        }
+
+    start = time.time()
+
+    try:
+        # Get project directory
+        repo_path = proj.get("directory")
+        if not repo_path:
+            return {"error": "Project directory not found"}
+
+        # Initialize GitIndexer
+        from engram_mcp.history import GitIndexer
+        from engram_mcp.security import PathContext
+
+        path_context = PathContext(allowed_roots=cfg.allowed_roots)
+
+        indexer = GitIndexer(
+            db_path=cfg.db_path,
+            embedding_service=embedding_service,
+            project_path_context=path_context,
+        )
+
+        # Process reverts
+        result = await indexer.process_reverts(project_id=project_id)
+
+        # Fetch a sample of generated rules
+        sample_rules = []
+        if result["rules_generated"] > 0:
+            rules = await dbmod.fetch_repo_rules(
+                cfg.db_path,
+                project_id=project_id,
+            )
+            # Filter for immune system rules
+            immune_rules = [r for r in rules if r["rule_id"].startswith("immune_system_")]
+            sample_rules = immune_rules[:3]  # Show up to 3 samples
+
+        duration_ms = int((time.time() - start) * 1000)
+
+        logging.info(
+            "analyze_reverts completed",
+            extra={
+                "project_id": project_id,
+                "operation": "analyze_reverts",
+                "duration_ms": duration_ms,
+                "reverts_found": result["reverts_found"],
+                "rules_generated": result["rules_generated"],
+            },
+        )
+
+        return {
+            **result,
+            "sample_rules": [
+                {
+                    "rule_id": r["rule_id"],
+                    "file_pattern": r["file_pattern"],
+                    "rule_preview": r["rule_text"][:200] + "..." if len(r["rule_text"]) > 200 else r["rule_text"],
+                }
+                for r in sample_rules
+            ],
+            "duration_ms": duration_ms,
+        }
+
+    except Exception as exc:
+        logging.error("analyze_reverts failed", exc_info=True)
+        return {"error": f"Failed to analyze reverts: {exc}"}
 
 
 def main() -> None:

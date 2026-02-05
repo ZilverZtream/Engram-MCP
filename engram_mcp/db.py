@@ -1082,6 +1082,65 @@ async def upsert_chunk_vectors(
         await db.commit()
 
 
+async def upsert_chunks_with_embeddings(
+    db_path: str,
+    *,
+    project_id: str,
+    chunks: List[Tuple[str, str, str, int, str, np.ndarray]],
+) -> None:
+    """Upsert chunks with embeddings in a single transaction.
+
+    This is used for git commit chunks where we have embeddings but no internal_id yet.
+    Each tuple: (chunk_id, project_id, content, token_count, metadata_json, embedding)
+
+    Args:
+        db_path: Path to the database
+        project_id: The project ID
+        chunks: List of (chunk_id, project_id, content, token_count, metadata_json, embedding)
+    """
+    if not chunks:
+        return
+
+    async with get_connection(db_path) as db:
+        # First, get the next available internal_id for this project
+        row = await db.execute_fetchone(
+            "SELECT COALESCE(MAX(internal_id), -1) FROM chunks WHERE project_id = ?",
+            (project_id,),
+        )
+        next_internal_id = int(row[0]) + 1 if row else 0
+
+        # Prepare chunk rows with sequential internal_ids
+        chunk_rows = []
+        for idx, (chunk_id, proj_id, content, token_count, metadata_json, embedding) in enumerate(chunks):
+            internal_id = next_internal_id + idx
+            vector_bytes = embedding.astype(np.float32).tobytes()
+            chunk_rows.append((
+                chunk_id,
+                proj_id,
+                internal_id,
+                content,
+                token_count,
+                metadata_json,
+                vector_bytes,
+            ))
+
+        # Insert/update chunks with vectors
+        await db.executemany(
+            """
+            INSERT INTO chunks(chunk_id, project_id, internal_id, content, token_count, metadata, vector, updated_at)
+            VALUES(?,?,?,?,?,?,?, datetime('now'))
+            ON CONFLICT(chunk_id) DO UPDATE SET
+              content = excluded.content,
+              token_count = excluded.token_count,
+              metadata = excluded.metadata,
+              vector = excluded.vector,
+              updated_at = datetime('now')
+            """,
+            chunk_rows,
+        )
+        await db.commit()
+
+
 async def upsert_graph_nodes(
     db_path: str,
     *,
@@ -2224,11 +2283,44 @@ async def find_symbol_with_references(
                         }
                     )
 
+        # Find temporally coupled files for the files containing these symbols
+        coupled_files = []
+        file_paths_in_definitions = list({d["file_path"] for d in definitions})
+
+        for file_path in file_paths_in_definitions:
+            # Create file node ID
+            file_node_id = f"{project_id}:{file_path}:FILE:{file_path}"
+
+            # Find coupled_with edges
+            coupling_rows = await db.execute_fetchall(
+                """
+                SELECT ge.target_id, ge.edge_type
+                FROM graph_edges ge
+                WHERE ge.project_id = ? AND ge.source_id = ? AND ge.edge_type = 'coupled_with'
+                LIMIT 20
+                """,
+                (project_id, file_node_id),
+            )
+
+            for row in coupling_rows:
+                target_id = row["target_id"]
+                # Extract file path from node_id (format: project_id:file_path:FILE:file_path)
+                parts = target_id.split(":", 3)
+                if len(parts) >= 2:
+                    coupled_file_path = parts[1]
+                    coupled_files.append({
+                        "source_file": file_path,
+                        "coupled_file": coupled_file_path,
+                        "edge_type": "coupled_with",
+                    })
+
     return {
         "definitions": definitions,
         "references": references,
+        "coupled_files": coupled_files,
         "total_definitions": len(definitions),
         "total_references": len(references),
+        "total_coupled_files": len(coupled_files),
     }
 
 
@@ -2536,6 +2628,39 @@ async def fetch_git_commits(
             """,
             (project_id, limit),
         )
+    return [dict(r) for r in rows]
+
+
+async def fetch_commits_by_uuids(
+    db_path: str,
+    *,
+    project_id: str,
+    uuids: List[str],
+) -> List[Dict[str, Any]]:
+    """Fetch git commits by their embedding UUIDs (for vector search).
+
+    Args:
+        db_path: Path to the database
+        project_id: The project ID to filter by
+        uuids: List of embedding UUIDs to fetch
+
+    Returns:
+        List of commit dictionaries with standard fields
+    """
+    if not uuids:
+        return []
+
+    async with get_connection(db_path) as db:
+        db.row_factory = aiosqlite.Row
+        query = build_in_query(
+            """
+            SELECT commit_hash, author, timestamp, message, embedding_uuid
+            FROM git_commits
+            WHERE project_id = ? AND embedding_uuid IN
+            """,
+            uuids,
+        )
+        rows = await db.execute_fetchall(query.text, (project_id, *query.params))
     return [dict(r) for r in rows]
 
 

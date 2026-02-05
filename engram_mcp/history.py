@@ -474,9 +474,11 @@ class GitIndexer:
         project_id: str,
         commits: List[Tuple[GitCommit, str, np.ndarray]],
     ) -> None:
-        """Bulk-store commits via a single executemany round-trip."""
+        """Bulk-store commits and their embeddings as searchable chunks."""
         if not commits:
             return
+
+        # Store commit metadata in git_commits table
         commit_tuples = [
             (
                 commit.commit_hash,
@@ -489,6 +491,38 @@ class GitIndexer:
             for commit, uuid, _embedding in commits
         ]
         await dbmod.upsert_git_commits(self.db_path, commits=commit_tuples)
+
+        # Store embeddings as chunks for vector search
+        # This enables semantic history search via FAISS
+        chunk_tuples = []
+        for commit, uuid, embedding in commits:
+            # Create a chunk with the commit message content
+            chunk_id = uuid  # Use the embedding_uuid as chunk_id
+            # Approximate token count (rough heuristic: ~0.75 tokens per char)
+            token_count = max(1, int(len(commit.message) * 0.75))
+            metadata = {
+                "type": "git_commit",
+                "commit_hash": commit.commit_hash,
+                "author": commit.author,
+                "timestamp": commit.timestamp,
+                "file_path": "vfs://git_history",  # Virtual file system path
+            }
+            import json
+            chunk_tuples.append((
+                chunk_id,
+                project_id,
+                commit.message,  # Content is the commit message
+                token_count,
+                json.dumps(metadata),
+                embedding,
+            ))
+
+        if chunk_tuples:
+            await dbmod.upsert_chunks_with_embeddings(
+                self.db_path,
+                project_id=project_id,
+                chunks=chunk_tuples
+            )
 
     async def _store_diffs(self, diffs: List[GitDiff]) -> None:
         """Store diffs in database."""
@@ -517,3 +551,145 @@ class GitIndexer:
         if not tags:
             return
         await dbmod.upsert_git_tags(self.db_path, tags=tags)
+
+    # ------------------------------------------------------------------
+    # Immune System: Revert Detection
+    # ------------------------------------------------------------------
+
+    async def process_reverts(
+        self,
+        *,
+        project_id: str,
+    ) -> Dict[str, int]:
+        """Detect revert commits and auto-generate repo_rules to prevent regressions.
+
+        This implements "The Immune System" - learning from mistakes by analyzing
+        reverted commits and treating their patterns as anti-patterns.
+
+        Returns:
+            Dict with counts: {"reverts_found": N, "rules_generated": M}
+        """
+        # Fetch all commits for this project
+        commits = await dbmod.fetch_git_commits(
+            self.db_path,
+            project_id=project_id,
+            limit=1000,  # Process last 1000 commits
+        )
+
+        reverts_found = []
+        revert_patterns = [
+            r"^revert[:\s]+[\"\']?(.+?)[\"\']?$",  # Revert "commit message"
+            r"^revert\s+([a-f0-9]{7,40})",  # Revert <hash>
+            r"this reverts commit\s+([a-f0-9]{7,40})",  # This reverts commit <hash>
+        ]
+
+        for commit in commits:
+            message = commit["message"].strip()
+            message_lower = message.lower()
+
+            # Check if this is a revert commit
+            is_revert = False
+            reverted_hash = None
+            original_message = None
+
+            for pattern in revert_patterns:
+                match = re.search(pattern, message_lower)
+                if match:
+                    is_revert = True
+                    matched_text = match.group(1)
+
+                    # Try to extract hash (7-40 hex chars)
+                    hash_match = re.search(r"([a-f0-9]{7,40})", matched_text)
+                    if hash_match:
+                        reverted_hash = hash_match.group(1)
+                    else:
+                        # The matched text is the original message
+                        original_message = matched_text
+
+                    break
+
+            if not is_revert:
+                continue
+
+            # Find the original (bad) commit
+            original_commit = None
+            if reverted_hash:
+                # Try exact hash match
+                for c in commits:
+                    if c["commit_hash"].startswith(reverted_hash):
+                        original_commit = c
+                        break
+
+            if not original_commit and original_message:
+                # Try message match
+                for c in commits:
+                    if original_message in c["message"].lower():
+                        original_commit = c
+                        break
+
+            if original_commit:
+                reverts_found.append({
+                    "revert_commit_hash": commit["commit_hash"],
+                    "revert_message": message,
+                    "original_commit_hash": original_commit["commit_hash"],
+                    "original_message": original_commit["message"],
+                })
+
+        # Generate rules for each revert
+        rules_generated = 0
+        for revert_info in reverts_found:
+            original_hash = revert_info["original_commit_hash"]
+            original_message = revert_info["original_message"]
+            revert_message = revert_info["revert_message"]
+
+            # Fetch diffs from the original (bad) commit
+            diffs = await dbmod.fetch_git_diffs_for_commit(
+                self.db_path,
+                commit_hash=original_hash,
+            )
+
+            if not diffs:
+                continue
+
+            # Extract file patterns from the bad commit
+            affected_files = [d["file_path"] for d in diffs]
+            file_pattern = "|".join(affected_files[:5])  # Limit to 5 files
+
+            # Generate rule text
+            rule_text = (
+                f"CRITICAL: Anti-pattern detected from reverted commit {original_hash[:8]}.\n\n"
+                f"Original commit: '{original_message}'\n"
+                f"This commit was REVERTED because it caused a regression.\n\n"
+                f"Affected files: {', '.join(affected_files[:3])}\n"
+                f"{'...' if len(affected_files) > 3 else ''}\n\n"
+                f"Before making similar changes, review why this was reverted:\n"
+                f"Revert message: '{revert_message}'\n\n"
+                f"Recommendation: Search git history for this commit to understand the failure."
+            )
+
+            # Create rule ID
+            rule_id = f"immune_system_{original_hash[:12]}"
+
+            # Insert into repo_rules
+            await dbmod.upsert_repo_rule(
+                self.db_path,
+                rule_id=rule_id,
+                project_id=project_id,
+                file_pattern=file_pattern,
+                rule_text=rule_text,
+                priority=10,  # High priority
+            )
+
+            rules_generated += 1
+
+        logging.info(
+            "Immune system: found %d reverts, generated %d rules for project %s",
+            len(reverts_found),
+            rules_generated,
+            project_id,
+        )
+
+        return {
+            "reverts_found": len(reverts_found),
+            "rules_generated": rules_generated,
+        }
