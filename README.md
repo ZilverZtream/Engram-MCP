@@ -62,7 +62,7 @@ It is a **cognitive substrate** for agents.
 
 ---
 
-## 🧬 Cognitive Intelligence (Phase 3)
+## 🧬 Cognitive Intelligence
 
 Engram goes beyond static files to understand **Time** and **Evolution**:
 
