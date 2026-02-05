@@ -142,6 +142,17 @@ CREATE TABLE IF NOT EXISTS project_artifacts (
     PRIMARY KEY (project_id, artifact_path),
     FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE
 );
+
+CREATE TABLE IF NOT EXISTS search_sessions (
+    session_id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    query TEXT NOT NULL,
+    created_at TEXT DEFAULT (datetime('now')),
+    FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_search_sessions_project_created_at
+ON search_sessions(project_id, created_at DESC);
 """
 
 
@@ -336,6 +347,7 @@ async def init_db(db_path: str) -> None:
         await _ensure_chunks_vector_column(db)
         await _ensure_fts_tokenizer(db)
         await _ensure_fts_triggers(db)
+        await _ensure_search_sessions_schema(db)
         await db.commit()
 
 async def _ensure_chunks_vector_column(db: aiosqlite.Connection) -> None:
@@ -535,6 +547,33 @@ async def _ensure_fts_triggers(db: aiosqlite.Connection) -> None:
     )
 
 
+async def _ensure_search_sessions_schema(db: aiosqlite.Connection) -> None:
+    row = await db.execute_fetchone(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'search_sessions'"
+    )
+    if not row:
+        await db.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS search_sessions (
+                session_id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                query TEXT NOT NULL,
+                created_at TEXT DEFAULT (datetime('now')),
+                FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_search_sessions_project_created_at
+            ON search_sessions(project_id, created_at DESC);
+            """
+        )
+        return
+    await db.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_search_sessions_project_created_at
+        ON search_sessions(project_id, created_at DESC)
+        """
+    )
+
+
 async def upsert_project(
     db_path: str,
     *,
@@ -640,6 +679,72 @@ async def list_all_project_artifacts(db_path: str) -> List[str]:
             "SELECT artifact_path FROM project_artifacts ORDER BY created_at DESC"
         )
         return [str(r[0]) for r in rows]
+
+
+async def insert_search_session(
+    db_path: str,
+    *,
+    session_id: str,
+    project_id: str,
+    query: str,
+) -> None:
+    async with get_connection(db_path) as db:
+        await db.execute(
+            """
+            INSERT OR REPLACE INTO search_sessions(session_id, project_id, query, created_at)
+            VALUES(?,?,?, datetime('now'))
+            """,
+            (session_id, project_id, query),
+        )
+        await db.commit()
+
+
+async def prune_search_sessions(
+    db_path: str,
+    *,
+    project_id: Optional[str] = None,
+    max_age_s: Optional[int] = None,
+    max_rows: Optional[int] = None,
+) -> int:
+    deleted = 0
+    async with get_connection(db_path) as db:
+        if max_age_s is not None:
+            age_clause = "datetime('now', ?)"
+            age_param = f"-{int(max_age_s)} seconds"
+            if project_id:
+                cursor = await db.execute(
+                    "DELETE FROM search_sessions WHERE project_id = ? AND created_at < " + age_clause,
+                    (project_id, age_param),
+                )
+            else:
+                cursor = await db.execute(
+                    "DELETE FROM search_sessions WHERE created_at < " + age_clause,
+                    (age_param,),
+                )
+            deleted += cursor.rowcount or 0
+        if max_rows is not None:
+            max_rows = int(max_rows)
+            if max_rows < 0:
+                max_rows = 0
+            project_clause = "WHERE project_id = ?" if project_id else ""
+            params: Tuple[Any, ...] = (project_id,) if project_id else ()
+            cursor = await db.execute(
+                f"""
+                DELETE FROM search_sessions
+                WHERE session_id IN (
+                    SELECT session_id
+                    FROM search_sessions
+                    {project_clause}
+                    ORDER BY created_at DESC
+                    LIMIT -1 OFFSET ?
+                )
+                """,
+                (*params, max_rows),
+            )
+            deleted += cursor.rowcount or 0
+        if deleted:
+            await db.commit()
+    return deleted
 
 
 async def list_projects(db_path: str) -> List[Dict[str, Any]]:
