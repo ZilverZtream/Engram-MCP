@@ -74,6 +74,9 @@ class EngramConfig:
     enable_dreaming: bool = False
     dream_model_name: str = "gpt-4o-mini"
     dream_threshold: float = 0.8
+    auto_dream_enabled: bool = False
+    auto_dream_max_pairs: int = 10
+    auto_dream_max_runs_per_day: int = 1
 
     # Optional: keep GPU embeddings in-process (recommended)
     prefer_thread_for_cuda: bool = True
@@ -87,6 +90,11 @@ class EngramConfig:
     # Sharding settings
     shard_chunk_threshold: int = 1_000_000
     shard_size: int = 250_000
+
+    # Indexing safety limits
+    max_project_files: int = 100_000
+    max_project_bytes: int = 5 * 1024 * 1024 * 1024
+    max_jobs_per_project: int = 3
 
     # Embedding backend selection
     embedding_backend: str = "sentence_transformers"  # "sentence_transformers" | "ollama" | "openai"
@@ -141,6 +149,9 @@ class AllowedConfig(BaseModel):
     enable_dreaming: bool = False
     dream_model_name: str = "gpt-4o-mini"
     dream_threshold: float = 0.8
+    auto_dream_enabled: bool = False
+    auto_dream_max_pairs: int = 10
+    auto_dream_max_runs_per_day: int = 1
 
     prefer_thread_for_cuda: bool = True
 
@@ -154,6 +165,10 @@ class AllowedConfig(BaseModel):
     shard_chunk_threshold: int = 1_000_000
     shard_size: int = 250_000
 
+    # Indexing safety limits
+    max_project_files: int = 100_000
+    max_project_bytes: int = 5 * 1024 * 1024 * 1024
+    max_jobs_per_project: int = 3
     # Embedding backend selection
     embedding_backend: str = "sentence_transformers"
     ollama_model: str = "nomic-embed-text"

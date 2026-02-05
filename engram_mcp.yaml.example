@@ -20,4 +20,10 @@ allowed_roots:
 # enable_dreaming: false
 # dream_model_name: gpt-4o-mini
 # dream_threshold: 0.8
+# auto_dream_enabled: false
+# auto_dream_max_pairs: 10
+# auto_dream_max_runs_per_day: 1
+# max_project_files: 100000
+# max_project_bytes: 5368709120
+# max_jobs_per_project: 3
 # vector_backend: auto  # auto | fts | faiss_cpu | faiss_gpu

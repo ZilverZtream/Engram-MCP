@@ -355,29 +355,38 @@ class Embedder:
         if self._proc_pool is not None:
             self._proc_pool.shutdown(wait=True, cancel_futures=True)
         if self.shared and self._shared_key is not None:
-            pool_type, key = self._shared_key
-            # close() is called from sync contexts (worker-loop cleanup, atexit).
-            # The pool registry is mutated under the threading model lock here
-            # because we cannot await an asyncio.Lock in a sync function.
-            # This is safe: the only contention is another close() from a
-            # different Embedder instance, which is a rare teardown path.
-            with self._shared_model_lock:
-                if pool_type == "thread":
-                    pool, ref = self._shared_thread_pools.get(key, (None, 0))
-                    if pool and ref <= 1:
-                        pool.shutdown(wait=True, cancel_futures=True)
-                        self._shared_thread_pools.pop(key, None)
-                        self._shared_models.pop((key[0], key[1]), None)
-                    else:
-                        self._shared_thread_pools[key] = (pool, ref - 1)
-                else:
-                    pool, ref = self._shared_proc_pools.get(key, (None, 0))
-                    if pool and ref <= 1:
-                        pool.shutdown(wait=True, cancel_futures=True)
-                        self._shared_proc_pools.pop(key, None)
-                    else:
-                        self._shared_proc_pools[key] = (pool, ref - 1)
-                self._shared_key = None
+            if self._shared_model_lock.acquire(blocking=False):
+                try:
+                    self._release_shared_resources_locked()
+                finally:
+                    self._shared_model_lock.release()
+            else:
+                threading.Thread(target=self._release_shared_resources_threadsafe, daemon=True).start()
+
+    def _release_shared_resources_threadsafe(self) -> None:
+        with self._shared_model_lock:
+            self._release_shared_resources_locked()
+
+    def _release_shared_resources_locked(self) -> None:
+        if self._shared_key is None:
+            return
+        pool_type, key = self._shared_key
+        if pool_type == "thread":
+            pool, ref = self._shared_thread_pools.get(key, (None, 0))
+            if pool and ref <= 1:
+                pool.shutdown(wait=True, cancel_futures=True)
+                self._shared_thread_pools.pop(key, None)
+                self._shared_models.pop((key[0], key[1]), None)
+            else:
+                self._shared_thread_pools[key] = (pool, ref - 1)
+        else:
+            pool, ref = self._shared_proc_pools.get(key, (None, 0))
+            if pool and ref <= 1:
+                pool.shutdown(wait=True, cancel_futures=True)
+                self._shared_proc_pools.pop(key, None)
+            else:
+                self._shared_proc_pools[key] = (pool, ref - 1)
+        self._shared_key = None
 
 
 @dataclass

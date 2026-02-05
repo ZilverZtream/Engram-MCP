@@ -30,6 +30,7 @@ from engram_mcp.generation import GenerationService
 from engram_mcp.security import PathContext, PathNotAllowed, ProjectID, validate_project_field
 from engram_mcp import db as dbmod
 from engram_mcp import chunking
+from engram_mcp.parsing import SUPPORTED_DOC_EXTS, SUPPORTED_TEXT_EXTS, iter_files
 
 
 cfg = load_config()
@@ -53,11 +54,12 @@ embedding_service = EmbeddingService(
     openai_api_key=cfg.openai_api_key.get_secret_value(),
     openai_embedding_model=cfg.openai_embedding_model,
 )
-jobs = JobManager(cfg.db_path)
+jobs = JobManager(cfg.db_path, max_queue_per_key=cfg.max_jobs_per_project)
 indexer = Indexer(cfg, embedding_service, project_path_context, index_path_context)
 
 _AUTO_DREAM_SEARCH_INTERVAL = 25
 _AUTO_DREAM_MIN_INTERVAL_S = 300.0
+_AUTO_DREAM_DAY_S = 24 * 60 * 60
 MAX_DREAM_PAIRS = 100
 DEFAULT_MAX_CONTENT_CHARS = 1200
 MAX_CONTENT_CHARS = 100_000
@@ -263,6 +265,39 @@ def _device() -> str:
     return "cuda" if torch.cuda.is_available() else "cpu"
 
 
+def _scan_project_limits(directory: str) -> tuple[int, int]:
+    max_files = int(cfg.max_project_files)
+    max_bytes = int(cfg.max_project_bytes)
+    total_files = 0
+    total_bytes = 0
+    for path in iter_files(project_path_context, directory, cfg.ignore_patterns):
+        ext = path.suffix.lower()
+        if ext not in SUPPORTED_TEXT_EXTS and ext not in SUPPORTED_DOC_EXTS:
+            continue
+        stat_result = project_path_context.stat(path)
+        total_files += 1
+        total_bytes += stat_result.st_size
+        if max_files > 0 and total_files > max_files:
+            raise ValueError(
+                f"Project exceeds file limit ({max_files} files). "
+                "Reduce the directory size or increase max_project_files."
+            )
+        if max_bytes > 0 and total_bytes > max_bytes:
+            raise ValueError(
+                f"Project exceeds size limit ({max_bytes} bytes). "
+                "Reduce the directory size or increase max_project_bytes."
+            )
+    return total_files, total_bytes
+
+
+async def _enforce_project_limits(directory: str) -> None:
+    max_files = int(cfg.max_project_files)
+    max_bytes = int(cfg.max_project_bytes)
+    if max_files <= 0 and max_bytes <= 0:
+        return
+    await asyncio.to_thread(_scan_project_limits, directory)
+
+
 @mcp.tool
 async def index_project(
     directory: str,
@@ -302,7 +337,11 @@ async def index_project(
         )
         return f"✅ Indexed '{project_name}' as project_id: {pid}"
 
-    job = await jobs.create("index", _run())
+    try:
+        await _enforce_project_limits(directory)
+    except ValueError as e:
+        return f"❌ {e}"
+    job = await jobs.create("index", _run(), queue_key=directory)
     # Wait for completion (Claude expects tool result), but the event loop remains responsive.
     try:
         if not wait:
@@ -331,7 +370,16 @@ async def update_project(project_id: str, wait: bool = True) -> str:
         )
         return f"✅ Updated {project_id}: +{changes['added']} added, -{changes['deleted']} deleted"
 
-    job = await jobs.create("update", _run())
+    await dbmod.init_db(cfg.db_path)
+    proj = await dbmod.get_project(cfg.db_path, project_id)
+    directory = proj.get("directory") if proj else None
+    if directory:
+        try:
+            directory = str(project_path_context.resolve_path(directory))
+            await _enforce_project_limits(directory)
+        except (PathNotAllowed, ValueError) as e:
+            return f"❌ {e}"
+    job = await jobs.create("update", _run(), queue_key=project_id)
     try:
         if not wait:
             return f"🆔 Update job queued: {job.job_id}"
@@ -438,18 +486,27 @@ async def _run_dream_cycle(project_id: str, *, max_pairs: int = 10) -> str:
 
 
 async def _maybe_auto_trigger_dream(project_id: str) -> None:
-    if not cfg.enable_dreaming:
+    if not cfg.enable_dreaming or not cfg.auto_dream_enabled:
         return
     now = time.time()
     async with _auto_dream_lock:
-        state = _auto_dream_state.setdefault(project_id, {"count": 0.0, "last": 0.0})
+        state = _auto_dream_state.setdefault(
+            project_id, {"count": 0.0, "last": 0.0, "day": 0.0, "runs": 0.0}
+        )
+        day_marker = float(int(now // _AUTO_DREAM_DAY_S))
+        if state["day"] != day_marker:
+            state["day"] = day_marker
+            state["runs"] = 0.0
         state["count"] += 1.0
         if state["count"] < _AUTO_DREAM_SEARCH_INTERVAL:
             return
         if now - state["last"] < _AUTO_DREAM_MIN_INTERVAL_S:
             return
+        if state["runs"] >= float(cfg.auto_dream_max_runs_per_day):
+            return
         state["count"] = 0.0
         state["last"] = now
+        state["runs"] += 1.0
     try:
         ProjectID(project_id)
     except ValueError:
@@ -458,7 +515,12 @@ async def _maybe_auto_trigger_dream(project_id: str) -> None:
     proj = await dbmod.get_project(cfg.db_path, project_id)
     if not proj:
         return
-    job = await jobs.create("dream", _run_dream_cycle(project_id))
+    max_pairs = min(MAX_DREAM_PAIRS, max(1, int(cfg.auto_dream_max_pairs)))
+    job = await jobs.create(
+        "dream",
+        _run_dream_cycle(project_id, max_pairs=max_pairs),
+        queue_key=f"dream:{project_id}",
+    )
     logging.info(
         "auto_dream_triggered",
         extra={
@@ -483,7 +545,11 @@ async def dream_project(project_id: str, wait: bool = False, max_pairs: int = 10
     if not proj:
         return f"❌ Project not found: {project_id}"
 
-    job = await jobs.create("dream", _run_dream_cycle(project_id, max_pairs=max_pairs))
+    job = await jobs.create(
+        "dream",
+        _run_dream_cycle(project_id, max_pairs=max_pairs),
+        queue_key=f"dream:{project_id}",
+    )
     try:
         if not wait:
             return f"🆔 Dream job queued: {job.job_id}"
@@ -505,7 +571,7 @@ async def trigger_rem_cycle(project_id: str) -> str:
     proj = await dbmod.get_project(cfg.db_path, project_id)
     if not proj:
         return f"❌ Project not found: {project_id}"
-    job = await jobs.create("dream", _run_dream_cycle(project_id))
+    job = await jobs.create("dream", _run_dream_cycle(project_id), queue_key=f"dream:{project_id}")
     return f"🆔 Dream job queued: {job.job_id}"
 
 

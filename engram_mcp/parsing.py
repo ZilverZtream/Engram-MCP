@@ -355,18 +355,30 @@ def read_text_streaming(
 
 
 def hash_file(path_context: PathContext, path: Path, root: Path, max_bytes: int) -> str:
-    size = path_context.stat(path).st_size
-    if size > max_bytes:
-        raise ValueError(f"File too large: {path} ({size} bytes)")
-    h = hashlib.sha256()
-    with ExitStack() as stack:
-        handle = stack.enter_context(path_context.open_file(path, "rb"))
-        while True:
-            chunk = handle.read(1024 * 1024)
-            if not chunk:
-                break
-            h.update(chunk)
-    return h.hexdigest()
+    resolved = path_context.resolve_path(path)
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    fd = os.open(resolved, flags)
+    try:
+        st_before = os.fstat(fd)
+        if st_before.st_size > max_bytes:
+            raise ValueError(f"File too large: {path} ({st_before.st_size} bytes)")
+        h = hashlib.sha256()
+        with os.fdopen(fd, "rb", closefd=False) as handle:
+            while True:
+                chunk = handle.read(1024 * 1024)
+                if not chunk:
+                    break
+                h.update(chunk)
+        st_after = os.fstat(fd)
+        if st_after.st_mtime_ns != st_before.st_mtime_ns or st_after.st_size != st_before.st_size:
+            raise RuntimeError(f"File changed during hashing: {path}")
+        return h.hexdigest()
+    finally:
+        os.close(fd)
 
 
 def parse_file_to_chunks(
@@ -656,4 +668,3 @@ class ParsedFile:
     chunks: List[Chunk]
     nodes: List[GraphNodeObj] = field(default_factory=list)
     edges: List[GraphEdgeObj] = field(default_factory=list)
-

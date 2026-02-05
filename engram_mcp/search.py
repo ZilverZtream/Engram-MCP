@@ -291,28 +291,49 @@ class SearchEngine:
         if self.vector_backend == "faiss_gpu":
             index = self._maybe_to_gpu(index)
 
-        # --- Fix #12: UUID integrity check ---
-        # A companion .uuid file is written beside every FAISS index file
-        # when it is saved.  If the file and the project metadata disagree
-        # the index and DB have diverged (e.g. one was deleted manually);
-        # refuse to serve stale / ghost results.
+        # --- Fix #12: UUID + checksum integrity checks ---
+        # A companion .uuid + .checksum file is written beside every
+        # FAISS index file when it is saved. If the files are missing or
+        # disagree with metadata/checksum, the index and DB have diverged;
+        # refuse to serve stale or corrupted results.
         uuid_path = safe_path + ".uuid"
-        if self.index_path_context.exists(uuid_path):
-            try:
-                with self.index_path_context.open_file(uuid_path, "r", encoding="utf-8") as uf:
-                    file_uuid = uf.read().strip()
-                proj = await dbmod.get_project(self.db_path, project_id)
-                expected_uuid = proj.get("faiss_index_uuid") if proj else None
-                if expected_uuid and file_uuid and file_uuid != expected_uuid:
-                    raise RuntimeError(
-                        f"FAISS index UUID mismatch for project {project_id}: "
-                        f"on-disk={file_uuid} vs metadata={expected_uuid}. "
-                        f"The index and database have diverged — re-index required."
-                    )
-            except RuntimeError:
-                raise
-            except Exception:
-                logging.warning("UUID verification skipped for %s", index_path, exc_info=True)
+        checksum_path = safe_path + ".checksum"
+        if not self.index_path_context.exists(uuid_path):
+            raise RuntimeError(
+                f"Missing FAISS UUID file for project {project_id}: {uuid_path}. "
+                "Re-index required."
+            )
+        if not self.index_path_context.exists(checksum_path):
+            raise RuntimeError(
+                f"Missing FAISS checksum file for project {project_id}: {checksum_path}. "
+                "Re-index required."
+            )
+        with self.index_path_context.open_file(uuid_path, "r", encoding="utf-8") as uf:
+            file_uuid = uf.read().strip()
+        proj = await dbmod.get_project(self.db_path, project_id)
+        expected_uuid = proj.get("faiss_index_uuid") if proj else None
+        if not expected_uuid or not file_uuid or file_uuid != expected_uuid:
+            raise RuntimeError(
+                f"FAISS index UUID mismatch for project {project_id}: "
+                f"on-disk={file_uuid} vs metadata={expected_uuid}. "
+                f"The index and database have diverged — re-index required."
+            )
+        with self.index_path_context.open_file(checksum_path, "r", encoding="utf-8") as cf:
+            stored_checksum = cf.read().strip()
+        h = hashlib.sha256()
+        with self.index_path_context.open_file(safe_path, "rb") as f:
+            while True:
+                buf = f.read(1024 * 1024)
+                if not buf:
+                    break
+                h.update(buf)
+        actual_checksum = h.hexdigest()
+        if stored_checksum != actual_checksum:
+            raise RuntimeError(
+                f"FAISS index checksum mismatch for project {project_id}: "
+                f"stored={stored_checksum[:16]}… actual={actual_checksum[:16]}…. "
+                "Re-index required."
+            )
 
         async with _faiss_cache_lock:
             _faiss_cache[safe_path] = (index_mtime, index)
