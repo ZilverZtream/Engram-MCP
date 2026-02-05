@@ -8,7 +8,7 @@ from typing import List, Optional
 
 import yaml
 from .security import PathContext
-from pydantic import BaseModel, ConfigDict, ValidationError, field_validator, Field
+from pydantic import BaseModel, ConfigDict, SecretStr, ValidationError, field_validator, Field
 
 
 DEFAULT_IGNORE_PATTERNS: List[str] = [
@@ -87,7 +87,7 @@ class EngramConfig:
     embedding_backend: str = "sentence_transformers"  # "sentence_transformers" | "ollama" | "openai"
     ollama_model: str = "nomic-embed-text"
     ollama_url: str = "http://localhost:11434"
-    openai_api_key: str = ""
+    openai_api_key: SecretStr = SecretStr("")
     openai_embedding_model: str = "text-embedding-3-small"
 
 
@@ -147,7 +147,7 @@ class AllowedConfig(BaseModel):
     embedding_backend: str = "sentence_transformers"
     ollama_model: str = "nomic-embed-text"
     ollama_url: str = "http://localhost:11434"
-    openai_api_key: str = ""
+    openai_api_key: SecretStr = SecretStr("")
     openai_embedding_model: str = "text-embedding-3-small"
 
     @field_validator("overlap_tokens")

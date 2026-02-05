@@ -48,7 +48,7 @@ embedding_service = EmbeddingService(
     embedding_backend=cfg.embedding_backend,
     ollama_model=cfg.ollama_model,
     ollama_url=cfg.ollama_url,
-    openai_api_key=cfg.openai_api_key,
+    openai_api_key=cfg.openai_api_key.get_secret_value(),
     openai_embedding_model=cfg.openai_embedding_model,
 )
 jobs = JobManager(cfg.db_path)
