@@ -371,11 +371,32 @@ class GitIndexer:
         Checks ``+++ b/<path>`` first (present for all non-deleted files),
         falls back to ``--- a/<path>`` for deleted files, and handles the
         ``Binary files … differ`` line emitted for binary diffs.
+
+        Also handles quoted paths (e.g., +++ "b/path with spaces.txt") which
+        git uses when paths contain spaces or special characters.
         """
         minus_path: Optional[str] = None
         for line in block.split("\n")[:15]:  # header is always in the first few lines
+            # Handle quoted paths: +++ "b/path with spaces.txt"
+            if line.startswith('+++ "b/'):
+                # Extract path from quoted format and unescape
+                path = line[7:]  # Skip '+++ "b/'
+                if path.endswith('"'):
+                    path = path[:-1]  # Remove trailing quote
+                # Unescape common git escape sequences
+                path = path.replace('\\\\', '\\').replace('\\"', '"').replace('\\t', '\t')
+                return path
+            # Handle unquoted paths: +++ b/path
             if line.startswith("+++ b/"):
                 return line[6:]
+            # Handle quoted deleted files: --- "a/path"
+            if line.startswith('--- "a/') and minus_path is None:
+                path = line[7:]
+                if path.endswith('"'):
+                    path = path[:-1]
+                path = path.replace('\\\\', '\\').replace('\\"', '"').replace('\\t', '\t')
+                minus_path = path
+            # Handle unquoted deleted files: --- a/path
             if line.startswith("--- a/") and minus_path is None:
                 minus_path = line[6:]
             # Binary file: no +++ / --- lines
