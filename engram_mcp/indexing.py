@@ -2186,9 +2186,13 @@ def _save_faiss(index: Any, path_context: PathContext, path: str) -> None:
     import faiss
     path_context.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
     dir_path = os.path.dirname(os.path.abspath(path))
-    tmp_path = path_context.create_temp_file(dir_path=dir_path, suffix=".index.tmp")
+    fd, tmp_path = path_context.create_temp_file(dir_path=dir_path, suffix=".index.tmp")
     try:
-        faiss.write_index(index, tmp_path)
+        write_path = tmp_path
+        fd_path = f"/proc/self/fd/{fd}"
+        if os.name == "posix" and os.path.exists(fd_path):
+            write_path = fd_path
+        faiss.write_index(index, write_path)
         # Compute the checksum *before* the atomic replace so the hash
         # covers exactly the bytes that end up at *path*.
         checksum = _compute_file_checksum(tmp_path)
@@ -2203,6 +2207,11 @@ def _save_faiss(index: Any, path_context: PathContext, path: str) -> None:
         if path_context.exists(tmp_path):
             path_context.unlink(tmp_path)
         raise
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            logging.debug("Failed to close temp fd %s", fd, exc_info=True)
 
 
 def _replace_with_retries(
