@@ -59,6 +59,8 @@ indexer = Indexer(cfg, embedding_service, project_path_context, index_path_conte
 _AUTO_DREAM_SEARCH_INTERVAL = 25
 _AUTO_DREAM_MIN_INTERVAL_S = 300.0
 MAX_DREAM_PAIRS = 100
+DEFAULT_MAX_CONTENT_CHARS = 1200
+MAX_CONTENT_CHARS = 100_000
 _auto_dream_state: Dict[str, Dict[str, float]] = {}
 _auto_dream_lock = asyncio.Lock()
 
@@ -554,6 +556,11 @@ async def search_memory(
     if token_count > max_tokens:
         return {"error": f"Query too long ({token_count} tokens). Max is {max_tokens}."}
 
+    max_content_chars = int(max_content_chars_per_result)
+    if max_content_chars < 0:
+        max_content_chars = DEFAULT_MAX_CONTENT_CHARS
+    max_content_chars = min(max_content_chars, MAX_CONTENT_CHARS)
+
     md = proj.get("metadata") or {}
     model_name = md.get("model_name") or cfg.model_name_text
     device = md.get("device") or _device()
@@ -597,9 +604,8 @@ async def search_memory(
     def _trim_content(text: str) -> str:
         if not include_content:
             return ""
-        max_len = max(0, int(max_content_chars_per_result))
-        if max_len and len(text) > max_len:
-            return text[:max_len] + "…"
+        if max_content_chars and len(text) > max_content_chars:
+            return text[:max_content_chars] + "…"
         return text
 
     return {
@@ -628,7 +634,7 @@ async def get_chunk(project_id: str, chunk_id: str, include_content: bool = True
     if not chunk:
         return {"error": f"Chunk not found: {chunk_id}"}
     if include_content:
-        max_chars = 100_000
+        max_chars = MAX_CONTENT_CHARS
         content = chunk.get("content")
         if content and len(content) > max_chars:
             chunk = dict(chunk)
