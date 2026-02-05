@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -147,6 +148,7 @@ CREATE TABLE IF NOT EXISTS search_sessions (
     session_id TEXT PRIMARY KEY,
     project_id TEXT NOT NULL,
     query TEXT NOT NULL,
+    result_chunk_ids TEXT,
     created_at TEXT DEFAULT (datetime('now')),
     FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE
 );
@@ -558,6 +560,7 @@ async def _ensure_search_sessions_schema(db: aiosqlite.Connection) -> None:
                 session_id TEXT PRIMARY KEY,
                 project_id TEXT NOT NULL,
                 query TEXT NOT NULL,
+                result_chunk_ids TEXT,
                 created_at TEXT DEFAULT (datetime('now')),
                 FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE
             );
@@ -572,6 +575,10 @@ async def _ensure_search_sessions_schema(db: aiosqlite.Connection) -> None:
         ON search_sessions(project_id, created_at DESC)
         """
     )
+    columns = await db.execute_fetchall("PRAGMA table_info(search_sessions)")
+    column_names = {str(row[1]) for row in columns}
+    if "result_chunk_ids" not in column_names:
+        await db.execute("ALTER TABLE search_sessions ADD COLUMN result_chunk_ids TEXT")
 
 
 async def upsert_project(
@@ -684,17 +691,25 @@ async def list_all_project_artifacts(db_path: str) -> List[str]:
 async def insert_search_session(
     db_path: str,
     *,
-    session_id: str,
     project_id: str,
-    query: str,
+    query_text: str,
+    result_chunk_ids: Sequence[str],
 ) -> None:
     async with get_connection(db_path) as db:
+        session_id = uuid.uuid4().hex
+        result_json = json.dumps(list(result_chunk_ids))
         await db.execute(
             """
-            INSERT OR REPLACE INTO search_sessions(session_id, project_id, query, created_at)
-            VALUES(?,?,?, datetime('now'))
+            INSERT OR REPLACE INTO search_sessions(
+                session_id,
+                project_id,
+                query,
+                result_chunk_ids,
+                created_at
+            )
+            VALUES(?,?,?,?, datetime('now'))
             """,
-            (session_id, project_id, query),
+            (session_id, project_id, query_text, result_json),
         )
         await db.commit()
 
