@@ -155,6 +155,41 @@ CREATE TABLE IF NOT EXISTS search_sessions (
 
 CREATE INDEX IF NOT EXISTS idx_search_sessions_project_created_at
 ON search_sessions(project_id, created_at DESC);
+
+-- Git history tables for Episodic Diff Memory
+CREATE TABLE IF NOT EXISTS git_commits (
+    commit_hash TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    author TEXT,
+    timestamp INTEGER,
+    message TEXT,
+    embedding_uuid TEXT,
+    FOREIGN KEY(project_id) REFERENCES projects(project_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_git_commits_project ON git_commits(project_id, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_git_commits_embedding ON git_commits(embedding_uuid);
+
+CREATE TABLE IF NOT EXISTS git_diffs (
+    id TEXT PRIMARY KEY,
+    commit_hash TEXT NOT NULL,
+    file_path TEXT NOT NULL,
+    change_type TEXT,
+    diff_content TEXT,
+    FOREIGN KEY(commit_hash) REFERENCES git_commits(commit_hash) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_git_diffs_commit ON git_diffs(commit_hash);
+CREATE INDEX IF NOT EXISTS idx_git_diffs_file ON git_diffs(file_path);
+
+CREATE TABLE IF NOT EXISTS git_tags (
+    commit_hash TEXT,
+    tag TEXT,
+    PRIMARY KEY(commit_hash, tag),
+    FOREIGN KEY(commit_hash) REFERENCES git_commits(commit_hash) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_git_tags_tag ON git_tags(tag);
 """
 
 MAX_RESERVE_COUNT = 1_000_000
@@ -2335,3 +2370,174 @@ async def delete_repo_rule(db_path: str, rule_id: str) -> None:
     async with get_connection(db_path) as db:
         await db.execute("DELETE FROM repo_rules WHERE rule_id = ?", (rule_id,))
         await db.commit()
+
+
+# ============================================================================
+# Episodic Diff Memory: Git History API
+# ============================================================================
+
+
+async def upsert_git_commit(
+    db_path: str,
+    *,
+    project_id: str,
+    commit_hash: str,
+    author: str,
+    timestamp: int,
+    message: str,
+    embedding_uuid: Optional[str] = None,
+) -> None:
+    """Insert or update a git commit record."""
+    async with get_connection(db_path) as db:
+        await db.execute(
+            """
+            INSERT INTO git_commits(commit_hash, project_id, author, timestamp, message, embedding_uuid)
+            VALUES(?, ?, ?, ?, ?, ?)
+            ON CONFLICT(commit_hash) DO UPDATE SET
+                author = excluded.author,
+                timestamp = excluded.timestamp,
+                message = excluded.message,
+                embedding_uuid = excluded.embedding_uuid
+            """,
+            (commit_hash, project_id, author, timestamp, message, embedding_uuid),
+        )
+        await db.commit()
+
+
+async def upsert_git_diffs(
+    db_path: str,
+    *,
+    diffs: List[Tuple[str, str, str, str, str]],
+) -> None:
+    """Bulk insert or update git diff records.
+
+    Each tuple: (id, commit_hash, file_path, change_type, diff_content)
+    """
+    if not diffs:
+        return
+    async with get_connection(db_path) as db:
+        await db.executemany(
+            """
+            INSERT INTO git_diffs(id, commit_hash, file_path, change_type, diff_content)
+            VALUES(?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                change_type = excluded.change_type,
+                diff_content = excluded.diff_content
+            """,
+            diffs,
+        )
+        await db.commit()
+
+
+async def upsert_git_tags(
+    db_path: str,
+    *,
+    tags: List[Tuple[str, str]],
+) -> None:
+    """Bulk insert or update git tags.
+
+    Each tuple: (commit_hash, tag)
+    """
+    if not tags:
+        return
+    async with get_connection(db_path) as db:
+        await db.executemany(
+            """
+            INSERT OR IGNORE INTO git_tags(commit_hash, tag)
+            VALUES(?, ?)
+            """,
+            tags,
+        )
+        await db.commit()
+
+
+async def fetch_git_commits(
+    db_path: str,
+    *,
+    project_id: str,
+    limit: int = 100,
+) -> List[Dict[str, Any]]:
+    """Fetch git commits for a project, ordered by timestamp descending."""
+    async with get_connection(db_path) as db:
+        db.row_factory = aiosqlite.Row
+        rows = await db.execute_fetchall(
+            """
+            SELECT commit_hash, author, timestamp, message, embedding_uuid
+            FROM git_commits
+            WHERE project_id = ?
+            ORDER BY timestamp DESC
+            LIMIT ?
+            """,
+            (project_id, limit),
+        )
+    return [dict(r) for r in rows]
+
+
+async def fetch_git_diffs_for_commit(
+    db_path: str,
+    *,
+    commit_hash: str,
+) -> List[Dict[str, Any]]:
+    """Fetch all diffs for a specific commit."""
+    async with get_connection(db_path) as db:
+        db.row_factory = aiosqlite.Row
+        rows = await db.execute_fetchall(
+            """
+            SELECT id, file_path, change_type, diff_content
+            FROM git_diffs
+            WHERE commit_hash = ?
+            """,
+            (commit_hash,),
+        )
+    return [dict(r) for r in rows]
+
+
+async def search_git_commits_by_message(
+    db_path: str,
+    *,
+    project_id: str,
+    query: str,
+    limit: int = 10,
+) -> List[Dict[str, Any]]:
+    """Search commit messages using simple text matching."""
+    async with get_connection(db_path) as db:
+        db.row_factory = aiosqlite.Row
+        rows = await db.execute_fetchall(
+            """
+            SELECT commit_hash, author, timestamp, message, embedding_uuid
+            FROM git_commits
+            WHERE project_id = ? AND message LIKE ?
+            ORDER BY timestamp DESC
+            LIMIT ?
+            """,
+            (project_id, f"%{query}%", limit),
+        )
+    return [dict(r) for r in rows]
+
+
+async def fetch_git_tags_for_commit(
+    db_path: str,
+    *,
+    commit_hash: str,
+) -> List[str]:
+    """Fetch all tags associated with a commit."""
+    async with get_connection(db_path) as db:
+        rows = await db.execute_fetchall(
+            "SELECT tag FROM git_tags WHERE commit_hash = ?",
+            (commit_hash,),
+        )
+    return [str(r[0]) for r in rows]
+
+
+async def count_git_commits(
+    db_path: str,
+    *,
+    project_id: str,
+) -> int:
+    """Count total git commits for a project."""
+    async with get_connection(db_path) as db:
+        row = await db.execute_fetchone(
+            "SELECT COUNT(*) FROM git_commits WHERE project_id = ?",
+            (project_id,),
+        )
+    return int(row[0]) if row else 0

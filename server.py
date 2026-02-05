@@ -1606,6 +1606,196 @@ async def get_project_context(project_id: str) -> Dict[str, Any]:
         return {"error": f"Failed to get project context: {exc}"}
 
 
+# ============================================================================
+# Episodic Diff Memory: Git History Tools
+# ============================================================================
+
+
+@mcp.tool
+async def index_git_history(
+    project_id: str,
+    limit: int = 500,
+    branch: str = "HEAD",
+    wait: bool = True,
+) -> str:
+    """Index git history for a project to enable temporal debugging.
+
+    This tool implements "Episodic Diff Memory" - enabling agents to learn from
+    git history (evolution) rather than just the current state. It indexes commit
+    messages and diffs to build a searchable database of historical fixes.
+
+    AGENT NOTE: Run this once per project to unlock the ability to search for
+    historical solutions to bugs and errors. Useful for:
+    - "Has this error happened before?"
+    - "How was this bug fixed previously?"
+    - "What commits modified this file?"
+
+    Args:
+        project_id: The project to index history for
+        limit: Maximum number of commits to index (default: 500)
+        branch: Git branch/ref to index (default: HEAD)
+        wait: Wait for indexing to complete (default: True)
+
+    Returns:
+        Status message with counts of indexed commits, diffs, and tags
+    """
+    await dbmod.init_db(cfg.db_path)
+
+    try:
+        ProjectID(project_id)
+    except ValueError as e:
+        return f"❌ {e}"
+
+    proj = await dbmod.get_project(cfg.db_path, project_id)
+    if not proj:
+        return f"❌ Project not found: {project_id}"
+
+    directory = proj.get("directory") or proj.get("directory_realpath")
+    if not directory:
+        return "❌ Project has no associated directory"
+
+    async def _run() -> str:
+        from engram_mcp.history import GitIndexer
+
+        start = time.time()
+        git_indexer = GitIndexer(
+            db_path=cfg.db_path,
+            embedding_service=embedding_service,
+            project_path_context=project_path_context,
+        )
+
+        try:
+            result = await git_indexer.index_git_history(
+                project_id=project_id,
+                repo_path=directory,
+                limit=int(limit),
+                branch=str(branch),
+            )
+
+            logging.info(
+                "index_git_history",
+                extra={
+                    "project_id": project_id,
+                    "operation": "index_history",
+                    "duration_ms": int((time.time() - start) * 1000),
+                    "commits": result.get("commits", 0),
+                    "diffs": result.get("diffs", 0),
+                    "tags": result.get("tags", 0),
+                },
+            )
+
+            return (
+                f"✅ Indexed git history for {project_id}: "
+                f"{result['commits']} commits, {result['diffs']} diffs, {result['tags']} tags"
+            )
+        except ValueError as ve:
+            return f"❌ {ve}"
+        except Exception as exc:
+            logging.error("index_git_history failed", exc_info=True)
+            return f"❌ Failed to index git history: {exc}"
+
+    job = await jobs.create("index_history", _run(), queue_key=f"history:{project_id}")
+    try:
+        if not wait:
+            return f"🆔 History indexing job queued: {job.job_id}"
+        return await job.task
+    except asyncio.CancelledError:
+        return f"🛑 History indexing job cancelled: {job.job_id}"
+
+
+@mcp.tool
+async def search_history(
+    query: str,
+    project_id: str,
+    file_filter: Optional[str] = None,
+    limit: int = 5,
+) -> Dict[str, Any]:
+    """Search git history for commits related to an error or bug.
+
+    This implements the "Déjà Vu" search algorithm - finding historical fixes
+    for similar problems. When you encounter a bug, use this to see if it's
+    been fixed before and how.
+
+    AGENT NOTE: This is your "time machine" for debugging. Use it when:
+    - You encounter an error message
+    - A test is failing
+    - You see unexpected behavior
+    - You want to know "why was this changed?"
+
+    Example queries:
+    - "RecursionError in parser"
+    - "Fix deadlock in database pool"
+    - "Handle connection timeout"
+
+    Args:
+        query: Error message, bug description, or commit message search term
+        project_id: The project to search
+        file_filter: Optional file path filter (e.g., "parser.py")
+        limit: Maximum number of commits to return (default: 5)
+
+    Returns:
+        Dictionary with:
+        - query: The search query
+        - related_commits: List of matching commits with:
+          - hash: Commit SHA
+          - author: Commit author
+          - timestamp: Unix timestamp
+          - message: Commit message
+          - tags: Auto-extracted tags (fix, refactor, etc.)
+          - diffs: Preview of code changes (up to 5 diffs per commit)
+        - total_commits: Number of matching commits found
+    """
+    await dbmod.init_db(cfg.db_path)
+
+    try:
+        ProjectID(project_id)
+    except ValueError as e:
+        return {"error": str(e)}
+
+    proj = await dbmod.get_project(cfg.db_path, project_id)
+    if not proj:
+        return {"error": f"Project not found: {project_id}"}
+
+    if not query or not query.strip():
+        return {"error": "Query cannot be empty"}
+
+    # Check if history has been indexed
+    commit_count = await dbmod.count_git_commits(cfg.db_path, project_id=project_id)
+    if commit_count == 0:
+        return {
+            "error": (
+                "No git history indexed for this project. "
+                "Run index_git_history first to enable temporal search."
+            ),
+            "hint": f"Call: index_git_history(project_id='{project_id}')",
+        }
+
+    start = time.time()
+
+    try:
+        result = await search_engine.search_history(
+            project_id=project_id,
+            query=query.strip(),
+            file_filter=file_filter,
+            limit=int(limit),
+        )
+
+        logging.info(
+            "search_history",
+            extra={
+                "project_id": project_id,
+                "operation": "search_history",
+                "duration_ms": int((time.time() - start) * 1000),
+                "result_count": result.get("total_commits", 0),
+            },
+        )
+
+        return result
+    except Exception as exc:
+        logging.error("search_history failed", exc_info=True)
+        return {"error": f"Failed to search history: {exc}"}
+
+
 def main() -> None:
     mcp.run()
 
