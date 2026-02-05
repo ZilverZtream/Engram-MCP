@@ -108,6 +108,7 @@ def rrf_combine(bm25_results: List[Dict[str, Any]], vec_results: List[Dict[str, 
     all_ids: List[str] = []
     all_results: Dict[str, Dict[str, Any]] = {}
     insight_bonus = 0.002
+    memory_bank_boost = 0.05  # ~25x stronger than insight bonus
 
     for rank, r in enumerate(bm25_results, 1):
         cid = r["id"]
@@ -127,11 +128,16 @@ def rrf_combine(bm25_results: List[Dict[str, Any]], vec_results: List[Dict[str, 
     bm25_idx = np.asarray([id_to_index[r["id"]] for r in bm25_results], dtype=np.int64)
     vec_idx = np.asarray([id_to_index[r["id"]] for r in vec_results], dtype=np.int64)
     scores = _rrf_scores_impl(bm25_idx, vec_idx, k)
-    if insight_bonus:
-        for cid, idx in id_to_index.items():
-            metadata = all_results[cid].get("metadata") or {}
-            if metadata.get("type") == "insight":
-                scores[int(idx)] += insight_bonus
+
+    # Apply bonuses based on chunk type
+    for cid, idx in id_to_index.items():
+        metadata = all_results[cid].get("metadata") or {}
+        chunk_type = metadata.get("type")
+        if chunk_type == "memory_bank":
+            scores[int(idx)] += memory_bank_boost
+        elif chunk_type == "insight" and insight_bonus:
+            scores[int(idx)] += insight_bonus
+
     order = np.argsort(-scores)
 
     combined = []
