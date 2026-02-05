@@ -164,6 +164,9 @@ vector_backend: auto   # auto | fts | faiss_cpu | faiss_gpu
 enable_numba: false    # opt-in JIT kernels
 search_cache_ttl_s: 300
 search_cache_max_items: 512
+enable_dreaming: false
+dream_model_name: gpt-4o-mini
+dream_threshold: 0.8
 ```
 
 On startup, Engram logs:
