@@ -165,6 +165,8 @@ class AllowedConfig(BaseModel):
     @classmethod
     def validate_overlap(cls, value: int, info):  # type: ignore[override]
         chunk_size = info.data.get("chunk_size_tokens", 200)
+        if int(value) < 0:
+            raise ValueError("overlap_tokens must be greater than or equal to 0")
         if int(value) >= int(chunk_size):
             raise ValueError("overlap_tokens must be less than chunk_size_tokens")
         return value
