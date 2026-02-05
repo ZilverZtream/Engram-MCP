@@ -1,3 +1,6 @@
+<div align="center">
+  <img src="engram_mcp_logo.png" alt="Engram Logo" width="640" height="320">
+</div>
 # Engram MCP
 
 <p align="center">
