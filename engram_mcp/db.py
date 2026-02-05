@@ -1087,6 +1087,122 @@ async def upsert_graph_edges(
         await db.commit()
 
 
+async def delete_graph_nodes_for_files(
+    db_path: str,
+    *,
+    project_id: str,
+    file_paths: List[str],
+) -> None:
+    """Remove all graph nodes that belong to the given files.
+
+    Called before re-parsing changed files so that stale nodes (e.g. a
+    renamed function) do not linger.  Deleted files' nodes are cleaned up
+    by the same call.
+    """
+    if not file_paths:
+        return
+    batch_size = 900
+    async with get_connection(db_path) as db:
+        for i in range(0, len(file_paths), batch_size):
+            batch = file_paths[i : i + batch_size]
+            query = build_in_query(
+                "DELETE FROM graph_nodes WHERE project_id = ? AND file_path IN ",
+                batch,
+            )
+            await db.execute(query.text, (project_id, *query.params))
+        await db.commit()
+
+
+async def query_graph_nodes(
+    db_path: str,
+    *,
+    project_id: str,
+    node_type: Optional[str] = None,
+    name_pattern: Optional[str] = None,
+    file_path: Optional[str] = None,
+    limit: int = 100,
+) -> List[Dict[str, Any]]:
+    """Query graph_nodes with optional filters.
+
+    *name_pattern* is a SQL LIKE pattern (e.g. ``%parse%``).
+    """
+    clauses = ["project_id = ?"]
+    params: List[Any] = [project_id]
+    if node_type:
+        clauses.append("node_type = ?")
+        params.append(node_type)
+    if name_pattern:
+        clauses.append("name LIKE ?")
+        params.append(name_pattern)
+    if file_path:
+        clauses.append("file_path = ?")
+        params.append(file_path)
+    params.append(int(limit))
+    where = " AND ".join(clauses)
+    async with get_connection(db_path) as db:
+        db.row_factory = aiosqlite.Row
+        rows = await db.execute_fetchall(
+            f"""
+            SELECT node_id, node_type, name, file_path, start_line, end_line, metadata
+            FROM graph_nodes
+            WHERE {where}
+            ORDER BY file_path, start_line
+            LIMIT ?
+            """,
+            tuple(params),
+        )
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        out.append(
+            {
+                "node_id": r["node_id"],
+                "node_type": r["node_type"],
+                "name": r["name"],
+                "file_path": r["file_path"],
+                "start_line": int(r["start_line"]),
+                "end_line": int(r["end_line"]),
+                "metadata": _safe_load_metadata(r["metadata"], context=f"graph_node:{r['node_id']}"),
+            }
+        )
+    return out
+
+
+async def fetch_graph_edges(
+    db_path: str,
+    *,
+    project_id: str,
+    node_id: str,
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Return edges where *node_id* is the source or the target.
+
+    The result dict has two keys:
+      ``outgoing`` – edges where *node_id* is the source (calls, contains …)
+      ``incoming`` – edges where *node_id* is the target (called_by …)
+    """
+    async with get_connection(db_path) as db:
+        db.row_factory = aiosqlite.Row
+        out_rows = await db.execute_fetchall(
+            """
+            SELECT target_id, edge_type
+            FROM graph_edges
+            WHERE project_id = ? AND source_id = ?
+            """,
+            (project_id, node_id),
+        )
+        in_rows = await db.execute_fetchall(
+            """
+            SELECT source_id, edge_type
+            FROM graph_edges
+            WHERE project_id = ? AND target_id = ?
+            """,
+            (project_id, node_id),
+        )
+    return {
+        "outgoing": [{"target_id": r["target_id"], "edge_type": r["edge_type"]} for r in out_rows],
+        "incoming": [{"source_id": r["source_id"], "edge_type": r["edge_type"]} for r in in_rows],
+    }
+
+
 async def delete_chunks(db_path: str, project_id: str, chunk_ids: List[str]) -> None:
     if not chunk_ids:
         return
