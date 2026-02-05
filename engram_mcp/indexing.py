@@ -37,6 +37,7 @@ _PERSIST_BATCH_SIZE = 100
 # Upper bound on file-parsing / embedding concurrency.  On high-core-count
 # servers (64 cores) defaulting to cpu_count causes massive I/O contention.
 _CONCURRENCY_CAP = 8
+MAX_TRAINING_VECTORS = 100_000
 
 
 def _capped_concurrency() -> int:
@@ -1860,9 +1861,20 @@ class Indexer:
         else:
             index: Optional[Any] = None
             training_vectors: List[np.ndarray] = []
+            training_vector_count = 0
             pending_vectors: List[np.ndarray] = []
             pending_ids: List[np.ndarray] = []
             last_internal_id = -1
+
+            def _append_training(vecs: np.ndarray) -> None:
+                nonlocal training_vector_count
+                remaining = MAX_TRAINING_VECTORS - training_vector_count
+                if remaining <= 0:
+                    return
+                if vecs.shape[0] > remaining:
+                    vecs = vecs[:remaining]
+                training_vectors.append(vecs)
+                training_vector_count += int(vecs.shape[0])
 
             while True:
                 batch = await dbmod.fetch_chunk_batch(
@@ -1880,16 +1892,17 @@ class Indexer:
                 )
                 ids = np.asarray([r["internal_id"] for r in batch], dtype=np.int64)
                 if index is None:
-                    training_vectors.append(vectors)
+                    _append_training(vectors)
                     pending_vectors.append(vectors)
                     pending_ids.append(ids)
-                    if sum(v.shape[0] for v in training_vectors) >= train_target:
+                    if training_vector_count >= train_target:
                         train_vecs = np.vstack(training_vectors)
                         total = total_vectors or sum(v.shape[0] for v in pending_vectors)
                         index = await self._build_faiss_index(train_vecs, total_vectors=total)
                         for vecs, ids_arr in zip(pending_vectors, pending_ids):
                             await self._add_vectors(index, vecs, ids_arr)
                         training_vectors.clear()
+                        training_vector_count = 0
                         pending_vectors.clear()
                         pending_ids.clear()
                 else:
