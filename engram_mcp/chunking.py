@@ -91,6 +91,21 @@ def token_count(text: str) -> int:
     return len(tokenizer.encode(text).tokens)
 
 
+def truncate_text_to_tokens(text: str, max_tokens: int) -> str:
+    if not text:
+        return ""
+    max_tokens = max(0, int(max_tokens))
+    if max_tokens <= 0:
+        return ""
+    offsets = _get_offsets(text)
+    if not offsets:
+        return ""
+    if len(offsets) <= max_tokens:
+        return text
+    end_offset = offsets[max_tokens - 1][1]
+    return text[:end_offset].strip()
+
+
 def make_chunk_id(*parts: str) -> str:
     h = hashlib.sha256()
     for p in parts:

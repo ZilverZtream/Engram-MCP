@@ -362,41 +362,61 @@ async def _run_dream_cycle(project_id: str, *, max_pairs: int = 10) -> str:
     )
     chunk_map = {str(row["id"]): row for row in chunk_rows}
 
+    worker_count = max(1, min(4, os.cpu_count() or 4))
     generation = GenerationService(
         prefer_thread_for_cuda=cfg.prefer_thread_for_cuda,
-        worker_count=1,
+        worker_count=worker_count,
     )
     insights: List[chunking.Chunk] = []
+    semaphore = asyncio.Semaphore(worker_count)
+    max_context_window = max(256, int(os.getenv("ENGRAM_DREAM_CONTEXT_WINDOW", "2048")))
+    per_context_budget = max(64, int(max_context_window * 0.75) // 2)
     try:
-        for first, second, _count in candidates:
+        async def _generate_single_insight(candidate: tuple[str, str, int]) -> Optional[chunking.Chunk]:
+            first, second, _count = candidate
             cid_a, cid_b = str(first), str(second)
             row_a = chunk_map.get(cid_a)
             row_b = chunk_map.get(cid_b)
             if not row_a or not row_b:
-                continue
+                return None
             context_a = row_a.get("content") or ""
             context_b = row_b.get("content") or ""
             if not context_a.strip() or not context_b.strip():
-                continue
-            insight = await generation.generate_insight(
-                context_a,
-                context_b,
-                model_name=cfg.dream_model_name,
-                device=_device(),
-            )
+                return None
+            context_a = chunking.truncate_text_to_tokens(context_a, per_context_budget)
+            context_b = chunking.truncate_text_to_tokens(context_b, per_context_budget)
+            if not context_a.strip() or not context_b.strip():
+                return None
+            async with semaphore:
+                insight = await generation.generate_insight(
+                    context_a,
+                    context_b,
+                    model_name=cfg.dream_model_name,
+                    device=_device(),
+                )
             insight = (insight or "").strip()
-            if not insight:
-                continue
+            if not insight or "NO_INSIGHT" in insight.upper():
+                return None
             sorted_ids = sorted([cid_a, cid_b])
             insight_id = chunking.make_chunk_id("insight", project_id, *sorted_ids)
-            insights.append(
-                chunking.Chunk(
-                    insight_id,
-                    insight,
-                    chunking.token_count(insight),
-                    {"type": "insight", "source_chunks": sorted_ids},
-                )
+            return chunking.Chunk(
+                insight_id,
+                insight,
+                chunking.token_count(insight),
+                {"type": "insight", "source_chunks": sorted_ids},
             )
+
+        results = await asyncio.gather(
+            *[_generate_single_insight(candidate) for candidate in candidates],
+            return_exceptions=True,
+        )
+        for result in results:
+            if isinstance(result, Exception):
+                logging.warning("Dream insight generation failed: %s", result)
+                continue
+            if result is None:
+                continue
+            insights.append(result)
     finally:
         await generation.close()
 
@@ -445,7 +465,7 @@ async def _maybe_auto_trigger_dream(project_id: str) -> None:
 
 
 @mcp.tool
-async def dream_project(project_id: str, wait: bool = True, max_pairs: int = 10) -> str:
+async def dream_project(project_id: str, wait: bool = False, max_pairs: int = 10) -> str:
     """Generate insight chunks from recent search co-occurrences."""
     if not cfg.enable_dreaming:
         return "❌ Dreaming is disabled in the configuration."

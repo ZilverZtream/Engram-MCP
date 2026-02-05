@@ -20,6 +20,7 @@ Context B:
 
 Task:
 Write a single, concise insight that links the two contexts. Be specific and avoid repetition.
+If the snippets are unrelated or the connection is trivial, respond with ONLY "NO_INSIGHT".
 
 Insight:
 """
@@ -31,19 +32,26 @@ Insight:
 _WORKER_MODEL: Any = None
 _WORKER_TOKENIZER: Any = None
 _WORKER_DEVICE: Optional[str] = None
+_WORKER_INIT_ERROR: Optional[str] = None
 
 
 def _worker_init(model_name: str, device: str) -> None:
-    global _WORKER_MODEL, _WORKER_TOKENIZER, _WORKER_DEVICE
+    global _WORKER_MODEL, _WORKER_TOKENIZER, _WORKER_DEVICE, _WORKER_INIT_ERROR
     _WORKER_DEVICE = device
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    _WORKER_TOKENIZER = AutoTokenizer.from_pretrained(model_name)
-    _WORKER_MODEL = AutoModelForCausalLM.from_pretrained(model_name)
-    if device.startswith("cuda"):
-        _WORKER_MODEL.to(device)
-    _WORKER_MODEL.eval()
+    try:
+        _WORKER_TOKENIZER = AutoTokenizer.from_pretrained(model_name)
+        _WORKER_MODEL = AutoModelForCausalLM.from_pretrained(model_name)
+        if device.startswith("cuda"):
+            _WORKER_MODEL.to(device)
+        _WORKER_MODEL.eval()
+    except Exception as exc:
+        _WORKER_MODEL = None
+        _WORKER_TOKENIZER = None
+        _WORKER_INIT_ERROR = f"{type(exc).__name__}: {exc}"
+        raise
 
 
 def _generate_worker(
@@ -53,6 +61,8 @@ def _generate_worker(
     temperature: float,
     top_p: float,
 ) -> str:
+    if _WORKER_INIT_ERROR:
+        raise RuntimeError(f"Generation worker failed to initialize: {_WORKER_INIT_ERROR}")
     if _WORKER_MODEL is None or _WORKER_TOKENIZER is None:
         raise RuntimeError("Generation worker not initialized")
 

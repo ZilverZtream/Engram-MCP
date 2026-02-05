@@ -27,6 +27,7 @@ async def identify_candidates(project_id: str) -> List[Tuple[str, str, int]]:
             FROM search_sessions
             WHERE project_id = ?
             ORDER BY created_at DESC
+            LIMIT 500
             """,
             (project_id,),
         )
@@ -81,7 +82,11 @@ async def identify_candidates(project_id: str) -> List[Tuple[str, str, int]]:
                 chunk_to_file.setdefault(str(chunk_id), str(file_path))
 
         insight_rows = await db.execute_fetchall(
-            "SELECT metadata FROM chunks WHERE project_id = ?",
+            """
+            SELECT metadata
+            FROM chunks
+            WHERE project_id = ? AND metadata LIKE '%"type": "insight"%'
+            """,
             (project_id,),
         )
 
