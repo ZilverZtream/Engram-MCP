@@ -52,18 +52,6 @@ from . import db as dbmod
 # Per-file parse timeout in seconds.
 _PARSE_TIMEOUT_S = 30
 
-# Shared executor for file-parsing tasks.  Sized at 3 × the concurrency cap
-# so that a burst of timed-out-but-still-running threads (CPython cannot
-# forcibly terminate threads) does not starve new submissions.
-# _bounded_gather limits active parse coroutines to _CONCURRENCY_CAP, so at
-# most that many threads are *actively used* at any instant; the extra
-# headroom absorbs threads that are draining after their timeout expired.
-_PARSE_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
-    max_workers=_CONCURRENCY_CAP * 3,
-    thread_name_prefix="engram-parse",
-)
-
-
 class _CancellationToken:
     """Lightweight signal shared between the async caller and the worker thread.
 
@@ -96,15 +84,71 @@ class _ParseTimeout(Exception):
     """Raised when a parse task exceeds its wall-clock budget."""
 
 
-def _cancellable_wrapper(token: _CancellationToken, fn, *args):
-    """Execute *fn* and raise _ParseTimeout if the token was cancelled before fn returned."""
+class _ResizableParsePool:
+    """Thread-pool that survives thread-leak exhaustion from timed-out parses.
+
+    CPython cannot forcibly terminate a blocked thread.  When a parse task
+    times out the thread remains alive, occupying a slot in the pool.  A
+    long-running sequence of malformed files could exhaust all
+    ``max_workers`` slots, stalling every future submission.
+
+    This wrapper tracks the number of *leaked* threads (those whose
+    cancellation token was signalled but which have not yet returned).
+    When the leaked count reaches ``_leak_ceiling`` — the point at which
+    the pool has no usable capacity — the current pool is *abandoned*
+    (``shutdown(wait=False)``; leaked threads continue to run but will exit
+    on their own or at process exit) and replaced with a fresh pool of
+    ``max_workers`` threads.  New submissions always land on a pool with
+    available capacity.
+    """
+
+    def __init__(self, max_workers: int) -> None:
+        self._max_workers = max_workers
+        # Ceiling at which a fresh pool is created.  Leave at least
+        # _CONCURRENCY_CAP slots free so that the next batch of real work
+        # never blocks on pool capacity.
+        self._leak_ceiling = max(1, max_workers - _CONCURRENCY_CAP)
+        self._leaked: int = 0
+        self._lock = _threading.Lock()
+        self._pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=max_workers,
+            thread_name_prefix="engram-parse",
+        )
+
+    def _on_leaked(self) -> None:
+        """Called from the wrapper when a thread discovers it was cancelled."""
+        with self._lock:
+            self._leaked += 1
+            if self._leaked >= self._leak_ceiling:
+                logging.warning(
+                    "Parse pool leak ceiling hit (%d/%d leaked threads); "
+                    "replacing pool to prevent stall.",
+                    self._leaked,
+                    self._max_workers,
+                )
+                self._pool.shutdown(wait=False, cancel_futures=False)
+                self._pool = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=self._max_workers,
+                    thread_name_prefix="engram-parse",
+                )
+                self._leaked = 0
+
+    @property
+    def pool(self) -> concurrent.futures.ThreadPoolExecutor:
+        return self._pool
+
+
+_PARSE_POOL = _ResizableParsePool(max_workers=_CONCURRENCY_CAP * 3)
+
+
+def _cancellable_wrapper(pool_ref: _ResizableParsePool, token: _CancellationToken, fn, *args):
+    """Execute *fn* and handle post-timeout accounting on the pool."""
     result = fn(*args)
     if token.is_cancelled():
-        # The async side has already timed out and raised; discard the result
-        # and log so operators can track how long the leaked thread ran.
         logging.warning(
             "Parse thread completed after its timeout was already raised; result discarded."
         )
+        pool_ref._on_leaked()
         raise _ParseTimeout("discarded: token cancelled before return")
     return result
 
@@ -116,16 +160,22 @@ async def _run_in_thread_with_timeout(fn, *args, timeout: float = _PARSE_TIMEOUT
     worker thread.  On timeout the token is cancelled so the thread can
     detect — after *fn* returns naturally — that its result is no longer
     needed.  CPython provides no portable mechanism to kill a running
-    thread, so truly stuck work (e.g. an infinite loop inside a C
-    extension) persists until process exit; the shared pool is bounded at
-    ``_CONCURRENCY_CAP * 3`` workers, capping the total number of leaked
-    threads regardless of input size.
+    thread; leaked threads are tracked by ``_ResizableParsePool`` and the
+    pool is replaced transparently when the leak ceiling is reached, so
+    new submissions are never starved regardless of input.
     """
     loop = asyncio.get_running_loop()
     token = _CancellationToken()
     try:
         return await asyncio.wait_for(
-            loop.run_in_executor(_PARSE_EXECUTOR, _cancellable_wrapper, token, fn, *args),
+            loop.run_in_executor(
+                _PARSE_POOL.pool,
+                _cancellable_wrapper,
+                _PARSE_POOL,
+                token,
+                fn,
+                *args,
+            ),
             timeout=timeout,
         )
     except asyncio.TimeoutError:

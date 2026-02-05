@@ -132,7 +132,23 @@ def _schedule_startup_tasks() -> None:
     except RuntimeError:
         asyncio.run(_startup_tasks())
         return
-    loop.create_task(_startup_tasks())
+
+    task = loop.create_task(_startup_tasks())
+
+    def _on_startup_done(t: "asyncio.Task[None]") -> None:
+        exc = t.exception()
+        if exc is None:
+            return
+        # Log with full traceback so the operator sees *why* startup failed,
+        # then stop the loop so the process does not linger in a half-
+        # initialised "zombie" state where all tool calls fail.
+        logging.critical(
+            "Startup tasks failed; the server cannot serve requests.",
+            exc_info=exc,
+        )
+        loop.stop()
+
+    task.add_done_callback(_on_startup_done)
 
 
 _schedule_startup_tasks()
