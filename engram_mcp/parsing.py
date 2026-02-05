@@ -131,53 +131,53 @@ def parse_file_to_chunks(
             raise ValueError(f"PDF file too large: {path} ({size} bytes)")
 
         max_text_chars = max_bytes * 4
-        with ExitStack() as stack:
-            handle = stack.enter_context(path_context.open_file(path, "rb"))
-            reader = PdfReader(handle)
         chunks: List[Chunk] = []
         base_id = make_chunk_id(str(path))
         total_chars = 0
-        for i, page in enumerate(reader.pages):
-            page_text = page.extract_text() or ""
-            page_len = len(page_text)
-            if total_chars + page_len > max_text_chars:
-                raise ValueError(f"PDF extracted text too large: {path}")
-            total_chars += page_len
-            if not page_text.strip():
-                continue
-            page_meta = {**base_meta, "type": "pdf_page", "page": i + 1}
-            # Keep pages as their own units, then chunk if needed
-            if token_count(page_text) <= chunk_size_tokens * 2:
-                cid = make_chunk_id(base_id, f"page:{i+1}", page_text)
-                chunks.append(Chunk(cid, page_text, token_count(page_text), page_meta))
-            else:
-                chunks.extend(
-                    chunk_text(
-                        text=page_text,
-                        base_id=make_chunk_id(base_id, f"page:{i+1}"),
-                        meta=page_meta,
-                        target_tokens=chunk_size_tokens,
-                        overlap_tokens=overlap_tokens,
+        with ExitStack() as stack:
+            handle = stack.enter_context(path_context.open_file(path, "rb"))
+            reader = PdfReader(handle)
+            for i, page in enumerate(reader.pages):
+                page_text = page.extract_text() or ""
+                page_len = len(page_text)
+                if total_chars + page_len > max_text_chars:
+                    raise ValueError(f"PDF extracted text too large: {path}")
+                total_chars += page_len
+                if not page_text.strip():
+                    continue
+                page_meta = {**base_meta, "type": "pdf_page", "page": i + 1}
+                # Keep pages as their own units, then chunk if needed
+                if token_count(page_text) <= chunk_size_tokens * 2:
+                    cid = make_chunk_id(base_id, f"page:{i+1}", page_text)
+                    chunks.append(Chunk(cid, page_text, token_count(page_text), page_meta))
+                else:
+                    chunks.extend(
+                        chunk_text(
+                            text=page_text,
+                            base_id=make_chunk_id(base_id, f"page:{i+1}"),
+                            meta=page_meta,
+                            target_tokens=chunk_size_tokens,
+                            overlap_tokens=overlap_tokens,
+                        )
                     )
-                )
         return chunks
 
     if ext == ".docx":
         from docx import Document
 
         max_text_chars = max_bytes * 4
+        paras: List[str] = []
+        total_chars = 0
         with ExitStack() as stack:
             handle = stack.enter_context(path_context.open_file(path, "rb"))
             doc = Document(handle)
-        paras: List[str] = []
-        total_chars = 0
-        for p in doc.paragraphs:
-            if not p.text or not p.text.strip():
-                continue
-            total_chars += len(p.text)
-            if total_chars > max_text_chars:
-                raise ValueError(f"DOCX extracted text too large: {path}")
-            paras.append(p.text)
+            for p in doc.paragraphs:
+                if not p.text or not p.text.strip():
+                    continue
+                total_chars += len(p.text)
+                if total_chars > max_text_chars:
+                    raise ValueError(f"DOCX extracted text too large: {path}")
+                paras.append(p.text)
         text = "\n".join(paras)
         base_id = make_chunk_id(str(path))
         return chunk_text(
@@ -351,5 +351,4 @@ class ParsedFile:
     size_bytes: int
     content_hash: str
     chunks: List[Chunk]
-
 
