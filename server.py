@@ -56,6 +56,11 @@ embedding_service = EmbeddingService(
 jobs = JobManager(cfg.db_path)
 indexer = Indexer(cfg, embedding_service, project_path_context, index_path_context)
 
+_AUTO_DREAM_SEARCH_INTERVAL = 25
+_AUTO_DREAM_MIN_INTERVAL_S = 300.0
+_auto_dream_state: Dict[str, Dict[str, float]] = {}
+_auto_dream_lock = asyncio.Lock()
+
 
 def _faiss_gpu_available() -> bool:
     if not is_faiss_available():
@@ -336,93 +341,147 @@ async def update_project(project_id: str, wait: bool = True) -> str:
         return f"🛑 Update job cancelled: {job.job_id}"
 
 
+async def _run_dream_cycle(project_id: str, *, max_pairs: int = 10) -> str:
+    candidates = await identify_candidates(project_id)
+    if not candidates:
+        return "ℹ️ No dream candidates found."
+    max_pairs_int = max(1, int(max_pairs))
+    candidates = candidates[:max_pairs_int]
+
+    unique_ids: List[str] = []
+    seen_ids: set[str] = set()
+    for first, second, _count in candidates:
+        for cid in (str(first), str(second)):
+            if cid in seen_ids:
+                continue
+            seen_ids.add(cid)
+            unique_ids.append(cid)
+
+    chunk_rows = await dbmod.fetch_chunks_by_ids(
+        cfg.db_path, project_id=project_id, chunk_ids=unique_ids
+    )
+    chunk_map = {str(row["id"]): row for row in chunk_rows}
+
+    generation = GenerationService(
+        prefer_thread_for_cuda=cfg.prefer_thread_for_cuda,
+        worker_count=1,
+    )
+    insights: List[chunking.Chunk] = []
+    try:
+        for first, second, _count in candidates:
+            cid_a, cid_b = str(first), str(second)
+            row_a = chunk_map.get(cid_a)
+            row_b = chunk_map.get(cid_b)
+            if not row_a or not row_b:
+                continue
+            context_a = row_a.get("content") or ""
+            context_b = row_b.get("content") or ""
+            if not context_a.strip() or not context_b.strip():
+                continue
+            insight = await generation.generate_insight(
+                context_a,
+                context_b,
+                model_name=cfg.dream_model_name,
+                device=_device(),
+            )
+            insight = (insight or "").strip()
+            if not insight:
+                continue
+            sorted_ids = sorted([cid_a, cid_b])
+            insight_id = chunking.make_chunk_id("insight", project_id, *sorted_ids)
+            insights.append(
+                chunking.Chunk(
+                    insight_id,
+                    insight,
+                    chunking.token_count(insight),
+                    {"type": "insight", "source_chunks": sorted_ids},
+                )
+            )
+    finally:
+        await generation.close()
+
+    if not insights:
+        return "ℹ️ No insights generated."
+
+    vfs_path = "vfs://insights/dream_cycle.md"
+    added = await indexer.add_virtual_file_chunks(
+        project_id=project_id,
+        file_path=vfs_path,
+        chunks=insights,
+    )
+    return f"✅ Dreamed {added} insights from {len(candidates)} pairs."
+
+
+async def _maybe_auto_trigger_dream(project_id: str) -> None:
+    if not cfg.enable_dreaming:
+        return
+    now = time.time()
+    async with _auto_dream_lock:
+        state = _auto_dream_state.setdefault(project_id, {"count": 0.0, "last": 0.0})
+        state["count"] += 1.0
+        if state["count"] < _AUTO_DREAM_SEARCH_INTERVAL:
+            return
+        if now - state["last"] < _AUTO_DREAM_MIN_INTERVAL_S:
+            return
+        state["count"] = 0.0
+        state["last"] = now
+    try:
+        ProjectID(project_id)
+    except ValueError:
+        return
+    await dbmod.init_db(cfg.db_path)
+    proj = await dbmod.get_project(cfg.db_path, project_id)
+    if not proj:
+        return
+    job = await jobs.create("dream", _run_dream_cycle(project_id))
+    logging.info(
+        "auto_dream_triggered",
+        extra={
+            "project_id": project_id,
+            "job_id": job.job_id,
+            "interval": _AUTO_DREAM_SEARCH_INTERVAL,
+        },
+    )
+
+
 @mcp.tool
 async def dream_project(project_id: str, wait: bool = True, max_pairs: int = 10) -> str:
     """Generate insight chunks from recent search co-occurrences."""
     if not cfg.enable_dreaming:
         return "❌ Dreaming is disabled in the configuration."
+    try:
+        ProjectID(project_id)
+    except ValueError as e:
+        return f"❌ {e}"
     await dbmod.init_db(cfg.db_path)
     proj = await dbmod.get_project(cfg.db_path, project_id)
     if not proj:
         return f"❌ Project not found: {project_id}"
 
-    async def _run() -> str:
-        candidates = await identify_candidates(project_id)
-        if not candidates:
-            return "ℹ️ No dream candidates found."
-        max_pairs_int = max(1, int(max_pairs))
-        candidates = candidates[:max_pairs_int]
-
-        unique_ids: List[str] = []
-        seen_ids: set[str] = set()
-        for first, second, _count in candidates:
-            for cid in (str(first), str(second)):
-                if cid in seen_ids:
-                    continue
-                seen_ids.add(cid)
-                unique_ids.append(cid)
-
-        chunk_rows = await dbmod.fetch_chunks_by_ids(
-            cfg.db_path, project_id=project_id, chunk_ids=unique_ids
-        )
-        chunk_map = {str(row["id"]): row for row in chunk_rows}
-
-        generation = GenerationService(
-            prefer_thread_for_cuda=cfg.prefer_thread_for_cuda,
-            worker_count=1,
-        )
-        insights: List[chunking.Chunk] = []
-        try:
-            for first, second, _count in candidates:
-                cid_a, cid_b = str(first), str(second)
-                row_a = chunk_map.get(cid_a)
-                row_b = chunk_map.get(cid_b)
-                if not row_a or not row_b:
-                    continue
-                context_a = row_a.get("content") or ""
-                context_b = row_b.get("content") or ""
-                if not context_a.strip() or not context_b.strip():
-                    continue
-                insight = await generation.generate_insight(
-                    context_a,
-                    context_b,
-                    model_name=cfg.dream_model_name,
-                    device=_device(),
-                )
-                insight = (insight or "").strip()
-                if not insight:
-                    continue
-                sorted_ids = sorted([cid_a, cid_b])
-                insight_id = chunking.make_chunk_id("insight", project_id, *sorted_ids)
-                insights.append(
-                    chunking.Chunk(
-                        insight_id,
-                        insight,
-                        chunking.token_count(insight),
-                        {"type": "insight", "source_chunks": sorted_ids},
-                    )
-                )
-        finally:
-            await generation.close()
-
-        if not insights:
-            return "ℹ️ No insights generated."
-
-        vfs_path = "vfs://insights/dream_cycle.md"
-        added = await indexer.add_virtual_file_chunks(
-            project_id=project_id,
-            file_path=vfs_path,
-            chunks=insights,
-        )
-        return f"✅ Dreamed {added} insights from {len(candidates)} pairs."
-
-    job = await jobs.create("dream", _run())
+    job = await jobs.create("dream", _run_dream_cycle(project_id, max_pairs=max_pairs))
     try:
         if not wait:
             return f"🆔 Dream job queued: {job.job_id}"
         return await job.task
     except asyncio.CancelledError:
         return f"🛑 Dream job cancelled: {job.job_id}"
+
+
+@mcp.tool
+async def trigger_rem_cycle(project_id: str) -> str:
+    """Enqueue a REM-style dream cycle for a project."""
+    if not cfg.enable_dreaming:
+        return "❌ Dreaming is disabled in the configuration."
+    try:
+        ProjectID(project_id)
+    except ValueError as e:
+        return f"❌ {e}"
+    await dbmod.init_db(cfg.db_path)
+    proj = await dbmod.get_project(cfg.db_path, project_id)
+    if not proj:
+        return f"❌ Project not found: {project_id}"
+    job = await jobs.create("dream", _run_dream_cycle(project_id))
+    return f"🆔 Dream job queued: {job.job_id}"
 
 
 @mcp.tool
@@ -502,6 +561,10 @@ async def search_memory(
             "result_count": len(results),
         },
     )
+    try:
+        await _maybe_auto_trigger_dream(project_id)
+    except Exception:
+        logging.warning("Auto dream trigger failed", exc_info=True)
 
     # Compact response (clients can format)
     def _trim_content(text: str) -> str:
