@@ -70,6 +70,11 @@ class EngramConfig:
     model_name_text: str = "paraphrase-multilingual-MiniLM-L12-v2"
     model_name_code: str = "all-MiniLM-L6-v2"
 
+    # Dreaming
+    enable_dreaming: bool = False
+    dream_model_name: str = "gpt-4o-mini"
+    dream_threshold: float = 0.8
+
     # Optional: keep GPU embeddings in-process (recommended)
     prefer_thread_for_cuda: bool = True
 
@@ -131,6 +136,12 @@ class AllowedConfig(BaseModel):
     # Embeddings
     model_name_text: str = "paraphrase-multilingual-MiniLM-L12-v2"
     model_name_code: str = "all-MiniLM-L6-v2"
+
+    # Dreaming
+    enable_dreaming: bool = False
+    dream_model_name: str = "gpt-4o-mini"
+    dream_threshold: float = 0.8
+
     prefer_thread_for_cuda: bool = True
 
     # FAISS IVF+PQ settings
