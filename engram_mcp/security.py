@@ -170,15 +170,14 @@ class PathContext:
         resolved = self.resolve_path(path)
         os.makedirs(resolved, exist_ok=exist_ok)
 
-    def create_temp_file(self, *, dir_path: str | Path, suffix: str) -> str:
+    def create_temp_file(self, *, dir_path: str | Path, suffix: str) -> tuple[int, str]:
         resolved_dir = self.resolve_path(dir_path)
         fd, temp_path = tempfile.mkstemp(dir=resolved_dir, suffix=suffix)
-        os.close(fd)
         try:
             os.chmod(temp_path, 0o600)
         except OSError:
             logging.debug("Failed to chmod temp file %s", temp_path, exc_info=True)
-        return temp_path
+        return fd, temp_path
 
     def chmod(self, path: str | Path, mode: int) -> None:
         resolved = self.resolve_path(path)
@@ -191,9 +190,9 @@ class PathContext:
     def write_bytes_atomic(self, path: str | Path, data: bytes) -> None:
         resolved = self.resolve_path(path)
         dir_path = resolved.parent
-        temp_path = self.create_temp_file(dir_path=dir_path, suffix=".tmp")
+        fd, temp_path = self.create_temp_file(dir_path=dir_path, suffix=".tmp")
         try:
-            with open(temp_path, "wb") as handle:
+            with os.fdopen(fd, "wb") as handle:
                 handle.write(data)
             try:
                 os.chmod(temp_path, 0o600)
