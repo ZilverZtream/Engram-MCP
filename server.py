@@ -56,6 +56,38 @@ embedding_service = EmbeddingService(
     openai_api_key=cfg.openai_api_key.get_secret_value(),
     openai_embedding_model=cfg.openai_embedding_model,
 )
+# Global generation service (lazy-loaded to avoid claiming VRAM until needed)
+_generation_service: Optional[GenerationService] = None
+_generation_service_lock = asyncio.Lock()
+# Shared GPU semaphore for low-VRAM environments (prevents embedding & generation from running concurrently)
+_gpu_semaphore: Optional[asyncio.Semaphore] = None
+
+
+def _get_gpu_semaphore() -> Optional[asyncio.Semaphore]:
+    """Get the shared GPU semaphore if low_vram_mode is enabled."""
+    global _gpu_semaphore
+    if cfg.low_vram_mode:
+        if _gpu_semaphore is None:
+            # Only allow 1 GPU operation at a time in low-VRAM mode
+            _gpu_semaphore = asyncio.Semaphore(1)
+        return _gpu_semaphore
+    return None
+
+
+async def get_generation_service() -> GenerationService:
+    """Get or create the global generation service instance."""
+    global _generation_service
+    async with _generation_service_lock:
+        if _generation_service is None:
+            worker_count = max(1, min(4, os.cpu_count() or 4))
+            _generation_service = GenerationService(
+                prefer_thread_for_cuda=cfg.prefer_thread_for_cuda,
+                worker_count=worker_count,
+                gpu_semaphore=_get_gpu_semaphore(),
+            )
+        return _generation_service
+
+
 jobs = JobManager(cfg.db_path, max_queue_per_key=cfg.max_jobs_per_project)
 indexer = Indexer(cfg, embedding_service, project_path_context, index_path_context)
 
@@ -177,7 +209,7 @@ _shutdown_started = False
 
 
 async def _shutdown(reason: str, *, loop: Optional[asyncio.AbstractEventLoop] = None) -> None:
-    global _shutdown_started
+    global _shutdown_started, _generation_service
     async with _shutdown_lock:
         if _shutdown_started:
             return
@@ -186,6 +218,9 @@ async def _shutdown(reason: str, *, loop: Optional[asyncio.AbstractEventLoop] = 
     try:
         await asyncio.wait_for(jobs.shutdown(timeout_s=5.0), timeout=6.0)
         await asyncio.wait_for(embedding_service.close(graceful=True), timeout=10.0)
+        # Close generation service if it was initialized
+        if _generation_service is not None:
+            await asyncio.wait_for(_generation_service.close(graceful=True), timeout=10.0)
         await asyncio.wait_for(dbmod.close_db_pool(), timeout=5.0)
         loop = loop or asyncio.get_running_loop()
         if loop.is_running():
@@ -411,11 +446,9 @@ async def _run_dream_cycle(project_id: str, *, max_pairs: int = 10) -> str:
     )
     chunk_map = {str(row["id"]): row for row in chunk_rows}
 
+    # Use global generation service instead of creating a new instance
+    generation = await get_generation_service()
     worker_count = max(1, min(4, os.cpu_count() or 4))
-    generation = GenerationService(
-        prefer_thread_for_cuda=cfg.prefer_thread_for_cuda,
-        worker_count=worker_count,
-    )
     insights: List[chunking.Chunk] = []
     semaphore = asyncio.Semaphore(worker_count)
     max_context_window = max(256, int(os.getenv("ENGRAM_DREAM_CONTEXT_WINDOW", "2048")))
@@ -472,8 +505,9 @@ async def _run_dream_cycle(project_id: str, *, max_pairs: int = 10) -> str:
             if result is None:
                 continue
             insights.append(result)
-    finally:
-        await generation.close()
+    except Exception:
+        logging.warning("Dream cycle generation failed", exc_info=True)
+        return "❌ Dream cycle generation failed"
 
     if not insights:
         return "ℹ️ No insights generated."
@@ -1982,11 +2016,15 @@ async def analyze_file_coding_style(
         # Import dreaming module
         from engram_mcp import dreaming
 
+        # Get global generation service
+        generation_service = await get_generation_service()
+
         # Analyze file style
         result = await dreaming.analyze_file_style(
             project_id,
             file_path,
             diff_limit=int(diff_limit),
+            generation_service=generation_service,
         )
 
         duration_ms = int((time.time() - start) * 1000)
