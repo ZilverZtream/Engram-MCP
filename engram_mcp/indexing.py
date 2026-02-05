@@ -1206,8 +1206,22 @@ class Indexer:
                     current_files[rel] = (stat.st_mtime_ns, stat.st_size, existing.content_hash, p)
                     continue
                 # File is new or modified; hash it now.
+                # Note: there is an inherent race between stat() and hashing; the file can
+                # change while we read it. Re-check metadata after hashing and re-hash once
+                # if we detect a change, so we don't persist a hash for stale bytes.
                 try:
-                    content_hash = hash_file(self.project_path_context, p, Path(directory), max_bytes)
+                    content_hash = None
+                    for _ in range(2):
+                        content_hash = hash_file(self.project_path_context, p, Path(directory), max_bytes)
+                        post_stat = self.project_path_context.stat(p)
+                        if (
+                            post_stat.st_mtime_ns == stat.st_mtime_ns
+                            and post_stat.st_size == stat.st_size
+                        ):
+                            break
+                        stat = post_stat
+                    if content_hash is None:
+                        raise RuntimeError("hashing failed to produce a result")
                 except Exception:
                     logging.warning("Failed to hash %s", rel, exc_info=True)
                     continue
