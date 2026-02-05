@@ -8,7 +8,7 @@ import random
 from collections import OrderedDict
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Any, AsyncIterator, Dict, List, Optional, Protocol, Sequence, Tuple, runtime_checkable
+from typing import Any, AsyncIterator, ClassVar, Dict, List, Optional, Protocol, Sequence, Tuple, runtime_checkable
 
 import numpy as np
 
@@ -213,12 +213,28 @@ class Embedder:
         self._thread_pool: Optional[ThreadPoolExecutor] = None
         self._shared_key: Optional[Tuple[str, Tuple[Any, ...]]] = None
 
-    _shared_lock = threading.Lock()
-    _shared_thread_pools: Dict[Tuple[str, str], Tuple[ThreadPoolExecutor, int]] = {}
-    _shared_proc_pools: Dict[Tuple[str, str, int], Tuple[ProcessPoolExecutor, int]] = {}
-    _shared_models: Dict[Tuple[str, str], Any] = {}
+    # _shared_pool_lock: asyncio.Lock guarding shared pool registry.
+    # Only accessed from async contexts (_ensure_executor, close), so an
+    # asyncio.Lock is correct and never blocks the event loop.
+    # NOTE: initialised lazily in _get_shared_pool_lock() because
+    # asyncio.Lock() must be created inside a running loop on Python < 3.10.
+    _shared_pool_lock: ClassVar[Optional[asyncio.Lock]] = None
+    _shared_thread_pools: ClassVar[Dict[Tuple[str, str], Tuple[ThreadPoolExecutor, int]]] = {}
+    _shared_proc_pools: ClassVar[Dict[Tuple[str, str, int], Tuple[ProcessPoolExecutor, int]]] = {}
+    # _shared_model_lock: threading.Lock guarding lazy model initialisation
+    # inside _embed_in_process, which runs in a worker thread.  This is
+    # intentionally a *separate* lock from the pool registry lock so that
+    # a slow model load (seconds) never blocks the async event loop.
+    _shared_model_lock: ClassVar[threading.Lock] = threading.Lock()
+    _shared_models: ClassVar[Dict[Tuple[str, str], Any]] = {}
 
-    def _ensure_executor(self) -> Tuple[str, Any]:
+    @classmethod
+    def _get_shared_pool_lock(cls) -> asyncio.Lock:
+        if cls._shared_pool_lock is None:
+            cls._shared_pool_lock = asyncio.Lock()
+        return cls._shared_pool_lock
+
+    async def _ensure_executor(self) -> Tuple[str, Any]:
         use_thread = (self.device.startswith("cuda") and self.prefer_thread_for_cuda) or (
             not self.device.startswith("cuda") and self.prefer_thread_for_cpu
         )
@@ -231,7 +247,7 @@ class Embedder:
         if use_thread:
             if self.shared:
                 key = (self.model_name, self.device)
-                with self._shared_lock:
+                async with self._get_shared_pool_lock():
                     if self._shared_key is None:
                         pool, ref = self._shared_thread_pools.get(key, (None, 0))
                         if pool is None:
@@ -251,7 +267,7 @@ class Embedder:
 
         if self.shared:
             key = (self.model_name, self.device, _proc_workers)
-            with self._shared_lock:
+            async with self._get_shared_pool_lock():
                 if self._shared_key is None:
                     pool, ref = self._shared_proc_pools.get(key, (None, 0))
                     if pool is None:
@@ -282,7 +298,7 @@ class Embedder:
         if not texts_list:
             return np.zeros((0, 0), dtype=np.float32)
 
-        mode, ex = self._ensure_executor()
+        mode, ex = await self._ensure_executor()
         loop = asyncio.get_running_loop()
 
         if mode == "thread":
@@ -294,7 +310,7 @@ class Embedder:
                 model = None
                 if self.shared:
                     key = (self.model_name, self.device)
-                    with self._shared_lock:
+                    with self._shared_model_lock:
                         model = self._shared_models.get(key)
                         if model is None:
                             model = SentenceTransformer(self.model_name, device=self.device)
@@ -340,7 +356,12 @@ class Embedder:
             self._proc_pool.shutdown(wait=True, cancel_futures=True)
         if self.shared and self._shared_key is not None:
             pool_type, key = self._shared_key
-            with self._shared_lock:
+            # close() is called from sync contexts (worker-loop cleanup, atexit).
+            # The pool registry is mutated under the threading model lock here
+            # because we cannot await an asyncio.Lock in a sync function.
+            # This is safe: the only contention is another close() from a
+            # different Embedder instance, which is a rare teardown path.
+            with self._shared_model_lock:
                 if pool_type == "thread":
                     pool, ref = self._shared_thread_pools.get(key, (None, 0))
                     if pool and ref <= 1:

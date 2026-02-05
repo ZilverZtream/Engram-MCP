@@ -395,14 +395,27 @@ def _iter_json_string_array(json_text: str) -> "Iterable[str]":
     thousands of elements (e.g. chunk-id lists for large files).  Falls back
     to the standard decoder for each element so escape sequences are handled
     correctly.
+
+    Robustness: the opening ``[`` is located by stripping leading whitespace
+    rather than scanning for the first ``[`` in the raw text.  The previous
+    scanner could mis-identify a ``[`` that appeared inside a leading string
+    or comment; ``json.loads`` would reject such input, so we raise
+    ``ValueError`` early to surface data-corruption rather than silently
+    yielding wrong results.
     """
     decoder = json.JSONDecoder()
-    idx = 0
+    stripped = json_text.lstrip()
+    if not stripped or stripped[0] != '[':
+        # Not a valid JSON array — surface the problem so callers can detect
+        # data corruption rather than silently returning an empty sequence.
+        raise ValueError(
+            f"Expected JSON array; got {stripped[:32]!r}… "
+            f"(first non-whitespace char is {stripped[0]!r})" if stripped
+            else "Expected JSON array; got empty string"
+        )
+    # idx into the *original* string, pointing just past '['
+    idx = len(json_text) - len(stripped) + 1
     length = len(json_text)
-    # Advance to the opening bracket.
-    while idx < length and json_text[idx] != '[':
-        idx += 1
-    idx += 1  # skip '['
     while idx < length:
         # Skip whitespace and commas.
         while idx < length and json_text[idx] in ' \t\n\r,':

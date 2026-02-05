@@ -165,10 +165,19 @@ def parse_file_to_chunks(
     if ext == ".docx":
         from docx import Document
 
+        max_text_chars = max_bytes * 4
         with ExitStack() as stack:
             handle = stack.enter_context(path_context.open_file(path, "rb"))
             doc = Document(handle)
-        paras = [p.text for p in doc.paragraphs if p.text and p.text.strip()]
+        paras: List[str] = []
+        total_chars = 0
+        for p in doc.paragraphs:
+            if not p.text or not p.text.strip():
+                continue
+            total_chars += len(p.text)
+            if total_chars > max_text_chars:
+                raise ValueError(f"DOCX extracted text too large: {path}")
+            paras.append(p.text)
         text = "\n".join(paras)
         base_id = make_chunk_id(str(path))
         return chunk_text(
@@ -261,12 +270,18 @@ def hash_and_parse_file(
         return chunks, hasher.hexdigest()
 
     if ext == ".pdf":
+        import io
         from pypdf import PdfReader
 
-        content_hash = hash_file(path_context, path, Path(root), max_bytes)
-        max_text_chars = max_bytes * 4
+        # Single read: hash and parse from the same buffer.  File size is
+        # already validated against max_bytes above, so loading into memory
+        # is safe and avoids a redundant disk pass.
         with path_context.open_file(path, "rb") as fh:
-            reader = PdfReader(fh)
+            raw = fh.read()
+        content_hash = hashlib.sha256(raw).hexdigest()
+        max_text_chars = max_bytes * 4
+        reader = PdfReader(io.BytesIO(raw))
+        del raw  # release the raw buffer; pages are decoded on demand
         chunks: List[Chunk] = []
         base_id = make_chunk_id(str(path))
         total_chars = 0
@@ -295,12 +310,25 @@ def hash_and_parse_file(
         return chunks, content_hash
 
     if ext == ".docx":
+        import io
         from docx import Document
 
-        content_hash = hash_file(path_context, path, Path(root), max_bytes)
+        # Single read: hash and parse from the same buffer.
         with path_context.open_file(path, "rb") as fh:
-            doc = Document(fh)
-        paras = [p.text for p in doc.paragraphs if p.text and p.text.strip()]
+            raw = fh.read()
+        content_hash = hashlib.sha256(raw).hexdigest()
+        max_text_chars = max_bytes * 4
+        doc = Document(io.BytesIO(raw))
+        del raw
+        paras: List[str] = []
+        total_chars = 0
+        for p in doc.paragraphs:
+            if not p.text or not p.text.strip():
+                continue
+            total_chars += len(p.text)
+            if total_chars > max_text_chars:
+                raise ValueError(f"DOCX extracted text too large: {path}")
+            paras.append(p.text)
         text = "\n".join(paras)
         base_id = make_chunk_id(str(path))
         chunks = chunk_text(
