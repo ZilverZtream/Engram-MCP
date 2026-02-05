@@ -545,6 +545,19 @@ class SearchEngine:
         else:
             combined = combined[:return_k]
 
+        async def _log_search_session() -> None:
+            try:
+                await dbmod.insert_search_session(
+                    self.db_path,
+                    project_id=project_id,
+                    query_text=query,
+                    result_chunk_ids=[r["id"] for r in combined],
+                )
+            except Exception:
+                logging.exception("Failed to log search session for project %s", project_id)
+
+        asyncio.create_task(_log_search_session())
+
         # bump access counts best-effort
         await dbmod.bump_access_counts(self.db_path, project_id, [r["id"] for r in combined])
         if _cache_enabled:
