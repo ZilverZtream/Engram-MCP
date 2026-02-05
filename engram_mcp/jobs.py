@@ -15,6 +15,7 @@ class Job:
     kind: str
     created_at: float
     task: asyncio.Task
+    queue_key: str | None = None
 
 
 def generate_job_id(kind: str) -> str:
@@ -27,6 +28,7 @@ class JobManager:
         db_path: str,
         max_concurrent_jobs: int = 5,
         max_queue_size: int = 1000,
+        max_queue_per_key: int = 3,
         job_retention_days: int = 30,
         job_retention_max: int = 1000,
     ) -> None:
@@ -35,6 +37,7 @@ class JobManager:
         # Semaphore to limit concurrent jobs and prevent DoS
         self._semaphore = asyncio.Semaphore(max_concurrent_jobs)
         self._max_queue_size = max(1, int(max_queue_size))
+        self._max_queue_per_key = max(1, int(max_queue_per_key))
         self._db_path = db_path
         self._job_retention_days = max(1, int(job_retention_days))
         self._job_retention_max = max(1, int(job_retention_max))
@@ -60,13 +63,17 @@ class JobManager:
             )
             self._reconciled = True
 
-    async def create(self, kind: str, coro: Awaitable[Any]) -> Job:
+    async def create(self, kind: str, coro: Awaitable[Any], *, queue_key: str | None = None) -> Job:
         await self._ensure_reconciled()
         if self._shutting_down:
             raise RuntimeError("Server is shutting down; refusing new jobs.")
         async with self._lock:
             if len(self._jobs) >= self._max_queue_size:
                 raise RuntimeError("Job queue is full; try again later.")
+            if queue_key:
+                queued_for_key = sum(1 for job in self._jobs.values() if job.queue_key == queue_key)
+                if queued_for_key >= self._max_queue_per_key:
+                    raise RuntimeError("Too many jobs queued for this project; try again later.")
         job_id = generate_job_id(kind)
         await dbmod.init_db(self._db_path)
         await dbmod.create_job(self._db_path, job_id=job_id, kind=kind, status="QUEUED")
@@ -106,7 +113,7 @@ class JobManager:
                             pass
 
         task = asyncio.create_task(_wrapped_coro())
-        job = Job(job_id=job_id, kind=kind, created_at=time.time(), task=task)
+        job = Job(job_id=job_id, kind=kind, created_at=time.time(), task=task, queue_key=queue_key)
         async with self._lock:
             self._jobs[job_id] = job
         # Cleanup when done
