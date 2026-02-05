@@ -21,8 +21,18 @@ SUPPORTED_DOC_EXTS = {".pdf", ".docx"}
 
 
 def _is_ignored(path: str, ignore_patterns: List[str]) -> bool:
+    basename = os.path.basename(path)
     for pat in ignore_patterns:
-        if fnmatch.fnmatch(path, pat) or fnmatch.fnmatch(os.path.basename(path), pat):
+        if fnmatch.fnmatch(path, pat) or fnmatch.fnmatch(basename, pat):
+            return True
+        # fnmatch does not honour the "any directory depth" semantics of **;
+        # strip leading **/ prefixes so that patterns like **/*.log also
+        # match files directly at the root (where the relative path has no
+        # directory component).
+        stripped = pat
+        while stripped.startswith("**/"):
+            stripped = stripped[3:]
+        if stripped != pat and fnmatch.fnmatch(basename, stripped):
             return True
     return False
 

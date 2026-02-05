@@ -48,40 +48,41 @@ from .search import invalidate_faiss_cache, invalidate_search_cache_project, is_
 from .security import PathContext, ProjectID, validate_project_field
 from . import db as dbmod
 
-# Per-file parse timeout in seconds.  asyncio.wait_for alone cannot kill a
-# thread; _run_in_thread_with_timeout uses a dedicated single-thread executor
-# so that a timed-out parse does not consume a slot from the shared
-# concurrency semaphore.
+# Per-file parse timeout in seconds.
 _PARSE_TIMEOUT_S = 30
+
+# Shared executor for file-parsing tasks.  Sized at 3 × the concurrency cap
+# so that a burst of timed-out-but-still-running threads (CPython cannot
+# forcibly terminate threads) does not starve new submissions.
+# _bounded_gather limits active parse coroutines to _CONCURRENCY_CAP, so at
+# most that many threads are *actively used* at any instant; the extra
+# headroom absorbs threads that are draining after their timeout expired.
+_PARSE_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=_CONCURRENCY_CAP * 3,
+    thread_name_prefix="engram-parse",
+)
 
 
 async def _run_in_thread_with_timeout(fn, *args, timeout: float = _PARSE_TIMEOUT_S):
-    """Run *fn* in its own thread and enforce a real wall-clock timeout.
+    """Run *fn* in the shared parse executor with a wall-clock timeout.
 
-    asyncio.wait_for + asyncio.to_thread only cancels the *wait*; the
-    underlying thread keeps running in the shared default executor forever,
-    eventually starving the pool.  This helper submits the callable to a
-    fresh single-thread executor.  On timeout the executor is shut down with
-    cancel_futures=True (which prevents it from accepting new work) and
-    discarded.  The orphaned thread will finish on its own when the GC
-    collects the executor, but crucially it does **not** occupy a slot in
-    the shared concurrency semaphore, so other files continue processing
-    immediately.
+    On timeout the asyncio Future is cancelled; the underlying thread
+    continues until *fn* returns naturally.  CPython provides no portable
+    mechanism to kill a running thread, so truly stuck work (e.g. an
+    infinite loop inside a C extension) persists until process exit.  The
+    shared pool is bounded, so the total number of leaked threads is capped
+    at max_workers — unlike the previous per-call executor design that could
+    spawn one thread pool (and one OS thread) per file, leading to 50 000
+    pools for a 50 000-file repository.
     """
     loop = asyncio.get_running_loop()
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-    future = executor.submit(fn, *args)
     try:
         return await asyncio.wait_for(
-            loop.run_in_executor(None, future.result, timeout),
-            timeout=timeout + 1,  # outer guard; inner future.result does the real timeout
+            loop.run_in_executor(_PARSE_EXECUTOR, fn, *args),
+            timeout=timeout,
         )
-    except (TimeoutError, asyncio.TimeoutError, concurrent.futures.TimeoutError):
-        future.cancel()
-        executor.shutdown(wait=False, cancel_futures=True)
+    except asyncio.TimeoutError:
         raise asyncio.TimeoutError(f"Parse timed out after {timeout}s")
-    finally:
-        executor.shutdown(wait=False)
 
 
 def _write_index_uuid(path_context: PathContext, index_path: str, uuid_str: str) -> None:
@@ -262,7 +263,7 @@ class Indexer:
                                 "shard_size": int(self.cfg.shard_size),
                             },
                             faiss_index_uuid=None,
-                            index_dirty=1,
+                            index_dirty=0,
                         )
                         project_initialized = True
 
@@ -454,7 +455,7 @@ class Indexer:
                     "device": device,
                 },
                 faiss_index_uuid=proj.get("faiss_index_uuid"),
-                index_dirty=1,
+                index_dirty=0,
                 deleting=proj.get("deleting") or 0,
             )
             await invalidate_search_cache_project(str(project))
@@ -531,6 +532,41 @@ class Indexer:
             raise RuntimeError("Embedding cache did not resolve all vectors.")
         return np.vstack([v for v in vectors]).astype(np.float32)
 
+    async def _resolve_vectors(
+        self,
+        batch: List[Dict[str, Any]],
+        *,
+        model_name: str,
+        device: str,
+    ) -> np.ndarray:
+        """Return vectors for *batch*, using DB-persisted vectors where available.
+
+        Chunks indexed before the vector-persistence migration have a NULL
+        ``vector`` column; those are re-embedded on the fly.  All other chunks
+        skip the (potentially expensive / paid-API) embedding call entirely.
+        """
+        persisted: Dict[int, np.ndarray] = {}
+        needs_embed: List[Dict[str, Any]] = []
+        for r in batch:
+            vec_blob = r.get("vector")
+            if vec_blob:
+                # .copy() is required: np.frombuffer returns a read-only view
+                # of the bytes object, which FAISS would reject.
+                persisted[r["internal_id"]] = np.frombuffer(vec_blob, dtype=np.float32).copy()
+            else:
+                needs_embed.append(r)
+
+        if needs_embed:
+            newly_embedded = await self._embed_chunks_cached(
+                [r["chunk"] for r in needs_embed],
+                model_name=model_name,
+                device=device,
+            )
+            for i, r in enumerate(needs_embed):
+                persisted[r["internal_id"]] = newly_embedded[i]
+
+        return np.vstack([persisted[r["internal_id"]] for r in batch]).astype(np.float32)
+
     async def _build_faiss_index(self, vectors: np.ndarray, *, total_vectors: Optional[int] = None) -> Any:
         if not self.faiss_available:
             raise RuntimeError("Vector search unavailable (faiss not installed).")
@@ -606,6 +642,15 @@ class Indexer:
 
         await dbmod.upsert_file_metadata(self.cfg.db_path, project_id, file_rows)
         await dbmod.upsert_chunks(self.cfg.db_path, project_id=project_id, rows=rows)
+
+        # Persist vectors alongside chunks so that dirty-flag recovery can
+        # skip re-embedding (which may hit a paid API or take minutes).
+        vec_rows = [
+            (vectors[i].tobytes(), project_id, int(ids[i]))
+            for i in range(len(ids))
+        ]
+        await dbmod.upsert_chunk_vectors(self.cfg.db_path, vec_rows)
+
         vectors_added = False
         try:
             await self._add_vectors(index, vectors, ids)
@@ -1481,10 +1526,8 @@ class Indexer:
                     break
                 had_chunks = True
                 last_internal_id = batch[-1]["internal_id"]
-                vectors = await self._embed_chunks_cached(
-                    [r["chunk"] for r in batch],
-                    model_name=model_name,
-                    device=device,
+                vectors = await self._resolve_vectors(
+                    batch, model_name=model_name, device=device,
                 )
                 ids = [r["internal_id"] for r in batch]
 
@@ -1570,10 +1613,8 @@ class Indexer:
                     break
                 had_chunks = True
                 last_internal_id = batch[-1]["internal_id"]
-                vectors = await self._embed_chunks_cached(
-                    [r["chunk"] for r in batch],
-                    model_name=model_name,
-                    device=device,
+                vectors = await self._resolve_vectors(
+                    batch, model_name=model_name, device=device,
                 )
                 ids = np.asarray([r["internal_id"] for r in batch], dtype=np.int64)
                 if index is None:

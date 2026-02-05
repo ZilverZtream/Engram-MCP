@@ -19,17 +19,34 @@ class Chunk:
     metadata: Dict[str, object]
 
 
+# Injected once at startup by config.load_config via configure_tokenizer_path.
+# None means "not yet configured"; empty string means "no tokenizer available".
+_TOKENIZER_PATH: str | None = None
+
+
+def configure_tokenizer_path(path: str) -> None:
+    """Inject the tokenizer path from EngramConfig at startup.
+
+    Must be called before any token-counting or chunking operation.
+    Clears the cached tokenizer so the next call to _load_tokenizer
+    picks up the new path.
+    """
+    global _TOKENIZER_PATH
+    _TOKENIZER_PATH = path
+    _load_tokenizer.cache_clear()
+
+
 @lru_cache(maxsize=1)
 def _load_tokenizer() -> Tokenizer | None:
-    tokenizer_path = os.getenv("ENGRAM_TOKENIZER_PATH")
+    tokenizer_path = _TOKENIZER_PATH if _TOKENIZER_PATH is not None else ""
     if not tokenizer_path:
         logging.warning(
-            "ENGRAM_TOKENIZER_PATH not set; using regex token offsets to avoid network downloads."
+            "tokenizer_path not configured; using regex token offsets to avoid network downloads."
         )
         return None
     if not os.path.exists(tokenizer_path):
         logging.warning(
-            "Tokenizer not found at ENGRAM_TOKENIZER_PATH=%s; using regex token offsets.",
+            "Tokenizer not found at tokenizer_path=%s; using regex token offsets.",
             tokenizer_path,
         )
         return None
@@ -48,6 +65,15 @@ def _regex_offsets(text: str) -> List[tuple[int, int]]:
     return [(m.start(), m.end()) for m in re.finditer(r"\S+", text)]
 
 
+def _regex_token_count(text: str) -> int:
+    """Count whitespace-delimited tokens without materialising offset tuples.
+
+    O(1) memory regardless of token count — avoids the 50M-tuple spike
+    that _regex_offsets would produce on a 100 MB file with dense tokens.
+    """
+    return sum(1 for _ in re.finditer(r"\S+", text))
+
+
 def _get_offsets(text: str) -> List[tuple[int, int]]:
     tokenizer = _load_tokenizer()
     if tokenizer is None:
@@ -59,7 +85,10 @@ def _get_offsets(text: str) -> List[tuple[int, int]]:
 def token_count(text: str) -> int:
     if not text:
         return 0
-    return len(_get_offsets(text))
+    tokenizer = _load_tokenizer()
+    if tokenizer is None:
+        return _regex_token_count(text)
+    return len(tokenizer.encode(text).tokens)
 
 
 def make_chunk_id(*parts: str) -> str:
@@ -136,7 +165,10 @@ def chunk_lines(
         overlap_tokens = max(0, target_tokens - 1)
 
     max_chars = max(200_000, target_tokens * 20)
-    buffer = ""
+    # Accumulate incoming parts in a list; join only at flush points.
+    # This gives O(N) append cost instead of O(N²) repeated str concatenation.
+    pending: List[str] = []
+    pending_len = 0
     chunks: List[Chunk] = []
     idx_offset = 0
 
@@ -171,14 +203,20 @@ def chunk_lines(
     for part in lines:
         if part is None:
             continue
-        buffer += part
-        if not buffer.endswith("\n"):
-            buffer += "\n"
-        if len(buffer) >= max_chars:
+        # Append the raw text exactly as received — do NOT insert artificial
+        # newlines.  The caller (read_text_streaming / _iter_lines) yields
+        # text that already contains its own line endings; injecting a "\n"
+        # at every chunk boundary corrupts content at 1 MB boundaries.
+        pending.append(part)
+        pending_len += len(part)
+        if pending_len >= max_chars:
+            buffer = "".join(pending)
             _flush(buffer)
-            buffer = _tail_text(buffer)
+            tail = _tail_text(buffer)
+            pending = [tail] if tail else []
+            pending_len = len(tail) if tail else 0
 
-    if buffer:
-        _flush(buffer)
+    if pending:
+        _flush("".join(pending))
 
     return chunks

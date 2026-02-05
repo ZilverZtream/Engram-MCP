@@ -44,6 +44,7 @@ class EngramConfig:
     max_file_size_mb: int = 50
     chunk_size_tokens: int = 200
     overlap_tokens: int = 30
+    tokenizer_path: str = field(default_factory=lambda: os.getenv("ENGRAM_TOKENIZER_PATH", ""))
 
     # Performance
     query_timeout_s: int = 60
@@ -105,6 +106,7 @@ class AllowedConfig(BaseModel):
     max_file_size_mb: int = 50
     chunk_size_tokens: int = 200
     overlap_tokens: int = 30
+    tokenizer_path: str = Field(default_factory=lambda: os.getenv("ENGRAM_TOKENIZER_PATH", ""))
 
     # Performance
     query_timeout_s: int = 60
@@ -236,6 +238,12 @@ def load_config(path: Optional[str] = None) -> EngramConfig:
         cfg.overlap_tokens = max(0, int(cfg.chunk_size_tokens) - 1)
 
     _ensure_storage_dirs(cfg)
+
+    # Push the resolved tokenizer path into the chunking module so it does
+    # not need to reach for an env-var at runtime.
+    from . import chunking as _chunking
+    _chunking.configure_tokenizer_path(cfg.tokenizer_path)
+
     return cfg
 
 
