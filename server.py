@@ -9,7 +9,7 @@ import os
 import signal
 import stat
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from fastmcp import FastMCP
 
@@ -25,6 +25,8 @@ from engram_mcp.search import (
     invalidate_search_cache_project,
     is_faiss_available,
 )
+from engram_mcp.dreaming import identify_candidates
+from engram_mcp.generation import GenerationService
 from engram_mcp.security import PathContext, PathNotAllowed, ProjectID, validate_project_field
 from engram_mcp import db as dbmod
 from engram_mcp import chunking
@@ -335,6 +337,95 @@ async def update_project(project_id: str, wait: bool = True) -> str:
 
 
 @mcp.tool
+async def dream_project(project_id: str, wait: bool = True, max_pairs: int = 10) -> str:
+    """Generate insight chunks from recent search co-occurrences."""
+    if not cfg.enable_dreaming:
+        return "❌ Dreaming is disabled in the configuration."
+    await dbmod.init_db(cfg.db_path)
+    proj = await dbmod.get_project(cfg.db_path, project_id)
+    if not proj:
+        return f"❌ Project not found: {project_id}"
+
+    async def _run() -> str:
+        candidates = await identify_candidates(project_id)
+        if not candidates:
+            return "ℹ️ No dream candidates found."
+        max_pairs_int = max(1, int(max_pairs))
+        candidates = candidates[:max_pairs_int]
+
+        unique_ids: List[str] = []
+        seen_ids: set[str] = set()
+        for first, second, _count in candidates:
+            for cid in (str(first), str(second)):
+                if cid in seen_ids:
+                    continue
+                seen_ids.add(cid)
+                unique_ids.append(cid)
+
+        chunk_rows = await dbmod.fetch_chunks_by_ids(
+            cfg.db_path, project_id=project_id, chunk_ids=unique_ids
+        )
+        chunk_map = {str(row["id"]): row for row in chunk_rows}
+
+        generation = GenerationService(
+            prefer_thread_for_cuda=cfg.prefer_thread_for_cuda,
+            worker_count=1,
+        )
+        insights: List[chunking.Chunk] = []
+        try:
+            for first, second, _count in candidates:
+                cid_a, cid_b = str(first), str(second)
+                row_a = chunk_map.get(cid_a)
+                row_b = chunk_map.get(cid_b)
+                if not row_a or not row_b:
+                    continue
+                context_a = row_a.get("content") or ""
+                context_b = row_b.get("content") or ""
+                if not context_a.strip() or not context_b.strip():
+                    continue
+                insight = await generation.generate_insight(
+                    context_a,
+                    context_b,
+                    model_name=cfg.dream_model_name,
+                    device=_device(),
+                )
+                insight = (insight or "").strip()
+                if not insight:
+                    continue
+                sorted_ids = sorted([cid_a, cid_b])
+                insight_id = chunking.make_chunk_id("insight", project_id, *sorted_ids)
+                insights.append(
+                    chunking.Chunk(
+                        insight_id,
+                        insight,
+                        chunking.token_count(insight),
+                        {"type": "insight", "source_chunks": sorted_ids},
+                    )
+                )
+        finally:
+            await generation.close()
+
+        if not insights:
+            return "ℹ️ No insights generated."
+
+        vfs_path = "vfs://insights/dream_cycle.md"
+        added = await indexer.add_virtual_file_chunks(
+            project_id=project_id,
+            file_path=vfs_path,
+            chunks=insights,
+        )
+        return f"✅ Dreamed {added} insights from {len(candidates)} pairs."
+
+    job = await jobs.create("dream", _run())
+    try:
+        if not wait:
+            return f"🆔 Dream job queued: {job.job_id}"
+        return await job.task
+    except asyncio.CancelledError:
+        return f"🛑 Dream job cancelled: {job.job_id}"
+
+
+@mcp.tool
 async def list_projects() -> Dict[str, Any]:
     """List indexed projects."""
     await dbmod.init_db(cfg.db_path)
@@ -580,7 +671,7 @@ async def repair_project(project_id: str) -> str:
 
 @mcp.tool
 async def list_jobs() -> Dict[str, Any]:
-    """List active background jobs (index/update)."""
+    """List active background jobs (index/update/dream)."""
     return await jobs.list()
 
 

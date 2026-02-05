@@ -214,6 +214,10 @@ def _content_hash(text: str) -> str:
     return h.hexdigest()
 
 
+def _is_virtual_path(path: str) -> bool:
+    return str(path).startswith("vfs://")
+
+
 async def _bounded_gather(items: Iterable[Any], worker, concurrency: int):
     """Yield worker(item) results with at most *concurrency* live tasks.
 
@@ -413,6 +417,8 @@ class Indexer:
         model_name = metadata.get("model_name") or _pick_model_name(project_type, self.cfg)
         device = metadata.get("device") or ("cuda" if _cuda_available() else "cpu")
 
+        virtual_paths = {path for path in existing_meta if _is_virtual_path(path)}
+        existing_meta = {path: row for path, row in existing_meta.items() if path not in virtual_paths}
         file_count = len(current_files)
         deleted_files = set(existing_meta.keys()) - set(current_files.keys())
         changed_files = {
@@ -1181,6 +1187,8 @@ class Indexer:
         lock = await get_project_lock(str(project))
         async with lock:
             existing_meta = await dbmod.fetch_file_metadata(self.cfg.db_path, str(project))
+            virtual_paths = {path for path in existing_meta if _is_virtual_path(path)}
+            existing_meta = {path: row for path, row in existing_meta.items() if path not in virtual_paths}
             rwlock = await get_project_rwlock(str(project))
 
             current_files: Dict[str, Tuple[int, int, str, Any]] = {}
@@ -1487,6 +1495,146 @@ class Indexer:
                 if added_chunk_ids:
                     await dbmod.delete_chunks(self.cfg.db_path, str(project), added_chunk_ids)
                 raise
+
+    async def add_virtual_file_chunks(
+        self,
+        *,
+        project_id: str,
+        file_path: str,
+        chunks: List[Any],
+    ) -> int:
+        if not _is_virtual_path(file_path):
+            raise ValueError(f"Virtual file paths must start with vfs:// (got {file_path})")
+        if not chunks:
+            return 0
+        await dbmod.init_db(self.cfg.db_path)
+        proj = await dbmod.get_project(self.cfg.db_path, project_id)
+        if not proj:
+            raise ValueError(f"Project not found: {project_id}")
+        metadata = proj.get("metadata") or {}
+        project_type = proj.get("project_type") or ""
+        model_name = metadata.get("model_name") or _pick_model_name(project_type, self.cfg)
+        device = metadata.get("device") or ("cuda" if _cuda_available() else "cpu")
+
+        existing_chunk_map = await dbmod.fetch_file_chunk_ids(
+            self.cfg.db_path, project_id, [file_path]
+        )
+        existing_ids = set(existing_chunk_map.get(file_path, []))
+        new_chunks = [c for c in chunks if c.chunk_id not in existing_ids]
+        if not new_chunks:
+            return 0
+
+        combined_ids = sorted(existing_ids)
+        combined_ids.extend(c.chunk_id for c in new_chunks if c.chunk_id not in existing_ids)
+        content_hash = _content_hash("".join(combined_ids))
+        size_bytes = sum(len(getattr(c, "content", "") or "") for c in new_chunks)
+        file_row = dbmod.FileMetadataRow(
+            file_path=file_path,
+            mtime_ns=time.time_ns(),
+            size_bytes=size_bytes,
+            content_hash=content_hash,
+            chunk_ids=combined_ids,
+        )
+
+        lock = await get_project_lock(project_id)
+        rwlock = await get_project_rwlock(project_id)
+
+        rows = []
+        internal_ids: List[int] = []
+        vectors: Optional[np.ndarray] = None
+        if self.faiss_available:
+            vectors = await self._embed_chunks_cached(new_chunks, model_name=model_name, device=device)
+        internal_ids = await dbmod.reserve_internal_ids(self.cfg.db_path, project_id, len(new_chunks))
+        rows = [
+            (c.chunk_id, int(iid), c.content, int(c.token_count), c.metadata)
+            for c, iid in zip(new_chunks, internal_ids)
+        ]
+
+        async with lock:
+            if not self.faiss_available:
+                await dbmod.upsert_file_metadata(self.cfg.db_path, project_id, [file_row])
+                await dbmod.upsert_chunks(self.cfg.db_path, project_id=project_id, rows=rows)
+                await dbmod.refresh_project_stats(self.cfg.db_path, project_id)
+                await invalidate_search_cache_project(project_id)
+                return len(new_chunks)
+
+            shard_count = int(metadata.get("shard_count") or 1)
+            index_uuid = uuid.uuid4().hex
+            async with rwlock.write_lock():
+                await dbmod.upsert_file_metadata(self.cfg.db_path, project_id, [file_row])
+                await dbmod.upsert_chunks(self.cfg.db_path, project_id=project_id, rows=rows)
+                if shard_count > 1:
+                    shard_paths = [
+                        _index_paths(self.cfg.index_dir, ProjectID(project_id), shard_id)
+                        for shard_id in range(shard_count)
+                    ]
+                    shard_indexes: List[Any] = []
+                    for current_path, _ in shard_paths:
+                        if self.index_path_context.exists(current_path):
+                            shard_indexes.append(
+                                await asyncio.to_thread(
+                                    _load_faiss, current_path, path_context=self.index_path_context
+                                )
+                            )
+                        else:
+                            shard_indexes.append(None)
+                    for shard_id in range(shard_count):
+                        shard_mask = [i for i, iid in enumerate(internal_ids) if iid % shard_count == shard_id]
+                        if not shard_mask:
+                            continue
+                        shard_vectors = vectors[shard_mask]
+                        shard_ids = np.asarray([internal_ids[i] for i in shard_mask], dtype=np.int64)
+                        if shard_indexes[shard_id] is None:
+                            shard_indexes[shard_id] = await self._build_faiss_index(shard_vectors)
+                        await self._add_vectors(shard_indexes[shard_id], shard_vectors, shard_ids)
+                    replacements: List[Tuple[str, str]] = []
+                    for shard_id, index in enumerate(shard_indexes):
+                        if index is None:
+                            continue
+                        current_path, new_path = shard_paths[shard_id]
+                        await invalidate_faiss_cache(current_path)
+                        await asyncio.to_thread(_save_faiss, index, self.index_path_context, new_path)
+                        await asyncio.to_thread(
+                            _write_index_uuid, self.index_path_context, new_path, index_uuid
+                        )
+                        replacements.append((new_path, current_path))
+                    if replacements:
+                        _swap_index_files(self.index_path_context, replacements)
+                        for new_path, current_path in replacements:
+                            await asyncio.to_thread(
+                                _write_index_uuid, self.index_path_context, current_path, index_uuid
+                            )
+                else:
+                    index_current, index_new = _index_paths(self.cfg.index_dir, ProjectID(project_id))
+                    index = await asyncio.to_thread(
+                        _load_faiss, index_current, path_context=self.index_path_context
+                    )
+                    await self._add_vectors(index, vectors, np.asarray(internal_ids, dtype=np.int64))
+                    await invalidate_faiss_cache(index_current)
+                    await asyncio.to_thread(_save_faiss, index, self.index_path_context, index_new)
+                    await asyncio.to_thread(
+                        _write_index_uuid, self.index_path_context, index_new, index_uuid
+                    )
+                    _replace_with_retries(self.index_path_context, index_new, index_current)
+                    await asyncio.to_thread(
+                        _write_index_uuid, self.index_path_context, index_current, index_uuid
+                    )
+                await dbmod.refresh_project_stats(self.cfg.db_path, project_id)
+                await dbmod.upsert_project(
+                    self.cfg.db_path,
+                    project_id=project_id,
+                    project_name=proj.get("project_name") or "",
+                    project_type=project_type,
+                    directory=proj.get("directory") or "",
+                    directory_realpath=proj.get("directory_realpath"),
+                    embedding_dim=int(proj.get("embedding_dim") or 0),
+                    metadata=metadata,
+                    faiss_index_uuid=index_uuid,
+                    index_dirty=proj.get("index_dirty") or 0,
+                    deleting=proj.get("deleting") or 0,
+                )
+                await invalidate_search_cache_project(project_id)
+                return len(new_chunks)
 
     async def _update_sharded_indexes(
         self,
