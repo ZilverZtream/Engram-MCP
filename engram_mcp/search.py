@@ -50,6 +50,38 @@ def configure_numba(enabled: bool, *, warmup: bool = False) -> None:
         _mmr_select_impl = _mmr_select_numpy
 
 
+def _batch_reconstruct(index: Any, internal_ids: List[int]) -> Dict[int, np.ndarray]:
+    """Reconstruct multiple FAISS vectors in a single O(1) batch call.
+
+    Uses faiss.reconstruct_batch when available (FAISS ≥ 1.7.4) and falls
+    back to individual reconstruct() calls for older versions.  Either way
+    this is a *much* cheaper operation than the previous one-call-per-vector
+    loop, especially for MMR which may request 250+ vectors per search.
+    """
+    if not internal_ids:
+        return {}
+    embeddings: Dict[int, np.ndarray] = {}
+    try:
+        ids_array = np.array(internal_ids, dtype=np.int64)
+        out = np.empty((len(internal_ids), index.d), dtype=np.float32)
+        index.reconstruct_batch(ids_array, out)
+        for iid, vec in zip(internal_ids, out):
+            embeddings[iid] = vec
+        return embeddings
+    except AttributeError:
+        # Older FAISS build without reconstruct_batch — fall back gracefully.
+        pass
+    except Exception as exc:
+        logging.debug("reconstruct_batch failed (%s), falling back to per-vector", exc)
+
+    for iid in internal_ids:
+        try:
+            embeddings[iid] = index.reconstruct(int(iid))
+        except (ValueError, RuntimeError):
+            logging.debug("Failed to reconstruct embedding %s", iid, exc_info=True)
+    return embeddings
+
+
 def _rrf_scores_numpy(bm25_indices: np.ndarray, vec_indices: np.ndarray, k: int = 60) -> np.ndarray:
     size = 0
     if bm25_indices.size:
@@ -389,22 +421,12 @@ class SearchEngine:
                     if not self.index_path_context.exists(index_path):
                         continue
                     index = await self._load_faiss_path(project_id, index_path)
-                    for iid in ids:
-                        try:
-                            embeddings[iid] = index.reconstruct(int(iid))
-                        except (ValueError, RuntimeError):
-                            logging.debug("Failed to reconstruct embedding %s", iid, exc_info=True)
-                            continue
+                    embeddings.update(_batch_reconstruct(index, ids))
             return embeddings
 
         async with rwlock.read_lock():
             index = await self._load_faiss(project_id)
-            for iid in internal_ids:
-                try:
-                    embeddings[iid] = index.reconstruct(int(iid))
-                except (ValueError, RuntimeError):
-                    logging.debug("Failed to reconstruct embedding %s", iid, exc_info=True)
-                    continue
+            embeddings = _batch_reconstruct(index, internal_ids)
         return embeddings
 
     async def vector_search(

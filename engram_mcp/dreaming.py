@@ -4,14 +4,23 @@ import json
 import logging
 from collections import Counter
 from itertools import combinations
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
 
 from . import db as dbmod
-from .config import load_config
+from .config import EngramConfig, load_config
 from .generation import GenerationService
 
+# Lazily loaded module-level config.  Access via _get_cfg() so that
+# unit tests and callers that supply an explicit cfg= are not forced to
+# have a config file present on disk.
+_cfg: Optional[EngramConfig] = None
 
-_cfg = load_config()
+
+def _get_cfg() -> EngramConfig:
+    global _cfg
+    if _cfg is None:
+        _cfg = load_config()
+    return _cfg
 
 # Style Analysis Prompt Template
 STYLE_ANALYSIS_PROMPT = """You are a code style analyzer. You will be given recent git diffs for a file.
@@ -38,7 +47,11 @@ Style Guide:
 """
 
 
-async def identify_candidates(project_id: str) -> List[Tuple[str, str, int]]:
+async def identify_candidates(
+    project_id: str,
+    *,
+    cfg: Optional[EngramConfig] = None,
+) -> List[Tuple[str, str, int]]:
     """Identify co-occurring chunk pairs from recent search sessions.
 
     Returns a list of (chunk_id_a, chunk_id_b, count) tuples for pairs that:
@@ -46,7 +59,8 @@ async def identify_candidates(project_id: str) -> List[Tuple[str, str, int]]:
     - are not already represented by an insight chunk
     - meet or exceed cfg.dream_threshold
     """
-    async with dbmod.get_connection(_cfg.db_path) as db:
+    cfg = cfg or _get_cfg()
+    async with dbmod.get_connection(cfg.db_path) as db:
         rows = await db.execute_fetchall(
             """
             SELECT result_chunk_ids
@@ -92,7 +106,7 @@ async def identify_candidates(project_id: str) -> List[Tuple[str, str, int]]:
 
     chunk_to_file: Dict[str, str] = {}
     batch_size = 900
-    async with dbmod.get_connection(_cfg.db_path) as db:
+    async with dbmod.get_connection(cfg.db_path) as db:
         for i in range(0, len(all_chunk_ids), batch_size):
             batch = all_chunk_ids[i:i + batch_size]
             query = dbmod.build_in_query(
@@ -147,7 +161,7 @@ async def identify_candidates(project_id: str) -> List[Tuple[str, str, int]]:
                 continue
             counts[pair] += 1
 
-    threshold = float(_cfg.dream_threshold)
+    threshold = float(cfg.dream_threshold)
     candidates = [
         (first, second, count)
         for (first, second), count in counts.items()
@@ -163,6 +177,7 @@ async def find_temporal_couplings(
     min_frequency: int = 5,
     limit: int = 100,
     recent_commits_limit: int = 2000,
+    cfg: Optional[EngramConfig] = None,
 ) -> List[Tuple[str, str, int, Dict[str, str]]]:
     """Find files that frequently change together in git history.
 
@@ -175,6 +190,7 @@ async def find_temporal_couplings(
         min_frequency: Minimum number of co-changes to consider a coupling (default: 5)
         limit: Maximum number of couplings to return (default: 100)
         recent_commits_limit: Only analyze recent N commits to prevent full history scan (default: 2000)
+        cfg: Optional EngramConfig instance; loaded lazily if not provided.
 
     Returns:
         List of (file_a, file_b, frequency, metadata) tuples where:
@@ -182,7 +198,8 @@ async def find_temporal_couplings(
         - frequency: Number of commits where both files changed
         - metadata: Additional context (recent commits, common tags, etc.)
     """
-    async with dbmod.get_connection(_cfg.db_path) as db:
+    cfg = cfg or _get_cfg()
+    async with dbmod.get_connection(cfg.db_path) as db:
         # The Coupling Detector SQL with optimization:
         # 1. Use CTE to limit to recent commits (prevents full history scan)
         # 2. Finds pairs of files that changed in the same commit
@@ -222,59 +239,56 @@ async def find_temporal_couplings(
     # Step 1: Collect all file pairs
     file_pairs = [(file_a, file_b, freq) for file_a, file_b, freq in rows]
 
-    # Step 2: Build a query to fetch recent commits for ALL pairs at once
-    # We'll use UNION ALL to combine queries for each pair
-    # IMPORTANT: Process in chunks to avoid SQLite query size limits
-    CHUNK_SIZE = 100  # Process 100 file pairs at a time to prevent SQLite errors
-
+    # Step 2: Use a single parameterised query with a JSON-array parameter
+    # to fetch recent commits for ALL pairs at once.  This replaces the
+    # previous UNION ALL approach whose query length grew O(pairs) and could
+    # exceed SQLite's SQLITE_MAX_COMPOUND_SELECT limit.
     pair_commits: Dict[Tuple[str, str], List[str]] = {}
 
-    async with dbmod.get_connection(_cfg.db_path) as db:
-        # Process file_pairs in chunks
-        for chunk_idx in range(0, len(file_pairs), CHUNK_SIZE):
-            chunk = file_pairs[chunk_idx : chunk_idx + CHUNK_SIZE]
+    async with dbmod.get_connection(cfg.db_path) as db:
+        import json as _json
 
-            # Build batch query for recent commits
-            # For each pair, we need to find commits where both files changed
-            commit_queries = []
-            commit_params = []
+        # Encode all pairs as a JSON array: [[file_a, file_b], ...]
+        pairs_json = _json.dumps([[fa, fb] for fa, fb, _ in file_pairs])
 
-            for file_a, file_b, _ in chunk:
-                commit_queries.append(
-                    """
-                    SELECT ? as file_a, ? as file_b, a.commit_hash, c.timestamp
-                    FROM git_diffs a
-                    JOIN git_diffs b ON a.commit_hash = b.commit_hash
-                    JOIN git_commits c ON a.commit_hash = c.commit_hash
-                    WHERE
-                        a.project_id = ? AND
-                        b.project_id = ? AND
-                        a.file_path = ? AND
-                        b.file_path = ?
-                    """
-                )
-                commit_params.extend([file_a, file_b, project_id, project_id, file_a, file_b])
-
-            # Execute batch query for this chunk
-            batch_commit_query = " UNION ALL ".join(commit_queries)
-            batch_commit_query = f"""
-                WITH all_commits AS (
-                    {batch_commit_query}
-                )
-                SELECT file_a, file_b, commit_hash, timestamp,
-                       ROW_NUMBER() OVER (PARTITION BY file_a, file_b ORDER BY timestamp DESC) as rn
-                FROM all_commits
+        commit_rows = await db.execute_fetchall(
             """
+            WITH pair_list(file_a, file_b) AS (
+                SELECT
+                    value ->> 0,
+                    value ->> 1
+                FROM json_each(?)
+            ),
+            matched AS (
+                SELECT
+                    p.file_a,
+                    p.file_b,
+                    a.commit_hash,
+                    c.timestamp,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY p.file_a, p.file_b
+                        ORDER BY c.timestamp DESC
+                    ) AS rn
+                FROM pair_list p
+                JOIN git_diffs a ON a.project_id = ? AND a.file_path = p.file_a
+                JOIN git_diffs b ON b.commit_hash = a.commit_hash
+                                AND b.project_id = ?
+                                AND b.file_path = p.file_b
+                JOIN git_commits c ON c.commit_hash = a.commit_hash
+            )
+            SELECT file_a, file_b, commit_hash, timestamp, rn
+            FROM matched
+            WHERE rn <= 3
+            """,
+            (pairs_json, project_id, project_id),
+        )
 
-            commit_rows = await db.execute_fetchall(batch_commit_query, commit_params)
-
-            # Map commits to file pairs (keep only top 3 per pair)
-            for file_a, file_b, commit_hash, _, rn in commit_rows:
-                if rn <= 3:  # Keep only top 3 recent commits per pair
-                    key = (file_a, file_b)
-                    if key not in pair_commits:
-                        pair_commits[key] = []
-                    pair_commits[key].append(commit_hash)
+        # Map commits to file pairs (keep only top 3 per pair)
+        for file_a, file_b, commit_hash, _, rn in commit_rows:
+            key = (file_a, file_b)
+            if key not in pair_commits:
+                pair_commits[key] = []
+            pair_commits[key].append(commit_hash)
 
         # Step 3: Build batch query for tags
         # Collect all unique commit hashes
@@ -339,6 +353,7 @@ async def analyze_file_style(
     diff_limit: int = 10,
     max_tokens: int = 512,
     generation_service: Optional[GenerationService] = None,
+    cfg: Optional[EngramConfig] = None,
 ) -> Dict[str, any]:
     """Analyze coding style and patterns from recent git diffs for a file.
 
@@ -351,6 +366,7 @@ async def analyze_file_style(
         diff_limit: Number of recent diffs to analyze (default: 10)
         max_tokens: Maximum tokens for LLM generation (default: 512)
         generation_service: Optional GenerationService instance (creates one if not provided)
+        cfg: Optional EngramConfig instance; loaded lazily if not provided.
 
     Returns:
         Dictionary containing:
@@ -358,7 +374,8 @@ async def analyze_file_style(
         - analyzed_commits: List of commit hashes that were analyzed
         - file_path: The analyzed file path
     """
-    async with dbmod.get_connection(_cfg.db_path) as db:
+    cfg = cfg or _get_cfg()
+    async with dbmod.get_connection(cfg.db_path) as db:
         # Fetch recent diffs for this file
         diff_rows = await db.execute_fetchall(
             """
@@ -456,6 +473,7 @@ async def get_coding_style(
     file_path: str,
     *,
     generation_service: Optional[GenerationService] = None,
+    cfg: Optional[EngramConfig] = None,
 ) -> Optional[str]:
     """Get a coding style guide for a file (simplified API).
 
@@ -474,5 +492,6 @@ async def get_coding_style(
         project_id,
         file_path,
         generation_service=generation_service,
+        cfg=cfg,
     )
     return result.get("style_guide")

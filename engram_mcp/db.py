@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import aiosqlite
+import numpy as np
 
 # Polyfill: aiosqlite >= 0.22 removed execute_fetchone.  Re-add it so that
 # the rest of the module can use the convenient one-liner without changing
@@ -128,7 +129,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     status TEXT NOT NULL,
     created_at TEXT DEFAULT (datetime('now')),
     updated_at TEXT DEFAULT (datetime('now')),
-    error TEXT
+    error TEXT,
+    progress TEXT
 );
 
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -194,6 +196,7 @@ END;
 CREATE TABLE IF NOT EXISTS git_diffs (
     id TEXT PRIMARY KEY,
     commit_hash TEXT NOT NULL,
+    project_id TEXT NOT NULL DEFAULT '',
     file_path TEXT NOT NULL,
     change_type TEXT,
     diff_content TEXT,
@@ -202,6 +205,7 @@ CREATE TABLE IF NOT EXISTS git_diffs (
 
 CREATE INDEX IF NOT EXISTS idx_git_diffs_commit ON git_diffs(commit_hash);
 CREATE INDEX IF NOT EXISTS idx_git_diffs_file ON git_diffs(file_path);
+CREATE INDEX IF NOT EXISTS idx_git_diffs_project_file ON git_diffs(project_id, file_path);
 
 CREATE TABLE IF NOT EXISTS git_tags (
     commit_hash TEXT,
@@ -433,6 +437,8 @@ async def init_db(db_path: str) -> None:
         await _ensure_graph_schema(db)
         await _ensure_repo_rules_schema(db)
         await _ensure_git_commits_fts_schema(db)
+        await _ensure_git_diffs_project_id(db)
+        await _ensure_jobs_progress_column(db)
         await db.commit()
 
 async def _ensure_chunks_vector_column(db: aiosqlite.Connection) -> None:
@@ -1986,12 +1992,37 @@ async def update_job_status(
         await db.commit()
 
 
+async def update_job_progress(
+    db_path: str,
+    *,
+    job_id: str,
+    progress: str,
+) -> None:
+    """Update the progress field for a running job.
+
+    *progress* is a JSON-encoded string describing the current state, e.g.
+    ``'{"files_parsed": 120, "files_total": 500, "phase": "embedding"}'``.
+    Callers should update this at most once every ~100 files to avoid
+    excessive write amplification.
+    """
+    async with get_connection(db_path) as db:
+        await db.execute(
+            """
+            UPDATE jobs
+            SET progress = ?, updated_at = datetime('now')
+            WHERE job_id = ?
+            """,
+            (progress, job_id),
+        )
+        await db.commit()
+
+
 async def list_jobs(db_path: str) -> List[Dict[str, Any]]:
     async with get_connection(db_path) as db:
         db.row_factory = aiosqlite.Row
         rows = await db.execute_fetchall(
             """
-            SELECT job_id, kind, status, created_at, updated_at, error
+            SELECT job_id, kind, status, created_at, updated_at, error, progress
             FROM jobs
             ORDER BY created_at DESC
             """
@@ -2604,6 +2635,50 @@ async def _ensure_git_commits_fts_schema(db: aiosqlite.Connection) -> None:
     )
 
 
+async def _ensure_jobs_progress_column(db: aiosqlite.Connection) -> None:
+    """Migration jobs_progress_v1: add progress TEXT column to the jobs table."""
+    await _add_column_if_missing(db, "jobs", "progress TEXT")
+
+
+async def _ensure_git_diffs_project_id(db: aiosqlite.Connection) -> None:
+    """Migration git_diffs_project_id_v1: add project_id column to git_diffs.
+
+    Without this column, diffs from different projects share the same table
+    rows and temporal-coupling queries that filter on project_id would fail
+    with OperationalError. Backfills from git_commits so existing rows get
+    their project_id populated correctly.
+    """
+    row = await db.execute_fetchone(
+        "SELECT 1 FROM schema_migrations WHERE name = 'git_diffs_project_id_v1'"
+    )
+    if row:
+        return
+
+    # Add column if missing (idempotent)
+    await _add_column_if_missing(db, "git_diffs", "project_id TEXT NOT NULL DEFAULT ''")
+
+    # Backfill project_id from the parent git_commits row
+    await db.execute(
+        """
+        UPDATE git_diffs
+        SET project_id = (
+            SELECT project_id FROM git_commits
+            WHERE git_commits.commit_hash = git_diffs.commit_hash
+        )
+        WHERE project_id = ''
+        """
+    )
+
+    # Add the index now that the column is populated
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_git_diffs_project_file ON git_diffs(project_id, file_path)"
+    )
+
+    await db.execute(
+        "INSERT INTO schema_migrations(name) VALUES(?)", ("git_diffs_project_id_v1",)
+    )
+
+
 # ============================================================================
 # Episodic Diff Memory: Git History API
 # ============================================================================
@@ -2639,20 +2714,21 @@ async def upsert_git_commits(
 async def upsert_git_diffs(
     db_path: str,
     *,
-    diffs: List[Tuple[str, str, str, str, str]],
+    diffs: List[Tuple[str, str, str, str, str, str]],
 ) -> None:
     """Bulk insert or update git diff records.
 
-    Each tuple: (id, commit_hash, file_path, change_type, diff_content)
+    Each tuple: (id, commit_hash, project_id, file_path, change_type, diff_content)
     """
     if not diffs:
         return
     async with get_connection(db_path) as db:
         await db.executemany(
             """
-            INSERT INTO git_diffs(id, commit_hash, file_path, change_type, diff_content)
-            VALUES(?, ?, ?, ?, ?)
+            INSERT INTO git_diffs(id, commit_hash, project_id, file_path, change_type, diff_content)
+            VALUES(?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
+                project_id = excluded.project_id,
                 change_type = excluded.change_type,
                 diff_content = excluded.diff_content
             """,

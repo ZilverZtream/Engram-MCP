@@ -57,10 +57,14 @@ class GitIndexer:
         db_path: str,
         embedding_service: EmbeddingService,
         project_path_context: PathContext,
+        model_name: str = "paraphrase-multilingual-MiniLM-L12-v2",
+        device: str = "cpu",
     ):
         self.db_path = db_path
         self.embedding_service = embedding_service
         self.project_path_context = project_path_context
+        self.model_name = model_name
+        self.device = device
 
     async def index_git_history(
         self,
@@ -125,7 +129,7 @@ class GitIndexer:
         # Overlap GPU work (embedding) with DB writes (diffs + tags).
         embedded_commits, _, _ = await asyncio.gather(
             self._embed_commit_messages(meaningful_commits),
-            self._store_diffs(filtered_diffs),
+            self._store_diffs(filtered_diffs, project_id),
             self._store_tags(all_tags),
         )
         logging.info("Embedded %d commit messages", len(embedded_commits))
@@ -472,8 +476,12 @@ class GitIndexer:
 
         messages = [commit.message for commit in commits]
 
-        # Embed all messages in batch
-        embeddings = await self.embedding_service.embed_batch(messages)
+        # Embed all messages in batch using the correct EmbeddingService API
+        embeddings = await self.embedding_service.embed_texts(
+            messages,
+            model_name=self.model_name,
+            device=self.device,
+        )
 
         # Generate UUIDs for embeddings (for future FAISS indexing)
         result = []
@@ -545,8 +553,8 @@ class GitIndexer:
                 chunks=chunk_tuples
             )
 
-    async def _store_diffs(self, diffs: List[GitDiff]) -> None:
-        """Store diffs in database."""
+    async def _store_diffs(self, diffs: List[GitDiff], project_id: str) -> None:
+        """Store diffs in database, including project_id for cross-project isolation."""
         if not diffs:
             return
 
@@ -559,6 +567,7 @@ class GitIndexer:
                 (
                     diff_id,
                     diff.commit_hash,
+                    project_id,
                     diff.file_path,
                     diff.change_type,
                     diff.diff_content,

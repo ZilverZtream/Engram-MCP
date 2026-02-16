@@ -1692,10 +1692,13 @@ async def index_git_history(
         from engram_mcp.history import GitIndexer
 
         start = time.time()
+        _proj_md = (proj.get("metadata") or {}) if "metadata" in (proj or {}) else {}
         git_indexer = GitIndexer(
             db_path=cfg.db_path,
             embedding_service=embedding_service,
             project_path_context=project_path_context,
+            model_name=_proj_md.get("model_name") or cfg.model_name_text,
+            device=_proj_md.get("device") or _device(),
         )
 
         try:
@@ -2114,6 +2117,8 @@ async def analyze_reverts(project_id: str) -> Dict[str, Any]:
             db_path=cfg.db_path,
             embedding_service=embedding_service,
             project_path_context=path_context,
+            model_name=cfg.model_name_text,
+            device=_device(),
         )
 
         # Process reverts
