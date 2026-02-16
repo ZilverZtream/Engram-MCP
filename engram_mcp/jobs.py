@@ -145,6 +145,7 @@ class JobManager:
                 "created_at": created_at,
                 "updated_at": row.get("updated_at"),
                 "error": row.get("error"),
+                "progress": row.get("progress"),
             }
         return out
 
@@ -161,6 +162,19 @@ class JobManager:
             await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=timeout_s)
         except asyncio.TimeoutError:
             pass
+
+    async def update_progress(self, job_id: str, progress: str) -> None:
+        """Write a progress snapshot for a running job.
+
+        *progress* is any JSON-serialisable string the caller chooses
+        (e.g. ``'{"files_parsed":120,"files_total":500,"phase":"embedding"}'``).
+        This is a best-effort update: failures are silently swallowed so that
+        progress reporting never interrupts the main indexing work.
+        """
+        try:
+            await dbmod.update_job_progress(self._db_path, job_id=job_id, progress=progress)
+        except Exception:
+            logging.debug("Failed to update progress for job %s", job_id, exc_info=True)
 
     async def mark_shutdown(self, *, reason: str) -> None:
         self._shutting_down = True

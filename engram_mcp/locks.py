@@ -46,20 +46,42 @@ class RWLock:
                 self._cond.notify_all()
 
     async def acquire_write(self) -> None:
-        async with self._cond:
-            current = asyncio.current_task()
-            if self._writer and current is not None and current == self._writer_task:
-                self._writer_depth += 1
-                return
-            self._writers_waiting += 1
-            try:
-                while self._writer or self._readers > 0:
-                    await self._cond.wait()
-                self._writer = True
-                self._writer_task = current
-                self._writer_depth = 1
-            finally:
-                self._writers_waiting = max(0, self._writers_waiting - 1)
+        # Pre-register write intent BEFORE acquiring the condition lock so
+        # that any reader entering acquire_read after this point will see
+        # _writers_waiting > 0 and block.  This narrows the starvation window
+        # that exists when many reader coroutines are queued ahead of a writer
+        # in the event-loop schedule.
+        self._writers_waiting += 1
+        _decremented = False
+        try:
+            async with self._cond:
+                current = asyncio.current_task()
+                if self._writer and current is not None and current == self._writer_task:
+                    # Reentrant acquire: undo the early increment and deepen.
+                    self._writers_waiting -= 1
+                    _decremented = True
+                    self._writer_depth += 1
+                    return
+                try:
+                    while self._writer or self._readers > 0:
+                        await self._cond.wait()
+                    self._writer = True
+                    self._writer_task = current
+                    self._writer_depth = 1
+                    self._writers_waiting -= 1
+                    _decremented = True
+                except BaseException:
+                    # Cancelled while waiting: wake any blocked readers/writers
+                    # so they are not stuck waiting for a writer that gave up.
+                    self._writers_waiting -= 1
+                    _decremented = True
+                    self._cond.notify_all()
+                    raise
+        finally:
+            if not _decremented:
+                # Safety net: if the condition lock itself raised (e.g. the
+                # event loop is closing), ensure the counter is corrected.
+                self._writers_waiting -= 1
 
     async def release_write(self) -> None:
         async with self._cond:

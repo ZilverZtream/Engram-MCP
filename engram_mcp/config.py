@@ -3,7 +3,6 @@ from __future__ import annotations
 import logging
 import os
 import sys
-from dataclasses import dataclass, field
 from typing import List, Optional
 
 import yaml
@@ -28,90 +27,16 @@ DEFAULT_IGNORE_PATTERNS: List[str] = [
 ]
 
 
-@dataclass
-class EngramConfig:
-    # Storage
-    db_path: str = field(default_factory=lambda: os.path.join(_default_data_dir(), "memory.db"))
-    index_dir: str = field(
-        default_factory=lambda: os.path.join(_default_data_dir(), "indexes")
-    )  # where *.index files are stored
-
-    # Security
-    allowed_roots: List[str] = field(default_factory=list)
-
-    # Indexing behavior
-    ignore_patterns: List[str] = field(default_factory=lambda: list(DEFAULT_IGNORE_PATTERNS))
-    max_file_size_mb: int = 50
-    chunk_size_tokens: int = 200
-    overlap_tokens: int = 30
-    tokenizer_path: str = field(default_factory=lambda: os.getenv("ENGRAM_TOKENIZER_PATH", ""))
-
-    # Performance
-    query_timeout_s: int = 60
-    index_timeout_s: int = 3600
-    embedding_batch_size: int = 128
-    embedding_cache_ttl_s: int = 0
-    embedding_cache_max_rows: int = 0
-
-    # Search
-    fts_top_k: int = 200
-    vector_top_k: int = 200
-    return_k: int = 10
-    enable_mmr: bool = True
-    mmr_lambda: float = 0.7
-    enable_numba: bool = False
-    max_query_chars: int = 4096
-    max_query_tokens: int = 256
-    search_cache_ttl_s: int = 300
-    search_cache_max_items: int = 512
-    vector_backend: str = "auto"
-
-    # Embeddings
-    model_name_text: str = "paraphrase-multilingual-MiniLM-L12-v2"
-    model_name_code: str = "all-MiniLM-L6-v2"
-
-    # Dreaming
-    enable_dreaming: bool = False
-    dream_model_name: str = "gpt-4o-mini"
-    dream_threshold: float = 0.8
-    auto_dream_enabled: bool = False
-    auto_dream_max_pairs: int = 10
-    auto_dream_max_runs_per_day: int = 1
-
-    # Optional: keep GPU embeddings in-process (recommended)
-    prefer_thread_for_cuda: bool = True
-
-    # GPU memory management
-    low_vram_mode: bool = False  # Enable to prevent embedding & generation from running concurrently
-
-    # FAISS IVF+PQ settings
-    faiss_nlist: int = 100
-    faiss_m: int = 8
-    faiss_nbits: int = 8
-    faiss_nprobe: int = 16
-
-    # Sharding settings
-    shard_chunk_threshold: int = 1_000_000
-    shard_size: int = 250_000
-
-    # Indexing safety limits
-    max_project_files: int = 100_000
-    max_project_bytes: int = 5 * 1024 * 1024 * 1024
-    max_jobs_per_project: int = 3
-
-    # Embedding backend selection
-    embedding_backend: str = "sentence_transformers"  # "sentence_transformers" | "ollama" | "openai"
-    ollama_model: str = "nomic-embed-text"
-    ollama_url: str = "http://localhost:11434"
-    openai_api_key: SecretStr = SecretStr("")
-    openai_embedding_model: str = "text-embedding-3-small"
-
-    # Episodic Diff Memory (Git History)
-    enable_history_indexing: bool = True
-    max_history_commits: int = 1000
-
-
 class AllowedConfig(BaseModel):
+    """Unified, validated configuration for Engram MCP.
+
+    Previously there were two parallel classes (AllowedConfig for Pydantic
+    validation and EngramConfig as a plain dataclass).  They have been merged
+    into this single Pydantic model to avoid the silent-default-on-typo bug
+    that the round-trip ``AllowedConfig.model_dump() → EngramConfig(**…)``
+    introduced.  ``EngramConfig`` is kept as a type alias for backwards
+    compatibility.
+    """
     model_config = ConfigDict(extra="forbid")
 
     # Storage
@@ -221,6 +146,13 @@ class AllowedConfig(BaseModel):
         return value
 
 
+# Backwards-compatible alias: all existing code that references EngramConfig
+# continues to work; the underlying type is now AllowedConfig (a Pydantic
+# model), so callers can use .model_dump() / .model_copy() instead of
+# dataclasses.asdict() / dataclasses.replace().
+EngramConfig = AllowedConfig
+
+
 def load_config(path: Optional[str] = None) -> EngramConfig:
     """Load config from YAML.
 
@@ -256,7 +188,8 @@ def load_config(path: Optional[str] = None) -> EngramConfig:
         if not env_path:
             path = os.path.join(user_config_dir, "engram_mcp.yaml")
 
-    cfg = EngramConfig()
+    # Default config (no file present)
+    cfg = AllowedConfig()
     config_root = os.path.dirname(os.path.abspath(path)) or os.getcwd()
     path_context = PathContext([config_root])
     if not path_context.exists(path):
@@ -272,23 +205,26 @@ def load_config(path: Optional[str] = None) -> EngramConfig:
         ]
 
     try:
-        validated = AllowedConfig.model_validate(data or {})
+        # Validate directly — no round-trip through a separate dataclass.
+        cfg = AllowedConfig.model_validate(data or {})
     except ValidationError as exc:
         raise ValueError(f"Invalid configuration: {exc}") from exc
 
-    cfg = EngramConfig(**validated.model_dump())
-
     # Normalize allowed roots (resolve symlinks for security)
-    cfg.allowed_roots = [os.path.realpath(p) for p in (cfg.allowed_roots or [])]
-    cfg.index_dir = os.path.abspath(cfg.index_dir)
-    cfg.db_path = os.path.abspath(cfg.db_path)
+    cfg = cfg.model_copy(update={
+        "allowed_roots": [os.path.realpath(p) for p in (cfg.allowed_roots or [])],
+        "index_dir": os.path.abspath(cfg.index_dir),
+        "db_path": os.path.abspath(cfg.db_path),
+    })
     if int(cfg.overlap_tokens) >= int(cfg.chunk_size_tokens):
         logging.warning(
             "overlap_tokens (%s) must be less than chunk_size_tokens (%s); adjusting overlap.",
             cfg.overlap_tokens,
             cfg.chunk_size_tokens,
         )
-        cfg.overlap_tokens = max(0, int(cfg.chunk_size_tokens) - 1)
+        cfg = cfg.model_copy(update={
+            "overlap_tokens": max(0, int(cfg.chunk_size_tokens) - 1),
+        })
 
     _ensure_storage_dirs(cfg)
 
@@ -318,7 +254,7 @@ def _ensure_dir(path: str, *, mode: int = 0o700) -> None:
             logging.warning("Failed to chmod %s to %s", path, oct(mode), exc_info=True)
 
 
-def _ensure_storage_dirs(cfg: EngramConfig) -> None:
+def _ensure_storage_dirs(cfg: AllowedConfig) -> None:
     db_dir = os.path.dirname(os.path.abspath(cfg.db_path))
     _ensure_dir(db_dir, mode=0o700)
     _ensure_dir(os.path.abspath(cfg.index_dir), mode=0o700)

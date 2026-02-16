@@ -532,9 +532,16 @@ def hash_and_parse_file(
         # so that large plain-text files (README, SQL, …) stay streaming.
         _needs_graph = (ext == ".py") or (ext in LANGUAGE_CONFIG)
         _content_parts: List[str] = []
+        # Cap the amount of content buffered for graph extraction to 512 KB of
+        # decoded text.  Tree-sitter and the Python AST module only need
+        # top-level definitions (classes, functions), which are always near the
+        # top of the file.  Buffering beyond this limit on a 10 MB C++/Rust
+        # file would OOM the parse worker without extracting more useful nodes.
+        _GRAPH_CONTENT_LIMIT = 512 * 1024  # 512 KB of decoded chars
+        _graph_bytes_accumulated = 0
 
         def _iter_lines() -> Iterator[str]:
-            nonlocal buffer
+            nonlocal buffer, _graph_bytes_accumulated
             with path_context.open_file(path, "rb") as fh:
                 while True:
                     chunk = fh.read(1024 * 1024)
@@ -544,8 +551,10 @@ def hash_and_parse_file(
                     text_chunk = decoder.decode(chunk)
                     if not text_chunk:
                         continue
-                    if _needs_graph:
-                        _content_parts.append(text_chunk)
+                    if _needs_graph and _graph_bytes_accumulated < _GRAPH_CONTENT_LIMIT:
+                        remaining = _GRAPH_CONTENT_LIMIT - _graph_bytes_accumulated
+                        _content_parts.append(text_chunk[:remaining])
+                        _graph_bytes_accumulated += len(text_chunk)
                     buffer += text_chunk
                     lines = buffer.splitlines(keepends=True)
                     if lines:
@@ -557,8 +566,9 @@ def hash_and_parse_file(
                             yield line
                 # Flush any incomplete multi-byte sequence at EOF.
                 final_flush = decoder.decode(b"", final=True)
-                if _needs_graph and final_flush:
-                    _content_parts.append(final_flush)
+                if _needs_graph and final_flush and _graph_bytes_accumulated < _GRAPH_CONTENT_LIMIT:
+                    remaining = _GRAPH_CONTENT_LIMIT - _graph_bytes_accumulated
+                    _content_parts.append(final_flush[:remaining])
                 tail = buffer + final_flush
                 if tail:
                     for line in tail.splitlines(keepends=True):
@@ -573,7 +583,7 @@ def hash_and_parse_file(
             overlap_tokens=overlap_tokens,
         )
 
-        # --- graph extraction (single-pass: content already buffered) ---
+        # --- graph extraction (single-pass: content already buffered up to cap) ---
         nodes: List[GraphNodeObj] = []
         edges: List[GraphEdgeObj] = []
         if _needs_graph:
