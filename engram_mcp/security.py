@@ -117,15 +117,67 @@ class PathContext:
     ):
         if any(flag in mode for flag in ("w", "a", "+", "x")):
             raise ValueError("PathContext.open_file only supports read modes. Use write_bytes_atomic/write_text_atomic.")
-        resolved = self.resolve_path(path)
-
-        flags = os.O_RDONLY
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        if hasattr(os, "O_CLOEXEC"):
-            flags |= os.O_CLOEXEC
-        fd = os.open(resolved, flags)
+        fd = self._open_file_no_symlink_race(path)
         return os.fdopen(fd, mode, encoding=encoding, errors=errors)
+
+    def _open_file_no_symlink_race(self, path: str | Path) -> int:
+        """Open *path* for reading without a symlink TOCTOU window.
+
+        The path is validated and opened through dirfd-relative ``open`` calls
+        with ``O_NOFOLLOW`` on each path component.
+        """
+        raw_abs = os.path.abspath(str(path))
+        normalized_abs = self.ensure_allowed_nofollow(raw_abs)
+        norm_ap = self._normalize_case(normalized_abs)
+
+        best_root: Optional[str] = None
+        for root in self._allowed_roots:
+            norm_root = self._normalize_case(root)
+            try:
+                common = os.path.commonpath([norm_ap, norm_root])
+            except ValueError:
+                continue
+            if common == norm_root and (best_root is None or len(root) > len(best_root)):
+                best_root = root
+
+        if not best_root:
+            raise PathNotAllowed(
+                f"Path '{normalized_abs}' is outside allowed_roots. Allowed roots: {self._allowed_roots}"
+            )
+
+        rel = os.path.relpath(normalized_abs, start=best_root)
+        parts = [p for p in rel.split(os.sep) if p and p != "."]
+
+        cloexec_flag = os.O_CLOEXEC if hasattr(os, "O_CLOEXEC") else 0
+        nofollow_flag = os.O_NOFOLLOW if hasattr(os, "O_NOFOLLOW") else 0
+        dir_flag = os.O_DIRECTORY if hasattr(os, "O_DIRECTORY") else 0
+
+        base_fd = os.open(best_root, os.O_RDONLY | dir_flag | nofollow_flag | cloexec_flag)
+        current_fd = base_fd
+        try:
+            if not parts:
+                raise IsADirectoryError(f"Expected a file path, got allowed root directory: {best_root}")
+
+            for index, part in enumerate(parts):
+                is_last = index == len(parts) - 1
+                flags = os.O_RDONLY | nofollow_flag | cloexec_flag
+                if not is_last:
+                    flags |= dir_flag
+                next_fd = os.open(part, flags, dir_fd=current_fd)
+                if current_fd != base_fd:
+                    os.close(current_fd)
+                current_fd = next_fd
+
+            fd_stat = os.fstat(current_fd)
+            if not os.path.samestat(fd_stat, os.stat(normalized_abs)):
+                raise PathNotAllowed(f"Path validation changed while opening '{normalized_abs}'")
+            return current_fd
+        except Exception:
+            if current_fd != base_fd:
+                os.close(current_fd)
+            raise
+        finally:
+            os.close(base_fd)
 
     def list_dir(self, path: str | Path) -> List[str]:
         resolved = self.resolve_path(path)
@@ -133,14 +185,32 @@ class PathContext:
 
     def iter_files(self, root: str | Path) -> Iterator[Path]:
         resolved_root = self.resolve_path(root)
-        for dirpath, dirnames, filenames in os.walk(resolved_root, followlinks=False):
-            for name in filenames:
-                candidate = Path(dirpath) / name
-                try:
-                    self.ensure_allowed(str(candidate))
-                except PathNotAllowed:
-                    continue
-                yield candidate
+        stack = [Path(resolved_root)]
+        while stack:
+            current = stack.pop()
+            try:
+                with os.scandir(current) as entries:
+                    for entry in entries:
+                        candidate = Path(entry.path)
+                        try:
+                            if entry.is_dir(follow_symlinks=False):
+                                if entry.is_symlink():
+                                    continue
+                                stack.append(candidate)
+                                continue
+                            if entry.is_file(follow_symlinks=False):
+                                if entry.is_symlink():
+                                    try:
+                                        self.ensure_allowed(str(candidate))
+                                    except PathNotAllowed:
+                                        continue
+                                yield candidate
+                        except OSError:
+                            logging.debug("Skipping unreadable filesystem entry: %s", entry.path, exc_info=True)
+                            continue
+            except OSError:
+                logging.debug("Skipping unreadable directory during traversal: %s", current, exc_info=True)
+                continue
 
     def stat(self, path: str | Path) -> os.stat_result:
         resolved = self.resolve_path(path)

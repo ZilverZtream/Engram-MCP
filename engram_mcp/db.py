@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import uuid
+from collections import Counter
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -213,6 +214,22 @@ CREATE INDEX IF NOT EXISTS idx_git_tags_tag ON git_tags(tag);
 """
 
 MAX_RESERVE_COUNT = 1_000_000
+_MAX_CHUNK_BATCH_CONTENT_BYTES = 16 * 1024 * 1024
+
+
+def _is_duplicate_column_error(exc: Exception, column_name: str) -> bool:
+    msg = str(exc).lower()
+    return f"duplicate column name: {column_name.lower()}" in msg
+
+
+async def _add_column_if_missing(db: aiosqlite.Connection, table: str, column_def: str) -> None:
+    column_name = column_def.split()[0]
+    try:
+        await db.execute(f"ALTER TABLE {table} ADD COLUMN {column_def}")
+    except aiosqlite.OperationalError as exc:
+        if _is_duplicate_column_error(exc, column_name):
+            return
+        raise
 
 
 @dataclass(frozen=True)
@@ -248,10 +265,15 @@ def build_in_query(prefix_sql: str, values: Sequence[Any], suffix_sql: str = "")
 
 def _safe_load_metadata(raw: Optional[str], *, context: str) -> Dict[str, Any]:
     try:
-        return json.loads(raw or "{}")
+        obj = json.loads(raw or "{}")
     except json.JSONDecodeError:
         logging.warning("Failed to decode metadata for %s", context, exc_info=True)
-        return {}
+        # Fail-closed: corrupted metadata is treated as restricted content.
+        return {"_metadata_decode_error": True, "private": True}
+    if not isinstance(obj, dict):
+        logging.warning("Metadata payload for %s is not a JSON object", context)
+        return {"_metadata_decode_error": True, "private": True}
+    return obj
 
 
 class _ConnectionPool:
@@ -291,7 +313,7 @@ class _ConnectionPool:
                         should_create = True
                 if should_create:
                     try:
-                        conn = await aiosqlite.connect(self.db_path, isolation_level=None)
+                        conn = await asyncio.wait_for(aiosqlite.connect(self.db_path, isolation_level=None), timeout=self.timeout_s)
                         await conn.execute("PRAGMA foreign_keys=ON;")
                         await conn.execute("PRAGMA journal_mode=WAL;")
                         self._all.add(conn)
@@ -300,7 +322,7 @@ class _ConnectionPool:
                         async with self._lock:
                             self._created -= 1
                         raise
-                conn = await self._queue.get()
+                conn = await asyncio.wait_for(self._queue.get(), timeout=self.timeout_s)
                 return conn
         except BaseException:
             self._semaphore.release()
@@ -320,8 +342,9 @@ class _ConnectionPool:
             except Exception:
                 logging.warning("Failed to close connection during release", exc_info=True)
             self._all.discard(conn)
-            if self._created > 0:
-                self._created -= 1
+            async with self._lock:
+                if self._created > 0:
+                    self._created -= 1
         finally:
             self._semaphore.release()
 
@@ -417,27 +440,27 @@ async def _ensure_chunks_vector_column(db: aiosqlite.Connection) -> None:
     rows = await db.execute_fetchall("PRAGMA table_info(chunks)")
     columns = {r[1] for r in rows}
     if "vector" not in columns:
-        await db.execute("ALTER TABLE chunks ADD COLUMN vector BLOB")
+        await _add_column_if_missing(db, "chunks", "vector BLOB")
 
 
 async def _ensure_projects_schema(db: aiosqlite.Connection) -> None:
     rows = await db.execute_fetchall("PRAGMA table_info(projects)")
     columns = {r[1] for r in rows}
     if "directory_realpath" not in columns:
-        await db.execute("ALTER TABLE projects ADD COLUMN directory_realpath TEXT")
+        await _add_column_if_missing(db, "projects", "directory_realpath TEXT")
     if "index_dirty" not in columns:
-        await db.execute("ALTER TABLE projects ADD COLUMN index_dirty INTEGER NOT NULL DEFAULT 0")
+        await _add_column_if_missing(db, "projects", "index_dirty INTEGER NOT NULL DEFAULT 0")
     if "faiss_index_uuid" not in columns:
-        await db.execute("ALTER TABLE projects ADD COLUMN faiss_index_uuid TEXT")
+        await _add_column_if_missing(db, "projects", "faiss_index_uuid TEXT")
     if "deleting" not in columns:
-        await db.execute("ALTER TABLE projects ADD COLUMN deleting INTEGER NOT NULL DEFAULT 0")
+        await _add_column_if_missing(db, "projects", "deleting INTEGER NOT NULL DEFAULT 0")
 
 
 async def _ensure_file_metadata_schema(db: aiosqlite.Connection) -> None:
     rows = await db.execute_fetchall("PRAGMA table_info(file_metadata)")
     columns = {r[1] for r in rows}
     if "content_hash" not in columns:
-        await db.execute("ALTER TABLE file_metadata ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''")
+        await _add_column_if_missing(db, "file_metadata", "content_hash TEXT NOT NULL DEFAULT ''")
 
 
 async def _ensure_file_chunks_schema(db: aiosqlite.Connection) -> None:
@@ -463,47 +486,19 @@ async def _ensure_file_chunks_schema(db: aiosqlite.Connection) -> None:
 
 
 def _iter_json_string_array(json_text: str) -> "Iterable[str]":
-    """Yield string elements from a JSON array without materialising the full list.
+    """Yield string entries from a JSON array with C-level parsing.
 
-    Avoids allocating a Python list when the array may contain hundreds of
-    thousands of elements (e.g. chunk-id lists for large files).  Falls back
-    to the standard decoder for each element so escape sequences are handled
-    correctly.
-
-    Robustness: the opening ``[`` is located by stripping leading whitespace
-    rather than scanning for the first ``[`` in the raw text.  The previous
-    scanner could mis-identify a ``[`` that appeared inside a leading string
-    or comment; ``json.loads`` would reject such input, so we raise
-    ``ValueError`` early to surface data-corruption rather than silently
-    yielding wrong results.
+    This intentionally delegates parsing to ``json.loads`` to avoid Python
+    bytecode hot loops over attacker-controlled whitespace/comma runs.
     """
-    decoder = json.JSONDecoder()
-    stripped = json_text.lstrip()
-    if not stripped or stripped[0] != '[':
-        # Not a valid JSON array — surface the problem so callers can detect
-        # data corruption rather than silently returning an empty sequence.
-        raise ValueError(
-            f"Expected JSON array; got {stripped[:32]!r}… "
-            f"(first non-whitespace char is {stripped[0]!r})" if stripped
-            else "Expected JSON array; got empty string"
-        )
-    # idx into the *original* string, pointing just past '['
-    idx = len(json_text) - len(stripped) + 1
-    length = len(json_text)
-    while idx < length:
-        # Skip whitespace and commas.
-        while idx < length and json_text[idx] in ' \t\n\r,':
-            idx += 1
-        if idx >= length or json_text[idx] == ']':
-            break
-        try:
-            obj, end = decoder.raw_decode(json_text, idx)
-        except json.JSONDecodeError as exc:
-            raise ValueError(
-                f"Malformed JSON array near index {idx}: {json_text[idx:idx + 32]!r}…"
-            ) from exc
+    try:
+        decoded = json.loads(json_text)
+    except json.JSONDecodeError as exc:
+        raise ValueError("Malformed JSON array payload") from exc
+    if not isinstance(decoded, list):
+        raise ValueError("Expected JSON array payload")
+    for obj in decoded:
         yield str(obj)
-        idx = end
 
 
 async def _migrate_file_chunks_from_metadata(db: aiosqlite.Connection) -> None:
@@ -638,7 +633,7 @@ async def _ensure_search_sessions_schema(db: aiosqlite.Connection) -> None:
     columns = await db.execute_fetchall("PRAGMA table_info(search_sessions)")
     column_names = {str(row[1]) for row in columns}
     if "result_chunk_ids" not in column_names:
-        await db.execute("ALTER TABLE search_sessions ADD COLUMN result_chunk_ids TEXT")
+        await _add_column_if_missing(db, "search_sessions", "result_chunk_ids TEXT")
 
 
 async def _ensure_graph_schema(db: aiosqlite.Connection) -> None:
@@ -1039,11 +1034,59 @@ async def upsert_chunks(
     project_id: str,
     rows: List[Tuple[str, int, str, int, Dict[str, Any]]],
 ) -> None:
-    """Upsert chunks.
+    """Upsert chunks with defensive internal-id collision handling.
 
     rows entries: (chunk_id, internal_id, content, token_count, metadata)
     """
+    if not rows:
+        return
+
+    duplicate_counts = Counter(iid for _, iid, _, _, _ in rows)
+    duplicate_iids = {iid for iid, count in duplicate_counts.items() if count > 1}
+    if duplicate_iids:
+        raise ValueError(f"Duplicate internal_id values in batch: {sorted(duplicate_iids)[:10]}")
+
     async with get_connection(db_path) as db:
+        normalized_rows = list(rows)
+        if normalized_rows:
+            incoming_iids = [iid for _, iid, _, _, _ in normalized_rows]
+            query = build_in_query(
+                "SELECT internal_id, chunk_id FROM chunks WHERE project_id = ? AND internal_id IN ",
+                incoming_iids,
+            )
+            existing = await db.execute_fetchall(query.text, (project_id, *query.params))
+            occupied = {int(iid): str(cid) for iid, cid in existing}
+            collisions = [
+                idx for idx, (cid, iid, _, _, _) in enumerate(normalized_rows)
+                if iid in occupied and occupied[iid] != cid
+            ]
+            if collisions:
+                seq_row = await db.execute_fetchone(
+                    "SELECT next_internal_id FROM internal_id_sequence WHERE project_id = ?",
+                    (project_id,),
+                )
+                if seq_row and seq_row[0] is not None:
+                    next_id = int(seq_row[0])
+                else:
+                    max_row = await db.execute_fetchone(
+                        "SELECT COALESCE(MAX(internal_id), 0) FROM chunks WHERE project_id = ?",
+                        (project_id,),
+                    )
+                    next_id = int(max_row[0]) + 1
+                for row_idx in collisions:
+                    cid, _iid, content, tcount, meta = normalized_rows[row_idx]
+                    normalized_rows[row_idx] = (cid, next_id, content, tcount, meta)
+                    next_id += 1
+                await db.execute(
+                    """
+                    INSERT INTO internal_id_sequence(project_id, next_internal_id)
+                    VALUES(?,?)
+                    ON CONFLICT(project_id) DO UPDATE SET
+                      next_internal_id = excluded.next_internal_id
+                    """,
+                    (project_id, next_id),
+                )
+
         await db.executemany(
             """
             INSERT INTO chunks(chunk_id, project_id, internal_id, content, token_count, metadata, updated_at)
@@ -1056,7 +1099,7 @@ async def upsert_chunks(
             """,
             [
                 (cid, project_id, iid, content, tcount, json.dumps(meta))
-                for (cid, iid, content, tcount, meta) in rows
+                for (cid, iid, content, tcount, meta) in normalized_rows
             ],
         )
         await db.commit()
@@ -1066,15 +1109,36 @@ async def upsert_chunk_vectors(
     db_path: str,
     rows: List[Tuple[bytes, str, int]],
 ) -> None:
-    """Persist embedding vectors for crash-recovery without re-embedding.
-
-    Each entry in *rows* is (vector_bytes, project_id, internal_id).
-    The UPDATE targets chunks that were just inserted by upsert_chunks in
-    the same logical batch, so all rows are guaranteed to exist.
-    """
+    """Persist embedding vectors with dimensionality validation."""
     if not rows:
         return
+
+    project_ids = {project_id for _vector, project_id, _internal_id in rows}
     async with get_connection(db_path) as db:
+        dims: Dict[str, int] = {}
+        if project_ids:
+            query = build_in_query(
+                "SELECT project_id, embedding_dim FROM projects WHERE project_id IN ",
+                sorted(project_ids),
+            )
+            dim_rows = await db.execute_fetchall(query.text, query.params)
+            dims = {str(project_id): int(dim) for project_id, dim in dim_rows}
+
+        for vector_bytes, project_id, internal_id in rows:
+            dim = dims.get(project_id)
+            if dim is None:
+                raise ValueError(f"Unknown project_id for vector upsert: {project_id}")
+            if len(vector_bytes) % 4 != 0:
+                raise ValueError(
+                    f"Vector byte length for {project_id}:{internal_id} is not float32-aligned: {len(vector_bytes)}"
+                )
+            expected_len = dim * 4
+            if len(vector_bytes) != expected_len:
+                raise ValueError(
+                    f"Vector length mismatch for {project_id}:{internal_id}. "
+                    f"Expected {expected_len} bytes ({dim} dims), got {len(vector_bytes)}"
+                )
+
         await db.executemany(
             "UPDATE chunks SET vector = ? WHERE project_id = ? AND internal_id = ?",
             rows,
@@ -1391,75 +1455,72 @@ async def refresh_project_stats(db_path: str, project_id: str) -> None:
 
 
 _FTS5_KEYWORDS: set[str] = {"not", "and", "or", "near"}
+_FTS5_OPERATORS = re.compile(r'[*^(){}<>]')
+
+
+def _normalize_fts_term(term: str, *, max_len: int = 128) -> str:
+    cleaned = _FTS5_OPERATORS.sub(" ", term)
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+    return cleaned[:max_len]
+
+
+def _tokenize_fts_expression(query: str) -> List[str]:
+    return re.findall(r'"[^"]+"|\(|\)|\S+', query)
 
 
 def _sanitize_fts_query(query: str) -> str:
-    """Sanitise *query* for FTS5 MATCH while preserving code punctuation.
-
-    The previous implementation stripped everything except [A-Za-z0-9_],
-    which destroyed code-search precision:  ``std::vector`` became two
-    independent AND terms instead of a phrase match, ``@component``
-    lost its decorator prefix, and ``C++`` collapsed to ``C``.
-
-    FTS5 only needs a handful of structural operators removed to avoid
-    query-parse errors (*  "  ^  +  (  )  {  }).  Angle brackets and
-    hyphens are replaced with spaces: angle brackets so that
-    ``vector<int>`` tokenises the same way at query time as at index
-    time, and hyphens so that ``pre-trained`` is not mis-parsed as
-    ``pre NOT trained`` by the FTS5 query engine.  Each
-    whitespace-delimited token is then quoted so FTS5 treats it as a
-    phrase; the ``unicode61`` tokeniser splits on the same boundaries
-    used during indexing, making ``"std::vector"`` match the
-    adjacent-token pair (std, vector).  Tokens that are bare FTS5
-    operator keywords (NOT / AND / OR / NEAR) are dropped entirely to
-    prevent unintended query-syntax injection.
-    """
-    if not query or not query.strip():
-        return '""'
-    # Replace FTS5 syntax operators, angle-brackets, and hyphens with spaces.
-    # Note: '+' is deliberately NOT stripped — it is not an FTS5 operator
-    # and stripping it collapses "C++" to "C".
-    cleaned = re.sub(r'[*^(){}<>\-]', ' ', query)
-    tokens = [t for t in cleaned.split() if t and t.lower() not in _FTS5_KEYWORDS]
-    if not tokens:
-        return '""'
-    if len(tokens) > 50:
-        raise ValueError("FTS strict query exceeds the 50-token maximum.")
-    tokens = [t[:64] for t in tokens]
-    return " AND ".join(f'"{t}"' for t in tokens)
+    """Sanitize strict lexical query while preserving code punctuation."""
+    return build_fts_query(query, mode="strict")
 
 
 def build_fts_query(query: str, *, mode: str = "strict") -> str:
-    """Build a sanitized FTS5 query string supporting AND/OR modes and phrases."""
+    """Build a sanitized FTS5 query string with optional boolean operators."""
     if not query or not query.strip():
         return '""'
-    # Replace FTS5 syntax operators, angle-brackets, and hyphens with spaces.
-    # '+' is not an FTS5 operator; keeping it preserves "C++" precision.
-    cleaned = re.sub(r'[*^(){}<>\-]', ' ', query)
     mode_lower = str(mode).lower()
     if mode_lower == "phrase":
-        cleaned_phrase = re.sub(r'\s+', ' ', cleaned).strip()
-        return f'"{cleaned_phrase[:256]}"' if cleaned_phrase else '""'
-    parts = re.findall(r'"([^"]+)"|(\S+)', cleaned)
-    tokens: List[str] = []
-    for quoted, plain in parts:
-        token = quoted or plain
-        if not token:
-            continue
-        token = token.strip()
-        if not token:
-            continue
-        token = re.sub(r'\s+', ' ', token)
-        if token.lower() in _FTS5_KEYWORDS:
-            continue
-        tokens.append(token)
-    if not tokens:
+        phrase = _normalize_fts_term(query, max_len=256)
+        return f'"{phrase}"' if phrase else '""'
+
+    raw_tokens = _tokenize_fts_expression(query)
+    if not raw_tokens:
         return '""'
-    if len(tokens) > 50:
-        raise ValueError("FTS query exceeds the 50-token maximum.")
-    tokens = [t[:64] for t in tokens]
-    joiner = " OR " if mode_lower == "any" else " AND "
-    return joiner.join(f'"{t}"' for t in tokens)
+
+    out_tokens: List[str] = []
+    pending_operator: Optional[str] = None
+    terms_seen = 0
+
+    for raw in raw_tokens:
+        token = raw.strip()
+        if not token:
+            continue
+        lowered = token.lower()
+        if lowered in _FTS5_KEYWORDS:
+            pending_operator = lowered.upper()
+            continue
+        if token in {"(", ")"}:
+            continue
+
+        if token.startswith('"') and token.endswith('"') and len(token) >= 2:
+            normalized = _normalize_fts_term(token[1:-1], max_len=256)
+        else:
+            normalized = _normalize_fts_term(token)
+        if not normalized:
+            continue
+
+        if terms_seen > 0:
+            if mode_lower == "any":
+                out_tokens.append("OR")
+            else:
+                out_tokens.append(pending_operator or "AND")
+        out_tokens.append(f'"{normalized}"')
+        terms_seen += 1
+        pending_operator = None
+
+        if terms_seen > 50:
+            raise ValueError("FTS query exceeds the 50-token maximum.")
+
+    return " ".join(out_tokens) if out_tokens else '""'
 
 
 async def fts_search(
@@ -1988,11 +2049,17 @@ async def fetch_chunk_batch(
     *,
     last_internal_id: int,
     batch_size: int,
+    max_content_bytes: int = _MAX_CHUNK_BATCH_CONTENT_BYTES,
 ) -> List[Dict[str, Any]]:
     from .chunking import Chunk
 
+    capped_batch_size = max(1, int(batch_size))
+    byte_budget = max(1024, int(max_content_bytes))
+
+    out: List[Dict[str, Any]] = []
+    consumed_bytes = 0
     async with get_connection(db_path) as db:
-        rows = await db.execute_fetchall(
+        cursor = await db.execute(
             """
             SELECT chunk_id, internal_id, content, token_count, metadata, vector
             FROM chunks
@@ -2000,24 +2067,29 @@ async def fetch_chunk_batch(
             ORDER BY internal_id ASC
             LIMIT ?
             """,
-            (project_id, int(last_internal_id), int(batch_size)),
+            (project_id, int(last_internal_id), capped_batch_size),
         )
-
-    out: List[Dict[str, Any]] = []
-    for cid, iid, content, tcount, meta_json, vector in rows:
-        meta = {}
         try:
-            meta = json.loads(meta_json or "{}")
-        except json.JSONDecodeError:
-            logging.warning("Failed to decode chunk metadata for %s", cid, exc_info=True)
-            meta = {}
-        out.append(
-            {
-                "chunk": Chunk(chunk_id=cid, content=content, token_count=int(tcount), metadata=meta),
-                "internal_id": int(iid),
-                "vector": vector,
-            }
-        )
+            while True:
+                row = await cursor.fetchone()
+                if row is None:
+                    break
+                cid, iid, content, tcount, meta_json, vector = row
+                consumed_bytes += len((content or "").encode("utf-8", errors="ignore"))
+                if consumed_bytes > byte_budget and out:
+                    break
+                meta = _safe_load_metadata(meta_json, context=f"chunk:{cid}")
+                out.append(
+                    {
+                        "chunk": Chunk(chunk_id=cid, content=content, token_count=int(tcount), metadata=meta),
+                        "internal_id": int(iid),
+                        "vector": vector,
+                    }
+                )
+                if consumed_bytes > byte_budget:
+                    break
+        finally:
+            await cursor.close()
     return out
 
 
@@ -2124,19 +2196,9 @@ async def get_codebase_statistics(
     *,
     project_id: str,
 ) -> Dict[str, Any]:
-    """Return high-level codebase overview for agent orientation.
-
-    Returns:
-        - total_files: Total file count
-        - total_chunks: Total chunk count
-        - top_modified_files: Top 5 most recently modified files
-        - top_directories: Top-level directories in the project
-        - language_breakdown: Count of files by extension
-    """
+    """Return high-level codebase overview for agent orientation."""
     async with get_connection(db_path) as db:
         db.row_factory = aiosqlite.Row
-
-        # Get total files and chunks
         stats_row = await db.execute_fetchone(
             """
             SELECT
@@ -2150,7 +2212,6 @@ async def get_codebase_statistics(
             (project_id,),
         )
 
-        # Get top 5 most recently modified files
         top_files_rows = await db.execute_fetchall(
             """
             SELECT file_path, mtime_ns, size_bytes
@@ -2162,42 +2223,55 @@ async def get_codebase_statistics(
             (project_id,),
         )
 
-        # Get all file paths for directory and extension analysis
-        all_files_rows = await db.execute_fetchall(
-            "SELECT file_path FROM file_metadata WHERE project_id = ?",
+        top_dirs_rows = await db.execute_fetchall(
+            """
+            SELECT
+                CASE
+                    WHEN instr(file_path, '/') > 0 THEN substr(file_path, 1, instr(file_path, '/') - 1)
+                    ELSE ''
+                END AS top_dir,
+                COUNT(*) AS cnt
+            FROM file_metadata
+            WHERE project_id = ?
+            GROUP BY top_dir
+            HAVING top_dir != ''
+            ORDER BY cnt DESC, top_dir ASC
+            LIMIT 25
+            """,
             (project_id,),
         )
 
-    # Analyze directories
-    top_dirs: set[str] = set()
-    ext_counts: Dict[str, int] = {}
-
-    for row in all_files_rows:
-        path = str(row["file_path"])
-        # Extract top-level directory
-        parts = path.split("/")
-        if len(parts) > 1:
-            top_dirs.add(parts[0])
-        # Extract extension
-        if "." in path:
-            ext = path.rsplit(".", 1)[-1]
-            ext_counts[ext] = ext_counts.get(ext, 0) + 1
-
-    # Sort extensions by count
-    sorted_exts = sorted(ext_counts.items(), key=lambda x: x[1], reverse=True)[:10]
+        ext_rows = await db.execute_fetchall(
+            """
+            SELECT
+                lower(
+                    CASE
+                        WHEN instr(file_path, '.') = 0 THEN ''
+                        ELSE substr(file_path, instr(file_path, '.') + 1)
+                    END
+                ) AS extension,
+                COUNT(*) AS cnt
+            FROM file_metadata
+            WHERE project_id = ?
+            GROUP BY extension
+            HAVING extension != ''
+            ORDER BY cnt DESC, extension ASC
+            LIMIT 10
+            """,
+            (project_id,),
+        )
 
     return {
         "total_files": int(stats_row["file_count"]) if stats_row else 0,
         "total_chunks": int(stats_row["chunk_count"]) if stats_row else 0,
         "top_modified_files": [
-            {
-                "path": r["file_path"],
-                "size_bytes": int(r["size_bytes"]),
-            }
+            {"path": r["file_path"], "size_bytes": int(r["size_bytes"])}
             for r in top_files_rows
         ],
-        "top_directories": sorted(top_dirs),
-        "language_breakdown": [{"extension": ext, "count": count} for ext, count in sorted_exts],
+        "top_directories": [str(r["top_dir"]) for r in top_dirs_rows],
+        "language_breakdown": [
+            {"extension": str(r["extension"]), "count": int(r["cnt"])} for r in ext_rows
+        ],
     }
 
 
